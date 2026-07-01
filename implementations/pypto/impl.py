@@ -129,3 +129,66 @@ class PytoAllscan(AllscanImpl):
         if self._rt is not None:
             self._rt.close()
             self._rt = None
+
+
+class PytoAllscanBackward(AllscanImpl):
+    """PyPTO DSL-compiled AllScan *backward* pass on a reusable DistributedWorker.
+
+    Separate from :class:`PytoAllscan` because only ONE DistributedWorker may be
+    prepared per device set at a time (two prepared workers fork chip processes
+    on the same devices and their HCCL comms collide, ``HcclCommInitRootInfo
+    failed: 7``). This class prepares only the backward program; the forward
+    class prepares only the forward one. Each is built/run/closed independently.
+
+    Reverse-ring program (see :mod:`implementations.pypto.program_backward`):
+    inputs g_out, gamma, out_prev; outputs dS, dgamma. ``out_prev[r] = out[r-1]``
+    (the block rank r received during the forward pass; zeros for rank 0), so the
+    dgamma row-reduction is fully local.
+    """
+
+    name = "pypto"
+
+    def __init__(self) -> None:
+        self._rt = None
+
+    def build(self, dk, dv, K, P, device_ids, platform):
+        self.close()
+
+        from pypto import ir
+        from pypto.ir.distributed_compiled_program import DistributedConfig
+
+        from implementations.pypto.program_backward import build_allscan_backward_program
+
+        self.P = P
+        dist_cfg = DistributedConfig(device_ids=device_ids[:P], num_sub_workers=0)
+        program = build_allscan_backward_program(dk, dv, K, P)
+        compiled = ir.compile(program, platform=platform, distributed_config=dist_cfg)
+
+        # Shared-memory IO buffers must exist before prepare() forks chip workers.
+        self._host_gout = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
+        self._host_g = torch.zeros((P, dk, 1), dtype=torch.float32).share_memory_()
+        self._host_outprev = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
+        self._host_dS = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
+        self._host_dgamma = torch.zeros((P, dk, 1), dtype=torch.float32).share_memory_()
+        self._rt = compiled.prepare()
+
+    def run(self, S_locals, gammas, outputs):
+        raise NotImplementedError("PytoAllscanBackward implements run_backward only")
+
+    def run_backward(self, g_out, gammas, outs, dS, dgamma):
+        assert self._rt is not None, "call build() first"
+        self._host_gout.copy_(g_out)
+        self._host_g.copy_(gammas)
+        # out_prev[r] = out[r-1]; rank 0 has no predecessor (dgamma[0] == 0).
+        self._host_outprev.zero_()
+        self._host_outprev[1:].copy_(outs[:-1])
+        self._host_dS.zero_()
+        self._host_dgamma.zero_()
+        self._rt(self._host_gout, self._host_g, self._host_outprev, self._host_dS, self._host_dgamma)
+        dS.copy_(self._host_dS)
+        dgamma.copy_(self._host_dgamma)
+
+    def close(self):
+        if self._rt is not None:
+            self._rt.close()
+            self._rt = None
