@@ -50,6 +50,48 @@ def make_inputs(
     return S_locals, gammas, outputs
 
 
+def expected_allscan_backward(
+    gammas: torch.Tensor, outs: torch.Tensor, g_out: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure sequential AllScan backward, the golden for every backend.
+
+    Given the forward outputs ``outs`` (``out[p]``, retained from the forward
+    pass) and the upstream gradient ``g_out[p] = dL/dout[p]``, the adjoint
+    ``d[p] = dL/dout[p]`` (total, including the downstream chain) is a *reverse*
+    scan with ``gamma`` shifted by one::
+
+        d[P-1] = g_out[P-1]
+        d[p]   = g_out[p] + gamma[p+1] * d[p+1]        (p = P-2 .. 0)
+
+    from which the parameter gradients are local::
+
+        dS_local[p] = d[p]                              (all p)
+        dgamma[p]   = rowsum_dv( d[p] * out[p-1] )      (p = 1..P-1) -> [dk,1]
+        dgamma[0]   = 0                                 (gamma[0] is unused)
+
+    Returns ``(dS[P,dk,dv], dgamma[P,dk,1])``.
+    """
+    P = g_out.shape[0]
+    dS = torch.zeros_like(g_out)
+    dS[P - 1] = g_out[P - 1]
+    for p in range(P - 2, -1, -1):
+        dS[p] = g_out[p] + gammas[p + 1] * dS[p + 1]
+    dgamma = torch.zeros_like(gammas)
+    for p in range(1, P):
+        dgamma[p] = (dS[p] * outs[p - 1]).sum(dim=1, keepdim=True)
+    return dS, dgamma
+
+
+def make_grad_inputs(P: int, dk: int, dv: int, seed: int = 1234) -> torch.Tensor:
+    """Deterministic upstream gradient ``g_out[P,dk,dv]`` for backward tests.
+
+    Uses a different default seed from :func:`make_inputs` so the upstream grad
+    is not accidentally correlated with the forward inputs.
+    """
+    torch.manual_seed(seed)
+    return torch.rand((P, dk, dv), dtype=torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # Implementation interface
 # ---------------------------------------------------------------------------
@@ -87,6 +129,26 @@ class AllscanImpl(ABC):
         outputs: torch.Tensor,
     ) -> None:
         """Execute the AllScan collective synchronously, writing into ``outputs``."""
+
+    def run_backward(
+        self,
+        g_out: torch.Tensor,
+        gammas: torch.Tensor,
+        outs: torch.Tensor,
+        dS: torch.Tensor,
+        dgamma: torch.Tensor,
+    ) -> None:
+        """Execute the AllScan backward pass synchronously.
+
+        Given the upstream gradient ``g_out[P,dk,dv]``, the per-rank decay
+        ``gammas[P,dk,1]``, and the retained forward outputs ``outs[P,dk,dv]``,
+        write the input gradients into ``dS[P,dk,dv]`` and ``dgamma[P,dk,1]``
+        (see :func:`expected_allscan_backward` for the exact math). Optional:
+        backends implement it as they gain a backward kernel.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement run_backward"
+        )
 
     #: Whether :meth:`measure` amortizes one-time per-call setup (e.g. comm-domain
     #: allocation) across the timed iterations. False here means the timed numbers

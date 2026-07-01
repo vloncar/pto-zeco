@@ -4,7 +4,7 @@ import pypto.language.distributed as pld
 def build_allscan_program(dk: int, dv: int, K: int, P: int):
     """
     Builds the PyPTO program for All-Scan collective communication.
-    
+
     dk: Hidden dimension size (keys)
     dv: Hidden dimension size (values)
     K: Pipeline depth (number of blocks)
@@ -35,13 +35,20 @@ def build_allscan_program(dk: int, dv: int, K: int, P: int):
                 # Push block to peer
                 pld.tile.remote_store(S_send_k, target=dst, peer=peer_next, offsets=[offset_k, 0])
 
-                # Notify peer
+                # Memory-ordering barrier: drain the MTE3 store pipe so the data
+                # is globally visible before the signal lands (Ascend 910B NoC is
+                # weakly ordered; without this the peer can observe the notify
+                # before the remote_store data — the producer-side race).
+                pld.system.fence()
+
+                # Notify peer (AtomicAdd matches the simpler reference kernel and
+                # is forward-compatible with epoch-based batching).
                 pld.system.notify(
                     target=signal,
                     peer=peer_next,
                     offsets=[k, 0],
                     value=1,
-                    op=pld.NotifyOp.Set,
+                    op=pld.NotifyOp.AtomicAdd,
                 )
             return S_out
 
@@ -78,12 +85,16 @@ def build_allscan_program(dk: int, dv: int, K: int, P: int):
 
                 pld.tile.remote_store(S_send_k, target=dst, peer=peer_next, offsets=[offset_k, 0])
 
+                # See allscan_first_step: fence before notify so data is visible
+                # before the signal on the weakly-ordered NoC.
+                pld.system.fence()
+
                 pld.system.notify(
                     target=signal,
                     peer=peer_next,
                     offsets=[k, 0],
                     value=1,
-                    op=pld.NotifyOp.Set,
+                    op=pld.NotifyOp.AtomicAdd,
                 )
             return S_out
 
@@ -158,7 +169,7 @@ def build_allscan_program(dk: int, dv: int, K: int, P: int):
             gammas: pl.Tensor[[P, dk, 1], pl.FP32],
             outputs: pl.Out[pl.Tensor[[P, dk, dv], pl.FP32]],
         ) -> pl.Tensor[[P, dk, dv], pl.FP32]:
-            
+
             dst_buf = pld.alloc_window_buffer(dk * dv * 4)
             signal_buf = pld.alloc_window_buffer(K * 4)
 

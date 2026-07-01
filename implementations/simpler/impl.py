@@ -125,11 +125,13 @@ class SimplerAllscan(AllscanImpl):
         from simpler.task_interface import (
             CallConfig,
             CommBufferSpec,
-            ContinuousTensor,
             DataType,
             TaskArgs,
             TensorArgType,
         )
+        # ``ContinuousTensor`` was folded into ``Tensor`` in the updated runtime
+        # (identical ``make(data, shapes, dtype, child_memory=)`` signature).
+        from simpler.task_interface import Tensor as ContinuousTensor
         from simpler.worker import Worker
         from simpler_setup.torch_interop import make_tensor_arg
 

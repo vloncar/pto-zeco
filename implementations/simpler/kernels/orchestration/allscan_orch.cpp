@@ -30,20 +30,24 @@
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
-allscan_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+allscan_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 10,  // 4 tensors + 6 scalars
     };
 }
 
-__attribute__((visibility("default"))) void allscan_orchestration(const ChipStorageTaskArgs &orch_args) {
-    Tensor s_local = from_tensor_arg(orch_args.tensor(0));
-    Tensor gamma = from_tensor_arg(orch_args.tensor(1));
-    Tensor output = from_tensor_arg(orch_args.tensor(2));
-    Tensor scratch = from_tensor_arg(orch_args.tensor(3));
+__attribute__((visibility("default"))) void allscan_orchestration(const L2TaskArgs &orch_args) {
+    // The framework hands the orchestration entry a const L2TaskArgs& (see
+    // aicpu_executor.cpp DeviceOrchestrationFunc). L2TaskArgs stores TensorRefs
+    // that carry dependency/external metadata, so tensors are read via .ref().
+    const Tensor &s_local = orch_args.tensor(0).ref();
+    const Tensor &gamma = orch_args.tensor(1).ref();
+    const Tensor &output = orch_args.tensor(2).ref();
+    const Tensor &scratch = orch_args.tensor(3).ref();
 
-    Arg params;
+    // Arg is now a class template; L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>.
+    L0TaskArgs params;
     params.add_input(s_local);
     params.add_input(gamma);
     params.add_output(output);
