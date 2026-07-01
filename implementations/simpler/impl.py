@@ -84,6 +84,53 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
     )
 
 
+def build_backward_chip_callable(platform: str, pto_isa_commit: str | None = None):
+    """Compile the AIV allscan *backward* kernel + its C++ orchestration shim.
+
+    Signature: g_out, gamma, out_prev (IN), dS, dgamma (OUT), scratch (INOUT).
+    """
+    from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable
+    from simpler_setup.elf_parser import extract_text_section
+    from simpler_setup.kernel_compiler import KernelCompiler
+    from simpler_setup.pto_isa import ensure_pto_isa_root
+
+    kc = KernelCompiler(platform=platform)
+    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    include_dirs = kc.get_orchestration_include_dirs(RUNTIME)
+    kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
+
+    kernel_bytes = kc.compile_incore(
+        source_path=os.path.join(KERNELS_DIR, "aiv/allscan_backward_kernel.cpp"),
+        core_type="aiv",
+        pto_isa_root=pto_isa_root,
+        extra_include_dirs=kernel_include_dirs,
+    )
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
+
+    orch_bytes = kc.compile_orchestration(
+        runtime_name=RUNTIME,
+        source_path=os.path.join(KERNELS_DIR, "orchestration/allscan_backward_orch.cpp"),
+    )
+    core_callable = CoreCallable.build(
+        signature=[
+            ArgDirection.IN, ArgDirection.IN, ArgDirection.IN,
+            ArgDirection.OUT, ArgDirection.OUT, ArgDirection.INOUT,
+        ],
+        binary=kernel_bytes,
+    )
+    return ChipCallable.build(
+        signature=[
+            ArgDirection.IN, ArgDirection.IN, ArgDirection.IN,
+            ArgDirection.OUT, ArgDirection.OUT, ArgDirection.INOUT,
+        ],
+        func_name="allscan_backward_orchestration",
+        config_name="allscan_backward_orchestration_config",
+        binary=orch_bytes,
+        children=[(0, core_callable)],
+    )
+
+
 class SimplerAllscan(AllscanImpl):
     """Direct PTO-runtime AllScan driven by a persistent L3 Worker.
 
@@ -152,6 +199,7 @@ class SimplerAllscan(AllscanImpl):
         self._slot_nbytes = self._slot_floats * DTYPE_NBYTES
 
         chip_callable = build_chip_callable(platform, self.pto_isa_commit)
+        bwd_chip_callable = build_backward_chip_callable(platform, self.pto_isa_commit)
         self.worker = Worker(
             level=3,
             platform=platform,
@@ -160,12 +208,20 @@ class SimplerAllscan(AllscanImpl):
             num_sub_workers=0,
         )
         self._cid = self.worker.register(chip_callable)
+        self._cid_bwd = self.worker.register(bwd_chip_callable)
         self.worker.init()
 
         # Per-rank shared-memory tensors (one private input/output per chip child).
         self.host_s = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
         self.host_g = [torch.zeros((dk, 1), dtype=torch.float32).share_memory_() for _ in range(P)]
         self.host_out = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
+
+        # Backward per-rank buffers: g_out, out_prev (IN); dS, dgamma (OUT).
+        # gamma reuses ``host_g``. out_prev[i] holds out[i-1] (zeros for rank 0).
+        self.host_gout = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
+        self.host_outprev = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
+        self.host_dS = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
+        self.host_dgamma = [torch.zeros((dk, 1), dtype=torch.float32).share_memory_() for _ in range(P)]
 
     def _submit_iter(self, orch, handle, cfg, slot_off_floats):
         """Submit one full P-rank AllScan, using the window slot at
@@ -196,6 +252,37 @@ class SimplerAllscan(AllscanImpl):
             chip_args.add_scalar(domain.device_ctx)
             orch.submit_next_level(self._cid, chip_args, cfg, worker=i)
 
+    def _submit_iter_backward(self, orch, handle, cfg, slot_off_floats):
+        """Submit one full P-rank AllScan backward, using the window slot at
+        ``slot_off_floats`` (in floats) for every rank's recv+signal region."""
+        Args = self._TaskArgs
+        TT = self._TensorArgType
+        mk = self._make_tensor_arg
+        for i in range(self.P):
+            domain = handle[i]
+            chip_args = Args()
+            chip_args.add_tensor(mk(self.host_gout[i]), TT.INPUT)
+            chip_args.add_tensor(mk(self.host_g[i]), TT.INPUT)
+            chip_args.add_tensor(mk(self.host_outprev[i]), TT.INPUT)
+            chip_args.add_tensor(mk(self.host_dS[i]), TT.OUTPUT_EXISTING)
+            chip_args.add_tensor(mk(self.host_dgamma[i]), TT.OUTPUT_EXISTING)
+            chip_args.add_tensor(
+                self._ContinuousTensor.make(
+                    data=domain.buffer_ptrs["scratch"] + slot_off_floats * DTYPE_NBYTES,
+                    shapes=(self._slot_floats,),
+                    dtype=self._DataType.FLOAT32,
+                    child_memory=True,
+                ),
+                TT.INOUT,
+            )
+            chip_args.add_scalar(self.dk)
+            chip_args.add_scalar(self.dv)
+            chip_args.add_scalar(self.K)
+            chip_args.add_scalar(domain.domain_size)
+            chip_args.add_scalar(1)  # epoch — each slot is zeroed once at alloc, so always 1
+            chip_args.add_scalar(domain.device_ctx)
+            orch.submit_next_level(self._cid_bwd, chip_args, cfg, worker=i)
+
     def _domain(self, orch, name, n_slots):
         nbytes = n_slots * self._slot_nbytes
         window_size = max(((nbytes + 511) // 512) * 512, 4 * 1024)
@@ -222,6 +309,28 @@ class SimplerAllscan(AllscanImpl):
         self.worker.run(orch_fn, args=None, config=self._CallConfig())
         for i in range(self.P):
             outputs[i].copy_(self.host_out[i])
+
+    def run_backward(self, g_out, gammas, outs, dS, dgamma):
+        assert self.worker is not None, "call build() first"
+        for i in range(self.P):
+            self.host_gout[i].copy_(g_out[i])
+            self.host_g[i].copy_(gammas[i])
+            # out_prev[i] = out[i-1]; rank 0 has no predecessor (dgamma[0] == 0).
+            if i == 0:
+                self.host_outprev[i].zero_()
+            else:
+                self.host_outprev[i].copy_(outs[i - 1])
+            self.host_dS[i].zero_()
+            self.host_dgamma[i].zero_()
+
+        def orch_fn(orch, _args, cfg):
+            with self._domain(orch, "allscan_bwd", 1) as handle:
+                self._submit_iter_backward(orch, handle, cfg, 0)
+
+        self.worker.run(orch_fn, args=None, config=self._CallConfig())
+        for i in range(self.P):
+            dS[i].copy_(self.host_dS[i])
+            dgamma[i].copy_(self.host_dgamma[i])
 
     def run_batch(self, S_locals, gammas, n_iters: int) -> float:
         """Dispatch ``n_iters`` AllScans inside ONE worker.run() under a single
