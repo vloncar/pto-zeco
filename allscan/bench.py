@@ -36,36 +36,13 @@ from typing import Optional
 import torch
 
 # Make the package importable when invoked from the repo root or any cwd.
-_THIS_DIR = Path(__file__).parent
+_THIS_DIR = Path(__file__).parent.parent  # repo root (pto-zeco/)
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-from common import AllscanImpl, expected_allscan, make_inputs  # noqa: E402
-from implementations import REGISTRY  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _parse_devices(raw: str) -> list[int]:
-    devices: list[int] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            a, b = token.split("-", 1)
-            devices.extend(range(int(a), int(b) + 1))
-        else:
-            devices.append(int(token))
-    return list(dict.fromkeys(devices))
-
-
-def _percentile(data: list[float], p: float) -> float:
-    s = sorted(data)
-    idx = max(0, min(int(len(s) * p / 100), len(s) - 1))
-    return s[idx]
+from allscan.common import AllscanImpl, expected_allscan, make_inputs  # noqa: E402
+from allscan.implementations import REGISTRY  # noqa: E402
+from common.harness import parse_devices, percentile, print_table  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -150,64 +127,14 @@ def bench_one(
         "cold_ms": cold_ms,
         "mean_ms": mean_ms,
         "min_ms": min(latencies_ms),
-        "p50_ms": _percentile(latencies_ms, 50),
-        "p95_ms": _percentile(latencies_ms, 95),
+        "p50_ms": percentile(latencies_ms, 50),
+        "p95_ms": percentile(latencies_ms, 95),
         "bw_mbs": bw_mbs,
         "correct": correct,
         "max_diff": max_diff,
         "amortized": bool(getattr(impl, "amortized_timing", False)),
         "raw_ms": latencies_ms,
     }
-
-
-# ---------------------------------------------------------------------------
-# Result display
-# ---------------------------------------------------------------------------
-
-_COLS = [
-    # (key,        header,     width, fmt)
-    ("impl",     "Impl",       7,  "s"),
-    ("P",        "P",          2,  "d"),
-    ("dk",       "dk",         4,  "d"),
-    ("dv",       "dv",         4,  "d"),
-    ("K",        "K",          2,  "d"),
-    ("build_s",  "Build(s)",   8,  ".2f"),
-    ("cold_ms",  "Cold(ms)",   9,  ".3f"),
-    ("mean_ms",  "Mean(ms)",   9,  ".3f"),
-    ("min_ms",   "Min(ms)",    8,  ".3f"),
-    ("p50_ms",   "p50(ms)",    8,  ".3f"),
-    ("p95_ms",   "p95(ms)",    8,  ".3f"),
-    ("bw_mbs",   "BW(MB/s)",   9,  ".2f"),
-    ("correct",  "OK",         4,  "s"),
-]
-
-
-def print_table(rows: list[dict]) -> None:
-    if not rows:
-        return
-    header = "  ".join(f"{label:>{width}}" for _, label, width, _ in _COLS)
-    sep    = "  ".join("-" * width          for _, _,     width, _ in _COLS)
-    print("\n" + header)
-    print(sep)
-    any_amortized = False
-    for row in rows:
-        parts = []
-        for key, _, width, fmt in _COLS:
-            val = row[key]
-            if key == "impl" and row.get("amortized"):
-                val = f"{val}*"
-                any_amortized = True
-            if key == "correct":
-                val = "?" if val is None else ("Y" if val else "N")
-                parts.append(f"{val:>{width}}")
-            else:
-                parts.append(f"{val:{width}{fmt}}")
-        print("  ".join(parts))
-    print()
-    if any_amortized:
-        print("* timing amortizes fixed per-call orchestration setup (comm-domain "
-              "alloc/free + drain) across a batch, so Mean/Min/etc. reflect the "
-              "marginal kernel+comm cost rather than full per-call latency.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +194,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    device_ids = _parse_devices(args.device)
+    device_ids = parse_devices(args.device)
     print(f"Devices : {device_ids}  ({len(device_ids)} available)")
     print(f"Platform: {args.platform}")
     print(f"Warmup  : {args.warmup}   Iters: {args.iters}   Verify: {not args.no_verify}")

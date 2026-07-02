@@ -9,8 +9,8 @@ import sys
 import pytest
 import torch
 
-from common import expected_allscan, make_inputs
-from implementations.torch_ref import TorchAllscan
+from allscan.common import expected_allscan, make_inputs
+from allscan.implementations.torch_ref import TorchAllscan
 
 
 @pytest.mark.parametrize("K", [1, 2, 4])

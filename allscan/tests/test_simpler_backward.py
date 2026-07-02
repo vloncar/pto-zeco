@@ -10,13 +10,13 @@ import sys
 import pytest
 import torch
 
-from common import (
+from allscan.common import (
     expected_allscan,
     expected_allscan_backward,
     make_grad_inputs,
     make_inputs,
 )
-from implementations.simpler.impl import SimplerAllscan
+from allscan.implementations.simpler.impl import SimplerAllscan
 
 
 @pytest.mark.parametrize("K", [1, 4])

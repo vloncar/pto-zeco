@@ -1,7 +1,23 @@
-# AllScan
+# pto-zeco
 
-Implementations and benchmark for the **AllScan** collective. Over P ranks
-arranged in a ring:
+Multi-backend implementations and benchmarks for **ZeCO** (Zero Communication
+Overhead sequence parallelism for Gated Linear Attention) and its communication
+core, the **AllScan** collective. Two layers:
+
+```
+allscan/   the AllScan collective — the SP communication primitive (forward + backward)
+gla/       the ZeCO / GLA operator — the linear-attention compute built on AllScan
+common/    backend-agnostic bench/CLI harness shared by both layers
+```
+
+The GLA operator defers its cross-device boundary-state hand-off to an AllScan
+backend, so `gla/` literally composes `allscan/`.
+
+---
+
+## AllScan (`allscan/`)
+
+Over P ranks arranged in a ring:
 
 ```
 out[0] = S_local[0]
@@ -11,11 +27,11 @@ out[p] = S_local[p] + gamma[p] * out[p-1]      (p = 1 .. P-1)
 `gamma[p]` is `[dk, 1]` and broadcasts across the `dv` columns of the `[dk, dv]`
 state. Work is pipelined over `K` blocks of `dk // K` rows.
 
-## Backward pass
+### Backward pass
 
-Given the upstream gradient `g_out[p] = dL/dout[p]`, the adjoint `d[p] = dL/dout[p]`
-(total, including the downstream chain) is a **reverse** scan with `gamma` shifted
-by one, from which the input gradients are local:
+Given the upstream gradient `g_out[p] = dL/dout[p]`, the adjoint `d[p]` (total,
+including the downstream chain) is a **reverse** scan with `gamma` shifted by one,
+from which the input gradients are local:
 
 ```
 d[P-1] = g_out[P-1]
@@ -27,141 +43,158 @@ dgamma[0]   = 0                                 (gamma[0] is unused)
 ```
 
 The forward ring flows `rank -> rank+1`; the adjoint flows `rank -> rank-1`. Each
-rank forwards the message `m = gamma[p] * d[p]` into the previous rank's recv slot,
-and the receiver adds its own `g_out` to form `d`. `out[p-1]` (needed for `dgamma`)
-is exactly the block each rank received during the forward pass, so the `dgamma`
-row-reduction is fully local — no extra exchange. Roles by rank: rank `P-1` is the
-source (no recv), ranks `1..P-2` are middle, rank `0` is the terminal (no send,
-`dgamma[0] = 0`).
+rank forwards `m = gamma[p] * d[p]` into the previous rank's recv slot, and the
+receiver adds its own `g_out` to form `d`. `out[p-1]` (needed for `dgamma`) is
+exactly the block each rank received during the forward pass, so the `dgamma`
+row-reduction is fully local. Roles by rank: rank `P-1` source (no recv),
+`1..P-2` middle, rank `0` terminal (no send, `dgamma[0] = 0`).
 
-Backends expose the backward pass via `run_backward(g_out, gammas, outs, dS, dgamma)`
-on the `AllscanImpl` interface (with the saved forward outputs `outs` passed in).
+Backends expose the pass via `run` / `run_backward(g_out, gammas, outs, dS, dgamma)`
+on the `AllscanImpl` interface. Status: torch, simpler, pypto — forward + backward,
+all HW-verified.
+
+---
+
+## ZeCO / GLA (`gla/`)
+
+Sequence-parallel Gated Linear Attention. Single head, data-dependent per-key-dim
+decay. The sequential golden (`gla.common.expected_gla`) is plain recurrent GLA
+over the full `P*L`-token sequence:
+
+```
+S_t = diag(a_t) @ S_{t-1} + k_t^T v_t           # state  S in R^{dk x dv}
+o_t = q_t @ S_t                                  # output o_t in R^{dv}
+```
+
+ZeCO computes the same thing in parallel over `P` devices, each holding a
+contiguous `L`-token slice split into `N = L // C` chunks:
+
+- **A — local chunk scan** (`gla_chunk_scan`): per chunk, within-chunk cumulative
+  decay `b_t = prod_{j<=t} a_j`, chunk total decay `gamma = b_{C-1}`, the local
+  state `S_[n]` and running cumulative decay, plus the device totals `S_total`,
+  `g_total`.
+- **B — intra-chunk masked attention** (overlaps comm): `scores[t,s] =
+  (q_t*b_t)·(k_s/b_s)` for `s <= t`, `O_intra = scores @ V`. In parallel,
+  **AllScan** the boundary state: `S_local[p] = S_total`, `gamma[p] = g_total`,
+  yielding each device's incoming prefix `S_recv = out[p-1] = S_{(p-1)L}`.
+- **C — output reconstruction** (`gla_reconstruct`): `O_inter[n] = (Q[n]*b) @
+  (S_prev[n] + diag(c_prev[n]) @ S_recv)`, then `O = O_inter + O_intra`.
+
+The chunk math lives in `gla/common.py` so every torch-level backend shares one
+implementation and agrees by construction.
+
+Backends implement the `ZeCoImpl` interface (`build` once, then
+`forward(Q, K, V, A)` many, `close`). **Status:** torch reference (in-process) +
+torch.distributed forward done and verified against the golden; simpler, pypto,
+and the full backward are planned.
+
+---
 
 ## Layout
 
 ```
-common.py                       AllscanImpl interface; expected_allscan / make_inputs
-                                and expected_allscan_backward / make_grad_inputs
-conftest.py                     shared --platform / --device pytest fixtures
-bench_allscan.py                forward benchmark — every registered implementation
-bench_allscan_backward.py       backward benchmark — simpler vs pypto (amortized)
+common/
+  harness.py                    parse_devices / percentile / print_table (shared bench plumbing)
+conftest.py                     shared --platform / --device pytest fixtures (repo root)
 
-implementations/
-  __init__.py                   REGISTRY (degrades gracefully if a backend's deps are missing)
-  torch_ref.py                  torch — in-process CPU ring baseline; forward + backward,
-                                plus standalone torch.distributed forward/backward references
-  pypto/
-    program.py                  build_allscan_program — the forward DSL program
-    program_backward.py         build_allscan_backward_program — the reverse-ring DSL program
-    batched_program.py          B-ring batched forward program generator (amortized timing)
-    batched_backward_program.py B-ring batched backward program generator (amortized timing)
-    impl.py                     PytoAllscan (forward) + PytoAllscanBackward (backward)
-  simpler/
-    impl.py                     simpler — direct PTO-runtime adapter + standalone CLI
-    kernels/aiv/allscan_kernel.cpp                    forward per-rank AIV kernel
-    kernels/aiv/allscan_backward_kernel.cpp           backward (reverse-ring) AIV kernel
-    kernels/orchestration/allscan_orch.cpp            forward: one AIV task per chip
-    kernels/orchestration/allscan_backward_orch.cpp   backward: one AIV task per chip
+allscan/
+  common.py                     AllscanImpl; expected_allscan / make_inputs + backward variants
+  bench.py                      forward benchmark — every registered backend
+  bench_backward.py             backward benchmark — simpler vs pypto (amortized)
+  implementations/
+    __init__.py                 REGISTRY (degrades gracefully if a backend's deps are missing)
+    torch_ref.py                torch — in-process CPU ring + standalone torch.distributed refs
+    pypto/                      DSL programs (fwd/bwd, single + batched) + impl.py
+    simpler/                    PTO-runtime adapter + AIV/orchestration kernels (fwd/bwd)
+  tests/                        test_{torch,pypto,simpler}[_backward].py
 
-tests/
-  test_torch.py                 CPU forward reference (any platform)
-  test_torch_backward.py        CPU backward reference + torch.autograd cross-check (any platform)
-  test_pypto.py                 forward DSL on --platform / --device
-  test_pypto_backward.py        backward DSL on --platform / --device
-  test_simpler.py               forward PTO runtime on --platform / --device
-  test_simpler_backward.py      backward PTO runtime on --platform / --device
+gla/
+  common.py                     ZeCoImpl; expected_gla / make_gla_inputs; gla_chunk_scan / gla_reconstruct
+  implementations/
+    __init__.py                 REGISTRY
+    torch_ref.py                TorchZeCo (in-process, composes AllScan) + torch.distributed ref
+  tests/
+    test_torch_gla.py           CPU: chunk==recurrent, in-process ZeCO, and gloo ring vs golden
 ```
 
-Every backend implements the `AllscanImpl` interface (`build` once, then `run` /
-`run_backward` many, `close`), so the benchmark and tests drive them uniformly.
+---
 
 ## Running
 
-The execution target is selected with `--platform` (`a2a3` hardware, `a2a3sim`
-simulator) and `--device` everywhere. On real hardware, preload HCCL via
-`LD_PRELOAD` (see below).
+Target is selected with `--platform` (`a2a3` hardware, `a2a3sim` simulator) and
+`--device`. On real hardware, preload HCCL via `LD_PRELOAD`.
 
 ### Tests
 
 ```bash
-# simulator (virtual devices, no NPU occupied) — forward + backward
-pytest tests/ --platform a2a3sim --device 0-3
+# CPU-only references (any platform) — AllScan + ZeCO torch layers
+pytest allscan/tests/test_torch.py allscan/tests/test_torch_backward.py gla/tests/test_torch_gla.py
 
-# real Ascend hardware
+# on-device AllScan backends: simulator / real hardware
+pytest allscan/tests/ --platform a2a3sim --device 0-3
 LD_PRELOAD=${CANN_HOME}/aarch64-linux/lib64/libhccl.so \
-    pytest tests/ --platform a2a3 --device 4-7
-
-# a single backend, or only the backward tests
-pytest tests/test_simpler.py --platform a2a3sim --device 0-3
-pytest tests/test_pypto_backward.py --platform a2a3 --device 4-7      # (with LD_PRELOAD)
+    pytest allscan/tests/ --platform a2a3 --device 4-7
 ```
 
-`test_torch_backward.py` also independently validates the closed-form backward
-against `torch.autograd`, so it anchors the math the device backends verify against.
+`test_torch_backward.py` cross-checks the AllScan backward against `torch.autograd`;
+`test_torch_gla.py` locks the GLA chunk math against plain recurrent GLA.
 
 ### Benchmark
 
-Both benchmarks time each backend's marginal kernel+comm cost by amortizing the
-fixed per-dispatch orchestration overhead (comm-domain alloc/free + drain) across
-a batch of `B = 16` dispatches (marked `*` in the table). The in-process torch
-baseline has no real communication and is excluded from the backward benchmark.
+Both AllScan benchmarks amortize the fixed per-dispatch orchestration overhead
+across `B = 16` dispatches (marked `*`), reporting marginal kernel+comm cost.
 
 ```bash
-# forward — simulator / real hardware / subset + JSON
-python bench_allscan.py --platform a2a3sim --device 0-3
+python allscan/bench.py --platform a2a3sim --device 0-3
 LD_PRELOAD=${CANN_HOME}/aarch64-linux/lib64/libhccl.so \
-    python bench_allscan.py --platform a2a3 --device 4,5,6,7
-python bench_allscan.py --platform a2a3sim --device 0-3 --impl simpler pypto --json results.json
-
-# backward — same flags; head-to-head simpler vs pypto
+    python allscan/bench.py --platform a2a3 --device 4,5,6,7
 LD_PRELOAD=${CANN_HOME}/aarch64-linux/lib64/libhccl.so \
-    python bench_allscan_backward.py --platform a2a3 --device 4-7 --json results_bwd.json
+    python allscan/bench_backward.py --platform a2a3 --device 4-7 --json results_bwd.json
 ```
 
 ### Standalone
 
 ```bash
-# direct PTO-runtime implementation, ad-hoc config
-python implementations/simpler/impl.py -p a2a3sim -d 0-3 --dk 128 --dv 128 --K 4
+# direct PTO-runtime AllScan, ad-hoc config
+python allscan/implementations/simpler/impl.py -p a2a3sim -d 0-3 --dk 128 --dv 128 --K 4
 
-# torch.distributed point-to-point references (forward then backward)
-python implementations/torch_ref.py
+# torch.distributed references (spawn one gloo process per rank)
+python -m allscan.implementations.torch_ref     # AllScan forward + backward
+python -m gla.implementations.torch_ref         # ZeCO forward
 ```
 
-## The `simpler` kernels
+Run these from the repo root (`pto-zeco/`) so the packages import.
 
-**Forward** — one uniform AIV kernel runs on every rank and selects its behaviour
-from `rankId`:
+## The `simpler` AllScan kernels
 
-- **rank 0** — source: emit `S_local`, push block to rank 1, no wait.
-- **rank 1..P-2** — receive from prev, fuse `S_local + gamma (*) recv` (`TROWEXPANDMUL` row broadcast), push to next.
-- **rank P-1** — receive from prev, fuse, terminate the chain.
+**Forward** — one uniform AIV kernel runs on every rank and selects behaviour from
+`rankId`: rank 0 source (emit `S_local`, push, no wait); ranks `1..P-2` receive,
+fuse `S_local + gamma (*) recv` (`TROWEXPANDMUL` row broadcast), push; rank `P-1`
+receive, fuse, terminate.
 
-**Backward** — a second uniform kernel runs the reverse ring: rank `P-1` is the
-source, rank `0` the terminal, `peer = rank - 1`. Each rank forms `d`, sends
-`gamma * d` to the previous rank, and computes `dgamma = rowsum_dv(d * out_prev)`
-locally (`TROWSUM`). It fits the 192KB UB (three `[128,128]` tiles) by sending the
-message **before** the row-sum and aliasing the reduction scratch onto the (now
-dead) `d` tile.
+**Backward** — a second uniform kernel runs the reverse ring: rank `P-1` source,
+rank `0` terminal, `peer = rank - 1`. Each rank forms `d`, sends `gamma * d` to the
+previous rank, and computes `dgamma = rowsum_dv(d * out_prev)` locally (`TROWSUM`).
+It fits the 192KB UB by sending the message **before** the row-sum and aliasing the
+reduction scratch onto the (now dead) `d` tile.
 
 Both kernels forward the computed block straight into the peer's recv slot in the
-shared HCCL window (remote `TSTORE`), flush it (`dcci`/`dsb`) and signal it
-(`TNOTIFY`); the receiver `TWAIT`s before reading. The domain window is zeroed at
-allocation, so per-block signals stay correct across repeated runs (`epoch = 1`
-each call).
+shared HCCL window (remote `TSTORE`), flush (`dcci`/`dsb`) and signal it (`TNOTIFY`);
+the receiver `TWAIT`s before reading. The domain window is zeroed at allocation, so
+per-block signals stay correct across repeated runs (`epoch = 1` each call).
 
 ## Troubleshooting
 
 **`comm_init … Timeout waiting for rootinfo` (or `HcclCommInitRootInfo failed`).**
-A benchmark/test that was killed or crashed mid-init leaves stale HCCL rendezvous
-files in `/tmp` (`barrier_pto_multi_comm_*…rootinfo…`). The next run's ranks then
-wait on stale rendezvous state and time out. Clean them up and re-run:
+A killed/crashed run leaves stale HCCL rendezvous files in `/tmp`
+(`barrier_pto_multi_comm_*…rootinfo…`); the next run's ranks then wait on stale
+state and time out. Clean them up and re-run:
 
 ```bash
 find /tmp -maxdepth 1 -name 'barrier_pto_multi_comm_*' -delete
 ```
 
-Also make sure the target NPUs are actually free (`npu-smi info` → "No running
-processes"), and always run on hardware with the `LD_PRELOAD=…/libhccl.so` prefix.
-Only one distributed worker may be prepared per device set at a time, so run the
-forward and backward benchmarks sequentially, not concurrently, on the same devices.
+Also make sure the target NPUs are free (`npu-smi info` → "No running processes"),
+and always run on hardware with the `LD_PRELOAD=…/libhccl.so` prefix. Only one
+distributed worker may be prepared per device set at a time, so run the forward and
+backward benchmarks sequentially, not concurrently, on the same devices.

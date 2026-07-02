@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import warnings
 
-from common import AllscanImpl
+from allscan.common import AllscanImpl
 
 REGISTRY: list[type[AllscanImpl]] = []
 
@@ -24,6 +24,6 @@ def _try_register(import_path: str, class_name: str) -> None:
         warnings.warn(f"AllScan backend {class_name} unavailable: {exc}", stacklevel=2)
 
 
-_try_register("implementations.torch_ref", "TorchAllscan")
-_try_register("implementations.pypto.impl", "PytoAllscan")
-_try_register("implementations.simpler.impl", "SimplerAllscan")
+_try_register("allscan.implementations.torch_ref", "TorchAllscan")
+_try_register("allscan.implementations.pypto.impl", "PytoAllscan")
+_try_register("allscan.implementations.simpler.impl", "SimplerAllscan")

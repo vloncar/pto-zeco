@@ -16,13 +16,13 @@ import sys
 import pytest
 import torch
 
-from common import (
+from allscan.common import (
     expected_allscan,
     expected_allscan_backward,
     make_grad_inputs,
     make_inputs,
 )
-from implementations.torch_ref import TorchAllscan
+from allscan.implementations.torch_ref import TorchAllscan
 
 
 def _autograd_backward(S_locals, gammas, g_out):

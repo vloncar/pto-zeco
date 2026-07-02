@@ -10,13 +10,13 @@ import sys
 import pytest
 import torch
 
-from common import (
+from allscan.common import (
     expected_allscan,
     expected_allscan_backward,
     make_grad_inputs,
     make_inputs,
 )
-from implementations.pypto.impl import PytoAllscanBackward
+from allscan.implementations.pypto.impl import PytoAllscanBackward
 
 
 @pytest.mark.parametrize("K", [1, 2, 4])

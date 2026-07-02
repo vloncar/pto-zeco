@@ -32,11 +32,11 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch  # noqa: E402
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from common import AllscanImpl, expected_allscan, make_inputs  # noqa: E402
+from allscan.common import AllscanImpl, expected_allscan, make_inputs  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KERNELS_DIR = os.path.join(HERE, "kernels")

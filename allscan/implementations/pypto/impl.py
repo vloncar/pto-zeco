@@ -23,12 +23,12 @@ import time
 
 import torch
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from common import AllscanImpl  # noqa: E402
-from implementations.pypto.batched_program import make_batched_builder  # noqa: E402
+from allscan.common import AllscanImpl  # noqa: E402
+from allscan.implementations.pypto.batched_program import make_batched_builder  # noqa: E402
 
 
 class PytoAllscan(AllscanImpl):
@@ -182,7 +182,7 @@ class PytoAllscanBackward(AllscanImpl):
         from pypto import ir
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
-        from implementations.pypto.batched_backward_program import make_batched_backward_builder
+        from allscan.implementations.pypto.batched_backward_program import make_batched_backward_builder
 
         self.P = P
         self._B = self._MEASURE_BATCH
