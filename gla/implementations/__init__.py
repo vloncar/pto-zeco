@@ -24,3 +24,4 @@ def _try_register(import_path: str, class_name: str) -> None:
 
 
 _try_register("gla.implementations.torch_ref", "TorchZeCo")
+_try_register("gla.implementations.pypto.impl", "PytoZeCo")

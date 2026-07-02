@@ -83,10 +83,24 @@ contiguous `L`-token slice split into `N = L // C` chunks:
 The chunk math lives in `gla/common.py` so every torch-level backend shares one
 implementation and agrees by construction.
 
+The **pypto** backend uses an equivalent **quadratic (unchunked, `C = L`) form**
+— the whole device slice as one block — because the chunk-recurrent state carry
+is not schedulable in this pypto build. With `b = exp(tril @ log A)` the
+device-global cumulative decay, each rank computes on-device:
+
+```
+O       = ((Q*b) @ (K/b)^T ⊙ mask_L) @ V   +   (Q*b) @ S_recv
+S_total = (K * (b[L-1] / b))^T @ V                       # local state -> AllScan
+```
+
+and `S_recv = out[r-1]` comes from the PyPTO AllScan. This is `O(L^2)` per device
+but uses only single matmuls; it matches the recurrent golden.
+
 Backends implement the `ZeCoImpl` interface (`build` once, then
-`forward(Q, K, V, A)` many, `close`). **Status:** torch reference (in-process) +
-torch.distributed forward done and verified against the golden; simpler, pypto,
-and the full backward are planned.
+`forward(Q, K, V, A)` many, `close`). **Status:** torch reference (in-process),
+torch.distributed, and **pypto** forward done and verified against the golden
+(pypto composes `stage1`/`stage2` `@pl.jit` kernels with the PyPTO AllScan). The
+hand-written `simpler` GLA kernel and the full backward are out of current scope.
 
 ---
 
@@ -113,8 +127,12 @@ gla/
   implementations/
     __init__.py                 REGISTRY
     torch_ref.py                TorchZeCo (in-process, composes AllScan) + torch.distributed ref
+    pypto/
+      program.py                stage1/stage2 @pl.jit GLA kernels (quadratic form, shape-baked)
+      impl.py                   PytoZeCo — composes the jit stages with the PyPTO AllScan
   tests/
     test_torch_gla.py           CPU: chunk==recurrent, in-process ZeCO, and gloo ring vs golden
+    test_pypto_gla.py           on-device: PytoZeCo vs golden (P=1 compute, P>=2 full SP path)
 ```
 
 ---
@@ -134,10 +152,16 @@ pytest allscan/tests/test_torch.py allscan/tests/test_torch_backward.py gla/test
 pytest allscan/tests/ --platform a2a3sim --device 0-3
 LD_PRELOAD=${CANN_HOME}/aarch64-linux/lib64/libhccl.so \
     pytest allscan/tests/ --platform a2a3 --device 4-7
+
+# on-device pypto ZeCO (compute + AllScan boundary): simulator / real hardware
+pytest gla/tests/test_pypto_gla.py --platform a2a3sim --device 0,1
+LD_PRELOAD=${CANN_HOME}/aarch64-linux/lib64/libhccl.so \
+    pytest gla/tests/test_pypto_gla.py --platform a2a3 --device 4,5
 ```
 
 `test_torch_backward.py` cross-checks the AllScan backward against `torch.autograd`;
-`test_torch_gla.py` locks the GLA chunk math against plain recurrent GLA.
+`test_torch_gla.py` locks the GLA chunk math against plain recurrent GLA;
+`test_pypto_gla.py` checks the on-device pypto ZeCO against the same golden.
 
 ### Benchmark
 
