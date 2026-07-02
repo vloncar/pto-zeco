@@ -58,6 +58,12 @@ class PytoAllscan(AllscanImpl):
         self._rt = None
 
     def build(self, dk, dv, K, P, device_ids, platform):
+        """Compile the batched program and prepare the DistributedWorker.
+
+        Args as in :meth:`common.AllscanImpl.build`. Compiles a ``_B``-ring
+        batched program (for amortized timing) and prepares a single reusable
+        worker; ``run``/verify read ring slice 0.
+        """
         # Release any DistributedWorker from a previous config first: it holds a
         # forked L3 Worker whose chip children leak if not closed.
         self.close()
@@ -89,8 +95,11 @@ class PytoAllscan(AllscanImpl):
         self._rt(self._host_s, self._host_g, self._host_out_b)
 
     def run(self, S_locals, gammas, outputs):
-        # All `_B` rings compute the same AllScan from the same inputs, so ring
-        # slice 0 is the result; used for the cold-start call and verification.
+        """Forward AllScan; args as in :meth:`common.AllscanImpl.run`.
+
+        All ``_B`` rings compute the same AllScan from the same inputs, so ring
+        slice 0 is the result (used for the cold-start call and verification).
+        """
         assert self._rt is not None, "call build() first"
         self._host_s.copy_(S_locals)
         self._host_g.copy_(gammas)
@@ -102,6 +111,14 @@ class PytoAllscan(AllscanImpl):
         single comm domain (each ring on its own window buffers + output slice).
         Returns total wall time (seconds); ``total / n_iters`` is the marginal
         kernel+comm cost. Requires n_iters == self._B (the compiled batch size).
+
+        Args:
+            S_locals: Per-rank local state, ``[P, dk, dv]`` (shared by all rings).
+            gammas: Per-rank decay factors, ``[P, dk, 1]``.
+            n_iters: Number of rings; must equal ``self._B``.
+
+        Returns:
+            Total wall time for the batched dispatch, in seconds.
         """
         assert self._rt is not None, "call build() first"
         assert n_iters == self._B, f"batched program compiled for B={self._B}, got {n_iters}"
@@ -148,45 +165,112 @@ class PytoAllscanBackward(AllscanImpl):
 
     name = "pypto"
 
+    #: Number of backward passes dispatched per batched timing sample.
+    _MEASURE_BATCH = 16
+
     def __init__(self) -> None:
         self._rt = None
 
     def build(self, dk, dv, K, P, device_ids, platform):
+        """Compile the batched backward program and prepare the worker.
+
+        Args as in :meth:`common.AllscanImpl.build`. Prepares only the backward
+        worker (one worker per device set); ``run_backward``/verify read slice 0.
+        """
         self.close()
 
         from pypto import ir
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
-        from implementations.pypto.program_backward import build_allscan_backward_program
+        from implementations.pypto.batched_backward_program import make_batched_backward_builder
 
         self.P = P
+        self._B = self._MEASURE_BATCH
         dist_cfg = DistributedConfig(device_ids=device_ids[:P], num_sub_workers=0)
-        program = build_allscan_backward_program(dk, dv, K, P)
-        compiled = ir.compile(program, platform=platform, distributed_config=dist_cfg)
+
+        # Batched backward program: `_B` independent rings per dispatch under one
+        # comm domain (each on its OWN window buffers + output slice), so the
+        # fixed comm-domain overhead is amortized in measure_backward. The
+        # single-ring program_backward.py is its source of truth. As in the
+        # forward class, only ONE DistributedWorker may be prepared per device
+        # set, so run_backward/verify reuse this worker and read ring slice 0.
+        program_b = make_batched_backward_builder(self._B)(dk, dv, K, P)
+        compiled_b = ir.compile(program_b, platform=platform, distributed_config=dist_cfg)
 
         # Shared-memory IO buffers must exist before prepare() forks chip workers.
+        # Inputs are shared across all `_B` rings; each ring writes its own slice.
         self._host_gout = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
         self._host_g = torch.zeros((P, dk, 1), dtype=torch.float32).share_memory_()
         self._host_outprev = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
-        self._host_dS = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
-        self._host_dgamma = torch.zeros((P, dk, 1), dtype=torch.float32).share_memory_()
-        self._rt = compiled.prepare()
+        self._host_dS_b = torch.zeros((self._B, P, dk, dv), dtype=torch.float32).share_memory_()
+        self._host_dgamma_b = torch.zeros((self._B, P, dk, 1), dtype=torch.float32).share_memory_()
+        self._rt = compiled_b.prepare()
 
     def run(self, S_locals, gammas, outputs):
+        """Not implemented — this class is backward-only (use :class:`PytoAllscan`
+        for the forward pass). Args match the interface but always raise."""
         raise NotImplementedError("PytoAllscanBackward implements run_backward only")
 
-    def run_backward(self, g_out, gammas, outs, dS, dgamma):
-        assert self._rt is not None, "call build() first"
+    def _copy_inputs(self, g_out, gammas, outs):
+        """Stage shared inputs into the host buffers.
+
+        Args:
+            g_out: Upstream gradient, ``[P, dk, dv]``.
+            gammas: Per-rank decay factors, ``[P, dk, 1]``.
+            outs: Retained forward outputs, ``[P, dk, dv]``; ``out_prev[r]`` is set
+                to ``outs[r-1]`` (row 0 left zero — rank 0 has no predecessor).
+        """
         self._host_gout.copy_(g_out)
         self._host_g.copy_(gammas)
         # out_prev[r] = out[r-1]; rank 0 has no predecessor (dgamma[0] == 0).
         self._host_outprev.zero_()
         self._host_outprev[1:].copy_(outs[:-1])
-        self._host_dS.zero_()
-        self._host_dgamma.zero_()
-        self._rt(self._host_gout, self._host_g, self._host_outprev, self._host_dS, self._host_dgamma)
-        dS.copy_(self._host_dS)
-        dgamma.copy_(self._host_dgamma)
+
+    def run_backward(self, g_out, gammas, outs, dS, dgamma):
+        """Backward AllScan; args as in :meth:`common.AllscanImpl.run_backward`.
+
+        All ``_B`` rings compute the same result from the same inputs, so ring
+        slice 0 is the answer (used for the cold-start call and verification).
+        """
+        assert self._rt is not None, "call build() first"
+        self._copy_inputs(g_out, gammas, outs)
+        self._host_dS_b.zero_()
+        self._host_dgamma_b.zero_()
+        self._rt(self._host_gout, self._host_g, self._host_outprev, self._host_dS_b, self._host_dgamma_b)
+        dS.copy_(self._host_dS_b[0])
+        dgamma.copy_(self._host_dgamma_b[0])
+
+    def run_batch_backward(self, g_out, gammas, outs, n_iters: int) -> float:
+        """Dispatch ``n_iters`` backward passes in ONE dispatch under a single
+        comm domain (each ring on its own window buffers + output slice). Returns
+        total wall time (seconds); ``total / n_iters`` is the marginal cost.
+        Requires n_iters == self._B (the compiled batch size).
+
+        Args:
+            g_out: Upstream gradient, ``[P, dk, dv]`` (shared by all rings).
+            gammas: Per-rank decay factors, ``[P, dk, 1]``.
+            outs: Retained forward outputs, ``[P, dk, dv]`` (for ``out_prev``).
+            n_iters: Number of rings; must equal ``self._B``.
+
+        Returns:
+            Total wall time for the batched dispatch, in seconds.
+        """
+        assert self._rt is not None, "call build() first"
+        assert n_iters == self._B, f"batched program compiled for B={self._B}, got {n_iters}"
+        self._copy_inputs(g_out, gammas, outs)
+        self._host_dS_b.zero_()
+        self._host_dgamma_b.zero_()
+        t0 = time.perf_counter()
+        self._rt(self._host_gout, self._host_g, self._host_outprev, self._host_dS_b, self._host_dgamma_b)
+        return time.perf_counter() - t0
+
+    #: pypto amortizes the per-dispatch comm-domain overhead in measure_backward.
+    amortized_timing = True
+
+    def measure_backward(self, g_out, gammas, outs, dS, dgamma, n_iters):
+        """Amortized backward samples: one batched dispatch of `_B` passes / `_B`."""
+        batch = self._B
+        return [self.run_batch_backward(g_out, gammas, outs, batch) / batch * 1e3 for _ in range(n_iters)]
 
     def close(self):
         if self._rt is not None:

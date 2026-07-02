@@ -45,7 +45,17 @@ DTYPE_NBYTES = 4  # float32
 
 
 def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
-    """Compile the AIV allscan kernel + its C++ orchestration shim."""
+    """Compile the forward AIV allscan kernel + its C++ orchestration shim.
+
+    Args:
+        platform: Target backend, e.g. ``"a2a3"`` (hardware) or ``"a2a3sim"``
+            (simulator); a ``sim`` suffix skips the ELF ``.text`` extraction.
+        pto_isa_commit: Optional PTO-ISA commit/tag to fetch for the kernel
+            headers; ``None`` uses the default checkout.
+
+    Returns:
+        A ``ChipCallable`` (one AIV task per chip) ready to register on a Worker.
+    """
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable
     from simpler_setup.elf_parser import extract_text_section
     from simpler_setup.kernel_compiler import KernelCompiler
@@ -87,7 +97,15 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
 def build_backward_chip_callable(platform: str, pto_isa_commit: str | None = None):
     """Compile the AIV allscan *backward* kernel + its C++ orchestration shim.
 
-    Signature: g_out, gamma, out_prev (IN), dS, dgamma (OUT), scratch (INOUT).
+    Kernel signature: g_out, gamma, out_prev (IN), dS, dgamma (OUT), scratch (INOUT).
+
+    Args:
+        platform: Target backend (``"a2a3"`` / ``"a2a3sim"``); a ``sim`` suffix
+            skips the ELF ``.text`` extraction.
+        pto_isa_commit: Optional PTO-ISA commit/tag for the kernel headers.
+
+    Returns:
+        A ``ChipCallable`` for the reverse-ring backward kernel.
     """
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable
     from simpler_setup.elf_parser import extract_text_section
@@ -154,10 +172,21 @@ class SimplerAllscan(AllscanImpl):
     _MEASURE_BATCH = 16
 
     def __init__(self, pto_isa_commit: str | None = None) -> None:
+        """Args:
+            pto_isa_commit: Optional PTO-ISA commit/tag to fetch for kernel
+                headers (passed through to the compilers); ``None`` = default.
+        """
         self.pto_isa_commit = pto_isa_commit
         self.worker = None
 
     def build(self, dk, dv, K, P, device_ids, platform):
+        """Compile both kernels and stand up the persistent Worker.
+
+        Args as in :meth:`common.AllscanImpl.build`. Registers the forward and
+        backward chip callables on one Worker (a single Worker can host both;
+        it is preparing *two distributed workers* on a device set that collides).
+        Allocates the per-rank shared-memory IO tensors reused across dispatches.
+        """
         # Tear down any Worker from a previous config before standing up a new
         # one: build() is called once per benchmark config on a reused impl
         # object, and a forked L3 Worker that isn't closed leaks its chip child
@@ -224,8 +253,16 @@ class SimplerAllscan(AllscanImpl):
         self.host_dgamma = [torch.zeros((dk, 1), dtype=torch.float32).share_memory_() for _ in range(P)]
 
     def _submit_iter(self, orch, handle, cfg, slot_off_floats):
-        """Submit one full P-rank AllScan, using the window slot at
-        ``slot_off_floats`` (in floats) for every rank's recv+signal region."""
+        """Submit one full P-rank forward AllScan into the given window slot.
+
+        Args:
+            orch: The orchestration handle for the current ``worker.run`` call.
+            handle: Per-rank comm-domain handles (buffer ptrs, sizes, ctx).
+            cfg: The ``CallConfig`` for the submitted tasks.
+            slot_off_floats: Offset (in floats) of this iteration's disjoint
+                recv+signal slot within the comm-domain scratch buffer — lets a
+                batch of iterations share one domain without racing.
+        """
         Args = self._TaskArgs
         TT = self._TensorArgType
         mk = self._make_tensor_arg
@@ -253,8 +290,15 @@ class SimplerAllscan(AllscanImpl):
             orch.submit_next_level(self._cid, chip_args, cfg, worker=i)
 
     def _submit_iter_backward(self, orch, handle, cfg, slot_off_floats):
-        """Submit one full P-rank AllScan backward, using the window slot at
-        ``slot_off_floats`` (in floats) for every rank's recv+signal region."""
+        """Submit one full P-rank backward AllScan into the given window slot.
+
+        Args:
+            orch: The orchestration handle for the current ``worker.run`` call.
+            handle: Per-rank comm-domain handles.
+            cfg: The ``CallConfig`` for the submitted tasks.
+            slot_off_floats: Offset (in floats) of this iteration's disjoint
+                recv+signal slot within the comm-domain scratch buffer.
+        """
         Args = self._TaskArgs
         TT = self._TensorArgType
         mk = self._make_tensor_arg
@@ -284,6 +328,18 @@ class SimplerAllscan(AllscanImpl):
             orch.submit_next_level(self._cid_bwd, chip_args, cfg, worker=i)
 
     def _domain(self, orch, name, n_slots):
+        """Allocate a symmetric HCCL comm-domain window over all ``P`` workers.
+
+        Args:
+            orch: The orchestration handle.
+            name: A label for the domain (distinct per allocation site).
+            n_slots: Number of disjoint recv+signal slots to reserve (1 for a
+                single dispatch, ``B`` for a batched run). Sizes the window to
+                ``n_slots`` slots, 512-byte aligned, minimum 4 KiB.
+
+        Returns:
+            A context-manager domain handle (auto-freed on exit).
+        """
         nbytes = n_slots * self._slot_nbytes
         window_size = max(((nbytes + 511) // 512) * 512, 4 * 1024)
         return orch.allocate_domain(
@@ -296,6 +352,11 @@ class SimplerAllscan(AllscanImpl):
         )
 
     def run(self, S_locals, gammas, outputs):
+        """Forward AllScan; args as in :meth:`common.AllscanImpl.run`.
+
+        Copies inputs into the per-rank shared tensors, runs the multi-chip DAG
+        under a freshly-allocated (zeroed) comm domain, and copies results back.
+        """
         assert self.worker is not None, "call build() first"
         for i in range(self.P):
             self.host_s[i].copy_(S_locals[i])
@@ -311,6 +372,11 @@ class SimplerAllscan(AllscanImpl):
             outputs[i].copy_(self.host_out[i])
 
     def run_backward(self, g_out, gammas, outs, dS, dgamma):
+        """Backward AllScan; args as in :meth:`common.AllscanImpl.run_backward`.
+
+        Loads ``out_prev[i] = outs[i-1]`` (zeros for rank 0), runs the reverse-ring
+        DAG under a fresh comm domain, and copies ``dS`` / ``dgamma`` back.
+        """
         assert self.worker is not None, "call build() first"
         for i in range(self.P):
             self.host_gout[i].copy_(g_out[i])
@@ -339,6 +405,14 @@ class SimplerAllscan(AllscanImpl):
         drain round-trip once for the whole batch instead of once per iteration,
         so ``total / n_iters`` reflects the marginal kernel+comm cost. The slots
         are disjoint, so iterations cannot race on each other's recv/signal.
+
+        Args:
+            S_locals: Per-rank local state, ``[P, dk, dv]`` (shared by all iters).
+            gammas: Per-rank decay factors, ``[P, dk, 1]``.
+            n_iters: Number of AllScans to pack into the single dispatch.
+
+        Returns:
+            Total wall time for the batched dispatch, in seconds.
         """
         assert self.worker is not None, "call build() first"
         for i in range(self.P):
@@ -349,6 +423,39 @@ class SimplerAllscan(AllscanImpl):
             with self._domain(orch, "allscan_batch", n_iters) as handle:
                 for it in range(n_iters):
                     self._submit_iter(orch, handle, cfg, it * self._slot_floats)
+
+        t0 = time.perf_counter()
+        self.worker.run(orch_fn, args=None, config=self._CallConfig())
+        return time.perf_counter() - t0
+
+    def run_batch_backward(self, g_out, gammas, outs, n_iters: int) -> float:
+        """Dispatch ``n_iters`` AllScan *backward* passes inside ONE worker.run()
+        under a single comm domain, each to a disjoint window slot. Returns the
+        total wall time (seconds); ``total / n_iters`` is the marginal
+        kernel+comm cost, mirroring :meth:`run_batch` for the backward kernel.
+
+        Args:
+            g_out: Upstream gradient, ``[P, dk, dv]`` (shared by all iterations).
+            gammas: Per-rank decay factors, ``[P, dk, 1]``.
+            outs: Retained forward outputs, ``[P, dk, dv]`` (for ``out_prev``).
+            n_iters: Number of backward passes to pack into the single dispatch.
+
+        Returns:
+            Total wall time for the batched dispatch, in seconds.
+        """
+        assert self.worker is not None, "call build() first"
+        for i in range(self.P):
+            self.host_gout[i].copy_(g_out[i])
+            self.host_g[i].copy_(gammas[i])
+            if i == 0:
+                self.host_outprev[i].zero_()
+            else:
+                self.host_outprev[i].copy_(outs[i - 1])
+
+        def orch_fn(orch, _args, cfg):
+            with self._domain(orch, "allscan_bwd_batch", n_iters) as handle:
+                for it in range(n_iters):
+                    self._submit_iter_backward(orch, handle, cfg, it * self._slot_floats)
 
         t0 = time.perf_counter()
         self.worker.run(orch_fn, args=None, config=self._CallConfig())
@@ -366,6 +473,11 @@ class SimplerAllscan(AllscanImpl):
         batch = self._MEASURE_BATCH
         return [self.run_batch(S_locals, gammas, batch) / batch * 1e3 for _ in range(n_iters)]
 
+    def measure_backward(self, g_out, gammas, outs, dS, dgamma, n_iters):
+        """Amortized backward per-iteration samples (see :meth:`measure`)."""
+        batch = self._MEASURE_BATCH
+        return [self.run_batch_backward(g_out, gammas, outs, batch) / batch * 1e3 for _ in range(n_iters)]
+
     def close(self):
         if self.worker is not None:
             self.worker.close()
@@ -377,6 +489,15 @@ class SimplerAllscan(AllscanImpl):
 # ---------------------------------------------------------------------------
 
 def _parse_device_range(spec: str) -> list[int]:
+    """Parse a ``--device`` spec into a device-id list.
+
+    Args:
+        spec: Either an inclusive range ``"lo-hi"`` (e.g. ``"0-3"``) or a
+            comma-separated list (e.g. ``"0,1,4"``).
+
+    Returns:
+        The parsed device ids (2..16 required by AllScan).
+    """
     if "-" in spec:
         lo, hi = (int(x) for x in spec.split("-"))
         ids = list(range(lo, hi + 1))

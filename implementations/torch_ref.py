@@ -42,9 +42,15 @@ class TorchAllscan(AllscanImpl):
     name = "torch"
 
     def build(self, dk, dv, K, P, device_ids, platform):
+        """Store the config (no compilation needed for the CPU reference).
+
+        Args are as in :meth:`common.AllscanImpl.build`; ``device_ids`` and
+        ``platform`` are ignored (this backend is pure in-process CPU).
+        """
         self.dk, self.dv, self.K, self.P = dk, dv, K, P
 
     def run(self, S_locals, gammas, outputs):
+        """Forward scan; args as in :meth:`common.AllscanImpl.run`."""
         P, K = self.P, self.K
         dk = S_locals.shape[1]
         block = dk // K
@@ -58,9 +64,12 @@ class TorchAllscan(AllscanImpl):
                 )
 
     def run_backward(self, g_out, gammas, outs, dS, dgamma):
-        # Reverse-ring adjoint scan, K-blocked to mirror the pipelined kernels.
-        # dS doubles as storage for the adjoint d[p] (dS[p] == d[p]); dgamma[0]
-        # is left zero since gamma[0] is unused in the forward.
+        """Backward scan; args as in :meth:`common.AllscanImpl.run_backward`.
+
+        Reverse-ring adjoint scan, K-blocked to mirror the pipelined kernels.
+        ``dS`` doubles as storage for the adjoint ``d[p]`` (``dS[p] == d[p]``);
+        ``dgamma[0]`` is left zero since ``gamma[0]`` is unused in the forward.
+        """
         P, K = self.P, self.K
         dk = g_out.shape[1]
         block = dk // K
@@ -83,7 +92,19 @@ class TorchAllscan(AllscanImpl):
 # ---------------------------------------------------------------------------
 
 def _all_scan_p2p(rank, world_size, S_local, gamma, K, device):
-    """Distributed All-Scan via point-to-point send/recv. ``S_local``: [dk, dv]."""
+    """Distributed forward AllScan via point-to-point send/recv (one rank's work).
+
+    Args:
+        rank: This process's rank in the ring (``0 .. world_size-1``).
+        world_size: Number of ring participants (P).
+        S_local: This rank's local state, ``[dk, dv]``.
+        gamma: This rank's decay factor, ``[dk, 1]``.
+        K: Pipeline depth (number of ``dk // K``-row blocks).
+        device: Torch device for the recv scratch buffer (CPU here).
+
+    Returns:
+        This rank's scan output ``S_send``, ``[dk, dv]``.
+    """
     import torch.distributed as dist
 
     assert S_local.shape[0] % K == 0
@@ -107,6 +128,17 @@ def _all_scan_p2p(rank, world_size, S_local, gamma, K, device):
 
 
 def _worker(rank, world_size, S_locals, gammas, K, output_queue):
+    """Per-rank gloo process body for the forward reference.
+
+    Args:
+        rank: This process's rank.
+        world_size: Number of ranks (P).
+        S_locals: All ranks' local state, ``[P, dk, dv]`` (this rank uses row
+            ``rank``); passed whole for pickling simplicity.
+        gammas: All ranks' decay factors, ``[P, dk, 1]``.
+        K: Pipeline depth.
+        output_queue: Queue to return ``(rank, S_send.tolist())`` to the parent.
+    """
     import torch.distributed as dist
 
     os.environ["MASTER_ADDR"] = "localhost"
@@ -119,7 +151,18 @@ def _worker(rank, world_size, S_locals, gammas, K, output_queue):
 
 
 def run_distributed(P: int = 4, dk: int = 64, dv: int = 64, K: int = 4) -> int:
-    """Spawn one gloo process per rank and verify against the sequential reference."""
+    """Spawn one gloo process per rank and verify against the sequential reference.
+
+    Args:
+        P: Number of ranks (processes) to spawn.
+        dk: Key/row dimension.
+        dv: Value/column dimension.
+        K: Pipeline depth.
+
+    Returns:
+        Process exit code: ``0`` if the distributed result matches the sequential
+        reference, ``1`` otherwise.
+    """
     import torch.multiprocessing as mp
 
     S_locals, gammas, _ = make_inputs(P, dk, dv)
@@ -161,7 +204,19 @@ def _all_scan_backward_p2p(rank, world_size, g_out_r, gamma_r, fwd_recv_r, K, de
     to ``p-1``. ``dgamma[p]`` reduces locally against ``fwd_recv_r == out[p-1]``,
     which is exactly the block rank ``p`` received during the forward pass.
 
-    ``g_out_r``/``fwd_recv_r``: ``[dk, dv]``; ``gamma_r``: ``[dk, 1]``.
+    Args:
+        rank: This process's rank in the ring.
+        world_size: Number of ring participants (P).
+        g_out_r: This rank's upstream gradient ``g_out[rank]``, ``[dk, dv]``.
+        gamma_r: This rank's decay factor ``gamma[rank]``, ``[dk, 1]``.
+        fwd_recv_r: ``out[rank-1]`` — the block this rank received in the forward
+            pass (zeros for rank 0), ``[dk, dv]``; used for the local dgamma reduction.
+        K: Pipeline depth.
+        device: Torch device for scratch buffers (CPU here).
+
+    Returns:
+        ``(dS_r[dk,dv], dgamma_r[dk,1])`` — this rank's gradients (``dgamma_r`` is
+        0 for rank 0).
     """
     import torch.distributed as dist
 
@@ -193,6 +248,17 @@ def _all_scan_backward_p2p(rank, world_size, g_out_r, gamma_r, fwd_recv_r, K, de
 
 
 def _worker_backward(rank, world_size, g_out, gammas, fwd_recv, K, output_queue):
+    """Per-rank gloo process body for the backward reference.
+
+    Args:
+        rank: This process's rank.
+        world_size: Number of ranks (P).
+        g_out: All ranks' upstream gradients, ``[P, dk, dv]`` (this rank uses row ``rank``).
+        gammas: All ranks' decay factors, ``[P, dk, 1]``.
+        fwd_recv: Per-rank ``out[rank-1]`` blocks, ``[P, dk, dv]`` (row 0 is zeros).
+        K: Pipeline depth.
+        output_queue: Queue to return ``(rank, dS_r.tolist(), dgamma_r.tolist())``.
+    """
     import torch.distributed as dist
 
     os.environ["MASTER_ADDR"] = "localhost"
@@ -207,7 +273,18 @@ def _worker_backward(rank, world_size, g_out, gammas, fwd_recv, K, output_queue)
 
 
 def run_distributed_backward(P: int = 4, dk: int = 64, dv: int = 64, K: int = 4) -> int:
-    """Spawn one gloo process per rank for the backward pass and verify."""
+    """Spawn one gloo process per rank for the backward pass and verify.
+
+    Args:
+        P: Number of ranks (processes) to spawn.
+        dk: Key/row dimension.
+        dv: Value/column dimension.
+        K: Pipeline depth.
+
+    Returns:
+        Process exit code: ``0`` if ``(dS, dgamma)`` match the sequential
+        backward reference, ``1`` otherwise.
+    """
     import torch.multiprocessing as mp
 
     S_locals, gammas, _ = make_inputs(P, dk, dv)

@@ -26,7 +26,17 @@ import torch
 # ---------------------------------------------------------------------------
 
 def expected_allscan(S_locals: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
-    """Pure sequential AllScan, used by every test/benchmark for verification."""
+    """Pure sequential AllScan, used by every test/benchmark for verification.
+
+    Args:
+        S_locals: Per-rank local state, shape ``[P, dk, dv]`` (rank ``p`` owns
+            ``S_locals[p]``).
+        gammas: Per-rank decay factors, shape ``[P, dk, 1]``; ``gammas[p]``
+            broadcasts across the ``dv`` columns of ``out[p-1]``.
+
+    Returns:
+        The scan output ``out``, shape ``[P, dk, dv]``.
+    """
     P = S_locals.shape[0]
     out = torch.zeros_like(S_locals)
     out[0] = S_locals[0]
@@ -40,8 +50,17 @@ def make_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Deterministic inputs shared across implementations.
 
-    Returns ``(S_locals[P,dk,dv], gammas[P,dk,1], outputs[P,dk,dv])`` with the
-    same seed every backend uses, so results are directly comparable.
+    The same seed is used by every backend so results are directly comparable.
+
+    Args:
+        P: Number of ranks (ring participants).
+        dk: Key/row dimension of the per-rank state.
+        dv: Value/column dimension of the per-rank state.
+        seed: RNG seed for the (reproducible) random inputs.
+
+    Returns:
+        ``(S_locals[P,dk,dv], gammas[P,dk,1], outputs[P,dk,dv])`` — random state
+        and decays, plus a zeroed output buffer for the backend to fill.
     """
     torch.manual_seed(seed)
     S_locals = torch.rand((P, dk, dv), dtype=torch.float32)
@@ -69,7 +88,14 @@ def expected_allscan_backward(
         dgamma[p]   = rowsum_dv( d[p] * out[p-1] )      (p = 1..P-1) -> [dk,1]
         dgamma[0]   = 0                                 (gamma[0] is unused)
 
-    Returns ``(dS[P,dk,dv], dgamma[P,dk,1])``.
+    Args:
+        gammas: Per-rank decay factors, shape ``[P, dk, 1]`` (same as forward).
+        outs: Retained forward outputs ``out[p]``, shape ``[P, dk, dv]``.
+        g_out: Upstream gradient ``dL/dout[p]``, shape ``[P, dk, dv]``.
+
+    Returns:
+        ``(dS[P,dk,dv], dgamma[P,dk,1])`` — gradients w.r.t. ``S_local`` and
+        ``gamma``.
     """
     P = g_out.shape[0]
     dS = torch.zeros_like(g_out)
@@ -87,6 +113,15 @@ def make_grad_inputs(P: int, dk: int, dv: int, seed: int = 1234) -> torch.Tensor
 
     Uses a different default seed from :func:`make_inputs` so the upstream grad
     is not accidentally correlated with the forward inputs.
+
+    Args:
+        P: Number of ranks.
+        dk: Key/row dimension.
+        dv: Value/column dimension.
+        seed: RNG seed (distinct from ``make_inputs`` by default).
+
+    Returns:
+        Random upstream gradient ``g_out``, shape ``[P, dk, dv]``.
     """
     torch.manual_seed(seed)
     return torch.rand((P, dk, dv), dtype=torch.float32)
@@ -119,7 +154,18 @@ class AllscanImpl(ABC):
         device_ids: list[int],
         platform: str,
     ) -> None:
-        """Compile or initialise the implementation. Called once per config."""
+        """Compile or initialise the implementation. Called once per config.
+
+        Args:
+            dk: Key/row dimension of the per-rank ``[dk, dv]`` state.
+            dv: Value/column dimension of the state.
+            K: Pipeline depth — the scan is blocked into ``K`` chunks of
+                ``dk // K`` rows (``dk`` must be divisible by ``K``).
+            P: Number of ranks; the first ``P`` of ``device_ids`` are used.
+            device_ids: Physical device ids available to this run.
+            platform: Target backend, e.g. ``"a2a3"`` (hardware) or
+                ``"a2a3sim"`` (simulator).
+        """
 
     @abstractmethod
     def run(
@@ -128,7 +174,14 @@ class AllscanImpl(ABC):
         gammas: torch.Tensor,
         outputs: torch.Tensor,
     ) -> None:
-        """Execute the AllScan collective synchronously, writing into ``outputs``."""
+        """Execute the AllScan collective synchronously, writing into ``outputs``.
+
+        Args:
+            S_locals: Per-rank local state, shape ``[P, dk, dv]``.
+            gammas: Per-rank decay factors, shape ``[P, dk, 1]``.
+            outputs: Destination for the scan result, shape ``[P, dk, dv]``;
+                overwritten in place.
+        """
 
     def run_backward(
         self,
@@ -140,11 +193,18 @@ class AllscanImpl(ABC):
     ) -> None:
         """Execute the AllScan backward pass synchronously.
 
-        Given the upstream gradient ``g_out[P,dk,dv]``, the per-rank decay
-        ``gammas[P,dk,1]``, and the retained forward outputs ``outs[P,dk,dv]``,
-        write the input gradients into ``dS[P,dk,dv]`` and ``dgamma[P,dk,1]``
-        (see :func:`expected_allscan_backward` for the exact math). Optional:
-        backends implement it as they gain a backward kernel.
+        Writes the input gradients (see :func:`expected_allscan_backward` for the
+        exact math). Optional: backends implement it as they gain a backward
+        kernel.
+
+        Args:
+            g_out: Upstream gradient ``dL/dout[p]``, shape ``[P, dk, dv]``.
+            gammas: Per-rank decay factors, shape ``[P, dk, 1]`` (same as forward).
+            outs: Retained forward outputs ``out[p]``, shape ``[P, dk, dv]``.
+            dS: Destination for ``dL/dS_local``, shape ``[P, dk, dv]``; written
+                in place.
+            dgamma: Destination for ``dL/dgamma``, shape ``[P, dk, 1]``; written
+                in place (``dgamma[0]`` is 0).
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement run_backward"
@@ -169,12 +229,56 @@ class AllscanImpl(ABC):
         dominated by fixed orchestration setup (e.g. comm-domain alloc/free)
         override this to amortize that setup across a batch and report the
         marginal kernel/comm time (set :attr:`amortized_timing` to True).
+
+        Args:
+            S_locals: Per-rank local state, shape ``[P, dk, dv]``.
+            gammas: Per-rank decay factors, shape ``[P, dk, 1]``.
+            outputs: Scratch output buffer, shape ``[P, dk, dv]`` (reused each
+                sample).
+            n_iters: Number of latency samples to collect.
+
+        Returns:
+            A list of ``n_iters`` per-iteration latencies in milliseconds.
         """
         samples: list[float] = []
         for _ in range(n_iters):
             outputs.zero_()
             t0 = time.perf_counter()
             self.run(S_locals, gammas, outputs)
+            samples.append((time.perf_counter() - t0) * 1e3)
+        return samples
+
+    def measure_backward(
+        self,
+        g_out: torch.Tensor,
+        gammas: torch.Tensor,
+        outs: torch.Tensor,
+        dS: torch.Tensor,
+        dgamma: torch.Tensor,
+        n_iters: int,
+    ) -> list[float]:
+        """Return ``n_iters`` per-iteration backward latency samples (ms).
+
+        Mirrors :meth:`measure` for the backward pass. Default times
+        :meth:`run_backward` once per sample; backends dominated by fixed
+        per-call orchestration override this to amortize it across a batch (and
+        set :attr:`amortized_timing`).
+
+        Args:
+            g_out: Upstream gradient, shape ``[P, dk, dv]``.
+            gammas: Per-rank decay factors, shape ``[P, dk, 1]``.
+            outs: Retained forward outputs, shape ``[P, dk, dv]``.
+            dS: Scratch buffer for ``dL/dS_local``, shape ``[P, dk, dv]``.
+            dgamma: Scratch buffer for ``dL/dgamma``, shape ``[P, dk, 1]``.
+            n_iters: Number of latency samples to collect.
+
+        Returns:
+            A list of ``n_iters`` per-iteration backward latencies in milliseconds.
+        """
+        samples: list[float] = []
+        for _ in range(n_iters):
+            t0 = time.perf_counter()
+            self.run_backward(g_out, gammas, outs, dS, dgamma)
             samples.append((time.perf_counter() - t0) * 1e3)
         return samples
 

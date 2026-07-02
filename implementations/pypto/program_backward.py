@@ -45,6 +45,25 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             signal: pld.DistributedTensor[[K, 1], pl.INT32],
             peer_prev: pl.Scalar[pl.INT32],
         ):
+            """Rank P-1 (reverse-ring source): d = g_out (no incoming message);
+            send ``gamma*d`` to the previous rank and reduce ``dgamma`` locally.
+
+            Args:
+                g_out: Upstream gradient for this rank, ``[dk, dv]``.
+                gamma: This rank's decay factor, ``[dk, 1]``; scales the outgoing
+                    message ``gamma*d``.
+                out_prev: ``out[p-1]`` — the block this rank received during the
+                    forward pass, ``[dk, dv]``; used for the local dgamma reduction.
+                dS_out: Output for ``dL/dS_local == d``, ``[dk, dv]``.
+                dgamma_out: Output for ``dL/dgamma == rowsum_dv(d*out_prev)``, ``[dk, 1]``.
+                dst: The *previous* rank's recv window, target of ``remote_store``,
+                    ``[dk, dv]``.
+                signal: The previous rank's per-block signal window, ``[K, 1]``; bumped.
+                peer_prev: Rank id of the previous ring participant (``rank - 1``).
+
+            Returns:
+                ``(dS_out, dgamma_out)`` (SSA store chain).
+            """
             # Rank P-1: d = g_out (no incoming message).
             for k in pl.range(K):
                 offset_k = k * BLOCK_SIZE
@@ -53,14 +72,10 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
                 # Local dS = d.
                 dS_out = pl.store(d_k, [offset_k, 0], dS_out)
 
-                # dgamma = rowsum_dv(d (*) out_prev).
-                out_prev_k = pl.load(out_prev, [offset_k, 0], [BLOCK_SIZE, dv])
-                prod_k = pl.tile.mul(d_k, out_prev_k)
-                tmp_k = pl.tile.create([BLOCK_SIZE, dv], pl.FP32)
-                dgamma_k = pl.row_sum(prod_k, tmp_k)
-                dgamma_out = pl.store(dgamma_k, [offset_k, 0], dgamma_out)
-
-                # Message m = gamma (*) d, pushed to the previous rank.
+                # Message m = gamma (*) d, pushed to the previous rank. Sent BEFORE
+                # the dgamma reduction so d_k is dead by the row_sum: otherwise
+                # d_k + the reduction's product + its scratch tile are three live
+                # [dk,dv] tiles at once, overflowing the Vec buffer at dk=dv=128.
                 gamma_k = pl.load(gamma, [offset_k, 0], [BLOCK_SIZE, 1])
                 msg_k = pl.tile.row_expand_mul(d_k, gamma_k)
                 pld.tile.remote_store(msg_k, target=dst, peer=peer_prev, offsets=[offset_k, 0])
@@ -75,6 +90,13 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
+
+                # dgamma = rowsum_dv(d (*) out_prev).
+                out_prev_k = pl.load(out_prev, [offset_k, 0], [BLOCK_SIZE, dv])
+                prod_k = pl.tile.mul(d_k, out_prev_k)
+                tmp_k = pl.tile.create([BLOCK_SIZE, dv], pl.FP32)
+                dgamma_k = pl.row_sum(prod_k, tmp_k)
+                dgamma_out = pl.store(dgamma_k, [offset_k, 0], dgamma_out)
             return dS_out, dgamma_out
 
         @pl.function(type=pl.FunctionType.InCore)
@@ -89,6 +111,25 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             signal: pld.DistributedTensor[[K, 1], pl.INT32],
             peer_prev: pl.Scalar[pl.INT32],
         ):
+            """Middle ranks: recv message from ``p+1``, form ``d = g_out + m``,
+            forward ``gamma*d`` to ``p-1`` and reduce ``dgamma`` locally.
+
+            Args:
+                g_out: Upstream gradient for this rank, ``[dk, dv]``.
+                gamma: This rank's decay factor, ``[dk, 1]``.
+                out_prev: ``out[p-1]`` (forward recv block), ``[dk, dv]``.
+                dS_out: Output for ``dL/dS_local``, ``[dk, dv]``.
+                dgamma_out: Output for ``dL/dgamma``, ``[dk, 1]``.
+                dst: Dual-purpose window — *reads* this rank's own recv slot (the
+                    message from ``p+1``) and *writes* the ``p-1`` rank's recv slot,
+                    ``[dk, dv]``.
+                signal: Per-block signal window, ``[K, 1]``; this rank waits on its
+                    own slot, then bumps ``p-1``'s.
+                peer_prev: Rank id of the previous ring participant (``rank - 1``).
+
+            Returns:
+                ``(dS_out, dgamma_out)`` (SSA store chain).
+            """
             # Middle ranks: receive m from p+1, form d = g_out + m, forward m to p-1.
             for k in pl.range(K):
                 offset_k = k * BLOCK_SIZE
@@ -106,12 +147,8 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
 
                 dS_out = pl.store(d_k, [offset_k, 0], dS_out)
 
-                out_prev_k = pl.load(out_prev, [offset_k, 0], [BLOCK_SIZE, dv])
-                prod_k = pl.tile.mul(d_k, out_prev_k)
-                tmp_k = pl.tile.create([BLOCK_SIZE, dv], pl.FP32)
-                dgamma_k = pl.row_sum(prod_k, tmp_k)
-                dgamma_out = pl.store(dgamma_k, [offset_k, 0], dgamma_out)
-
+                # Message before dgamma (see source step: keeps d_k from coexisting
+                # with the row_sum's product + scratch tiles -> fits the Vec buffer).
                 gamma_k = pl.load(gamma, [offset_k, 0], [BLOCK_SIZE, 1])
                 msg_out_k = pl.tile.row_expand_mul(d_k, gamma_k)
                 pld.tile.remote_store(msg_out_k, target=dst, peer=peer_prev, offsets=[offset_k, 0])
@@ -124,6 +161,12 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
+
+                out_prev_k = pl.load(out_prev, [offset_k, 0], [BLOCK_SIZE, dv])
+                prod_k = pl.tile.mul(d_k, out_prev_k)
+                tmp_k = pl.tile.create([BLOCK_SIZE, dv], pl.FP32)
+                dgamma_k = pl.row_sum(prod_k, tmp_k)
+                dgamma_out = pl.store(dgamma_k, [offset_k, 0], dgamma_out)
             return dS_out, dgamma_out
 
         @pl.function(type=pl.FunctionType.InCore)
@@ -137,6 +180,22 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             dst: pld.DistributedTensor[[dk, dv], pl.FP32],
             signal: pld.DistributedTensor[[K, 1], pl.INT32],
         ):
+            """Rank 0 (reverse-ring terminal): recv message from rank 1, form
+            ``d = g_out + m``, store ``dS``. No outgoing message; ``dgamma[0]`` is
+            left untouched (``gamma[0]`` is unused — the host zeroes the buffer).
+
+            Args:
+                g_out: Upstream gradient for rank 0, ``[dk, dv]``.
+                gamma: Rank 0's decay factor, ``[dk, 1]`` (unused; ``dgamma[0]==0``).
+                out_prev: Unused for rank 0 (no predecessor); ``[dk, dv]``.
+                dS_out: Output for ``dL/dS_local``, ``[dk, dv]``.
+                dgamma_out: Output for ``dL/dgamma`` — passed through untouched, ``[dk, 1]``.
+                dst: This rank's own recv window (message from rank 1), read-only, ``[dk, dv]``.
+                signal: This rank's per-block signal window, ``[K, 1]``; waited on.
+
+            Returns:
+                ``(dS_out, dgamma_out)``.
+            """
             # Rank 0: receive m from rank 1, form d = g_out + m. gamma[0] is unused,
             # so dgamma[0] is left untouched (the host zeroes the dgamma buffer
             # before dispatch, so dgamma[0] == 0); no outgoing message.
@@ -172,6 +231,8 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             signal: pld.DistributedTensor[[K, 1], pl.INT32],
             peer_prev: pl.Scalar[pl.INT32],
         ):
+            """Orchestration wrapper dispatching :meth:`allscan_bwd_source_step` on
+            one chip (device bound via ``device=`` at the :meth:`host_orch` call site)."""
             return self.allscan_bwd_source_step(
                 g_out, gamma, out_prev, dS_out, dgamma_out, dst, signal, peer_prev
             )
@@ -188,6 +249,8 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             signal: pld.DistributedTensor[[K, 1], pl.INT32],
             peer_prev: pl.Scalar[pl.INT32],
         ):
+            """Orchestration wrapper dispatching :meth:`allscan_bwd_middle_step` on
+            one chip (device bound via ``device=`` at the :meth:`host_orch` call site)."""
             return self.allscan_bwd_middle_step(
                 g_out, gamma, out_prev, dS_out, dgamma_out, dst, signal, peer_prev
             )
@@ -203,6 +266,8 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             dst: pld.DistributedTensor[[dk, dv], pl.FP32],
             signal: pld.DistributedTensor[[K, 1], pl.INT32],
         ):
+            """Orchestration wrapper dispatching :meth:`allscan_bwd_terminal_step`
+            on one chip (device bound via ``device=`` at the :meth:`host_orch` call site)."""
             return self.allscan_bwd_terminal_step(
                 g_out, gamma, out_prev, dS_out, dgamma_out, dst, signal
             )
@@ -216,6 +281,21 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
             dS: pl.Out[pl.Tensor[[P, dk, dv], pl.FP32]],
             dgamma: pl.Out[pl.Tensor[[P, dk, 1], pl.FP32]],
         ):
+            """Host orchestrator: allocate the shared window and dispatch one
+            backward chip kernel per rank (source / middle / terminal), wiring each
+            to device ``r`` with ``peer = r - 1``.
+
+            Args:
+                g_outs: All ranks' upstream gradients, ``[P, dk, dv]``.
+                gammas: All ranks' decay factors, ``[P, dk, 1]``.
+                out_prevs: Per-rank ``out[r-1]`` (forward recv blocks), ``[P, dk, dv]``;
+                    ``out_prevs[0]`` is unused.
+                dS: All ranks' ``dL/dS_local`` outputs, ``[P, dk, dv]``; written in place.
+                dgamma: All ranks' ``dL/dgamma`` outputs, ``[P, dk, 1]``; written in place.
+
+            Returns:
+                ``(dS, dgamma)``.
+            """
             dst_buf = pld.alloc_window_buffer(dk * dv * 4)
             signal_buf = pld.alloc_window_buffer(K * 4)
 

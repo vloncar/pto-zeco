@@ -29,7 +29,14 @@ _TAIL = "\n    return AllScanProgram\n"
 
 def _gen_host_orch(B: int) -> str:
     """Emit a host_orch method that runs B independent rings, each on its own
-    window buffers and disjoint output slice ``outputs[b]``."""
+    window buffers and disjoint output slice ``outputs[b]``.
+
+    Args:
+        B: Number of independent rings / output slices to emit.
+
+    Returns:
+        The generated ``host_orch`` method source as a string.
+    """
     lines = [
         "        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)",
         "        def host_orch(",
@@ -66,7 +73,14 @@ def make_batched_builder(B: int):
     """Return ``build(dk, dv, K, P) -> AllScanProgram`` for a B-ring batched
     program. The returned builder has the same closure-var contract as
     :func:`program.build_allscan_program`, so it plugs straight into
-    ``ir.compile``."""
+    ``ir.compile``.
+
+    Args:
+        B: Number of independent rings per dispatch (batch size).
+
+    Returns:
+        A ``build(dk, dv, K, P)`` callable that constructs the batched program.
+    """
     prog_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "program.py")
     with open(prog_path) as f:
         src = f.read()

@@ -84,8 +84,24 @@ def bench_one(
     n_iters: int,
     verify: bool,
 ) -> dict:
-    """Run one (impl, config) combination and return a result dict."""
+    """Run one (impl, config) combination and return a result dict.
 
+    Args:
+        impl: The backend instance to benchmark (built here, left built on return).
+        dk: Key/row dimension of the state.
+        dv: Value/column dimension of the state.
+        K: Pipeline depth (number of ``dk // K``-row blocks).
+        P: Number of ranks.
+        device_ids: Devices available; the first ``P`` are used.
+        platform: Target backend (``"a2a3"`` / ``"a2a3sim"`` / ...).
+        n_warmup: Warmup iterations after the cold-start call (heats HCCS links).
+        n_iters: Timed iterations (latency samples) to collect.
+        verify: If True, check the result against the sequential reference first.
+
+    Returns:
+        A result dict with timing stats (mean/min/p50/p95 ms), bandwidth,
+        correctness, and the raw per-iteration samples.
+    """
     # --- compile / init ---
     t0 = time.perf_counter()
     impl.build(dk, dv, K, P, device_ids, platform)
