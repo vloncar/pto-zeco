@@ -83,18 +83,22 @@ contiguous `L`-token slice split into `N = L // C` chunks:
 The chunk math lives in `gla/common.py` so every torch-level backend shares one
 implementation and agrees by construction.
 
-The **pypto** backend uses an equivalent **quadratic (unchunked, `C = L`) form**
-— the whole device slice as one block — because the chunk-recurrent state carry
-is not schedulable in this pypto build. With `b = exp(tril @ log A)` the
-device-global cumulative decay, each rank computes on-device:
+The **pypto** backend uses the same **chunk-recurrent `O(L·C)` form** (`N = L//C`
+chunks) as the torch/simpler backends, but is forced into a **hybrid** split by two
+pypto limitations:
 
-```
-O       = ((Q*b) @ (K/b)^T ⊙ mask_L) @ V   +   (Q*b) @ S_recv
-S_total = (K * (b[L-1] / b))^T @ V                       # local state -> AllScan
-```
+- **stage1** (local end-of-slice state, scan from `S = 0`) is **fused with the
+  AllScan ring** into one distributed `@pl.program` (`dist_program.py`), and
+- **stage2** (per-rank output `O[r]`, the chunk recurrence initialised from
+  `S_recv[r] = out[r-1]`) runs as a `@pl.jit` kernel (`program.py`) **after** the
+  distributed worker `close()`s.
 
-and `S_recv = out[r-1]` comes from the PyPTO AllScan. This is `O(L^2)` per device
-but uses only single matmuls; it matches the recurrent golden.
+The split is not by choice: a `@pl.jit` dispatch *before* `DistributedWorker.prepare()`
+segfaults, so the sole jit (stage2) must run last; and the wide-DAG stage2 kernel
+**hangs as a distributed chip kernel** (`507018`), so it cannot be fused into the
+distributed program and must stay on `@pl.jit`. A fully-fused single distributed
+pypto program (the "full" pypto ZeCO) is therefore **postponed** — see `issues/`.
+**Hardware-only:** the chunk kernels deadlock the a2a3sim simulator.
 
 Backends implement the `ZeCoImpl` interface (`build` once, then
 `forward(Q, K, V, A)` many, `close`). **Status:** forward done and verified
@@ -130,8 +134,9 @@ gla/
     __init__.py                 REGISTRY
     torch_ref.py                TorchZeCo (in-process, composes AllScan) + torch.distributed ref
     pypto/
-      program.py                stage1/stage2 @pl.jit GLA kernels (quadratic form, shape-baked)
-      impl.py                   PyPtoZeCo — composes the jit stages with the PyPTO AllScan
+      program.py                stage2 @pl.jit chunk-recurrent GLA kernel (shape-baked)
+      dist_program.py           stage1 + AllScan-ring fused as one distributed @pl.program
+      impl.py                   PyPtoZeCo — hybrid: fused dist stage1+ring, then @pl.jit stage2 (HW-only)
     simpler/                    hand-written aic/aiv + orchestration kernels + impl.py (real AllScan boundary)
   tests/
     test_torch_gla.py           CPU: chunk==recurrent, in-process ZeCO, and gloo ring vs golden
