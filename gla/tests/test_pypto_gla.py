@@ -3,7 +3,7 @@
 Compiles and runs on the target platform selected via ``--platform`` (a2a3
 hardware or a2a3sim simulator) across the devices given by ``--device``.
 
-:class:`PytoZeCo` uses the chunk-recurrent GLA form in a hybrid composition —
+:class:`PyPtoZeCo` uses the chunk-recurrent GLA form in a hybrid composition —
 a fused distributed ``stage1 + AllScan-ring`` program, then a ``@pl.jit`` stage2
 (see :mod:`gla.implementations.pypto.impl`). ``P=1`` exercises the compute alone
 (no exchange, no distributed program); ``P>=2`` exercises the full SP path.
@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from gla.common import expected_gla, flatten_seq, make_gla_inputs
-from gla.implementations.pypto.impl import PytoZeCo
+from gla.implementations.pypto.impl import PyPtoZeCo
 
 
 def _golden(Q, K, V, A):
@@ -42,7 +42,7 @@ def test_pypto_zeco(test_config, device_ids, P):
     L, C, dk, dv = 32, 16, 16, 16   # N = L // C = 2 chunks
     Q, K, V, A = make_gla_inputs(P, L, dk, dv)
 
-    impl = PytoZeCo()
+    impl = PyPtoZeCo()
     impl.build(P, L, C, dk, dv, device_ids=device_ids[:P], platform=test_config.platform)
     try:
         O = impl.forward(Q, K, V, A)

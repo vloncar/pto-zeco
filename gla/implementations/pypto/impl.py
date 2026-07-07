@@ -1,6 +1,6 @@
 """PyPTO DSL ZeCO / GLA forward — benchmark/test adapter.
 
-:class:`PytoZeCo` composes the chunk-recurrent GLA compute with the AllScan
+:class:`PyPtoZeCo` composes the chunk-recurrent GLA compute with the AllScan
 boundary hand-off, exactly as :class:`gla.implementations.torch_ref.TorchZeCo`
 composes ``TorchAllscan``. The composition is **hybrid**:
 
@@ -48,7 +48,7 @@ from gla.implementations.pypto.dist_program import build_stage1ring_program  # n
 from gla.implementations.pypto.program import make_zeco_jits  # noqa: E402
 
 
-class PytoZeCo(ZeCoImpl):
+class PyPtoZeCo(ZeCoImpl):
     """PyPTO ZeCO forward: fused distributed stage1+AllScan-ring, then ``@pl.jit`` stage2."""
 
     name = "pypto"

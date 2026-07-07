@@ -16,7 +16,7 @@ from allscan.common import (
     make_grad_inputs,
     make_inputs,
 )
-from allscan.implementations.pypto.impl import PytoAllscanBackward
+from allscan.implementations.pypto.impl import PyPtoAllscanBackward
 
 
 @pytest.mark.parametrize("K", [1, 2, 4])
@@ -33,7 +33,7 @@ def test_pypto_allscan_backward(test_config, device_ids, K):
     dS = torch.zeros((P, dk, dv), dtype=torch.float32)
     dgamma = torch.zeros((P, dk, 1), dtype=torch.float32)
 
-    impl = PytoAllscanBackward()
+    impl = PyPtoAllscanBackward()
     impl.build(dk, dv, K, P, device_ids=device_ids, platform=test_config.platform)
     try:
         impl.run_backward(g_out, gammas, outs, dS, dgamma)

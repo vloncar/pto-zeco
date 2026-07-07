@@ -43,12 +43,12 @@ from allscan.common import (  # noqa: E402
     make_grad_inputs,
     make_inputs,
 )
-from allscan.implementations.pypto.impl import PytoAllscanBackward  # noqa: E402
+from allscan.implementations.pypto.impl import PyPtoAllscanBackward  # noqa: E402
 from allscan.implementations.simpler.impl import SimplerAllscan  # noqa: E402
 from common.harness import parse_devices, percentile, print_table  # noqa: E402
 
 # name -> backward-capable impl class (pypto uses the backward-only worker).
-BACKWARD_IMPLS = {"simpler": SimplerAllscan, "pypto": PytoAllscanBackward}
+BACKWARD_IMPLS = {"simpler": SimplerAllscan, "pypto": PyPtoAllscanBackward}
 
 
 def bench_one_backward(

@@ -31,7 +31,7 @@ from allscan.common import AllscanImpl  # noqa: E402
 from allscan.implementations.pypto.batched_program import make_batched_builder  # noqa: E402
 
 
-class PytoAllscan(AllscanImpl):
+class PyPtoAllscan(AllscanImpl):
     """PyPTO DSL-compiled AllScan, dispatched on a reusable DistributedWorker.
 
     A single dispatch of one AllScan pays a full comm-domain alloc/free + drain
@@ -148,10 +148,10 @@ class PytoAllscan(AllscanImpl):
             self._rt = None
 
 
-class PytoAllscanBackward(AllscanImpl):
+class PyPtoAllscanBackward(AllscanImpl):
     """PyPTO DSL-compiled AllScan *backward* pass on a reusable DistributedWorker.
 
-    Separate from :class:`PytoAllscan` because only ONE DistributedWorker may be
+    Separate from :class:`PyPtoAllscan` because only ONE DistributedWorker may be
     prepared per device set at a time (two prepared workers fork chip processes
     on the same devices and their HCCL comms collide, ``HcclCommInitRootInfo
     failed: 7``). This class prepares only the backward program; the forward
@@ -207,9 +207,9 @@ class PytoAllscanBackward(AllscanImpl):
         self._rt = compiled_b.prepare()
 
     def run(self, S_locals, gammas, outputs):
-        """Not implemented — this class is backward-only (use :class:`PytoAllscan`
+        """Not implemented — this class is backward-only (use :class:`PyPtoAllscan`
         for the forward pass). Args match the interface but always raise."""
-        raise NotImplementedError("PytoAllscanBackward implements run_backward only")
+        raise NotImplementedError("PyPtoAllscanBackward implements run_backward only")
 
     def _copy_inputs(self, g_out, gammas, outs):
         """Stage shared inputs into the host buffers.

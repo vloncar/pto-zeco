@@ -97,10 +97,12 @@ and `S_recv = out[r-1]` comes from the PyPTO AllScan. This is `O(L^2)` per devic
 but uses only single matmuls; it matches the recurrent golden.
 
 Backends implement the `ZeCoImpl` interface (`build` once, then
-`forward(Q, K, V, A)` many, `close`). **Status:** torch reference (in-process),
-torch.distributed, and **pypto** forward done and verified against the golden
-(pypto composes `stage1`/`stage2` `@pl.jit` kernels with the PyPTO AllScan). The
-hand-written `simpler` GLA kernel and the full backward are out of current scope.
+`forward(Q, K, V, A)` many, `close`). **Status:** forward done and verified
+against the golden for the torch reference (in-process), torch.distributed,
+**pypto** (composes `stage1`/`stage2` `@pl.jit` kernels with the PyPTO AllScan),
+and **simpler** (hand-written PTO-ISA kernels + the real AllScan boundary —
+validated on a2a3 HW at P=1/2/4, exact to ~1e-6). The full backward is out of
+current scope.
 
 ---
 
@@ -129,10 +131,12 @@ gla/
     torch_ref.py                TorchZeCo (in-process, composes AllScan) + torch.distributed ref
     pypto/
       program.py                stage1/stage2 @pl.jit GLA kernels (quadratic form, shape-baked)
-      impl.py                   PytoZeCo — composes the jit stages with the PyPTO AllScan
+      impl.py                   PyPtoZeCo — composes the jit stages with the PyPTO AllScan
+    simpler/                    hand-written aic/aiv + orchestration kernels + impl.py (real AllScan boundary)
   tests/
     test_torch_gla.py           CPU: chunk==recurrent, in-process ZeCO, and gloo ring vs golden
-    test_pypto_gla.py           on-device: PytoZeCo vs golden (P=1 compute, P>=2 full SP path)
+    test_pypto_gla.py           on-device: PyPtoZeCo vs golden (P=1 compute, P>=2 full SP path)
+    test_simpler_gla.py         on-device/sim: SimplerZeCo vs golden (defaults to a2a3sim P=1)
 ```
 
 ---

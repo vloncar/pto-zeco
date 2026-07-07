@@ -25,5 +25,5 @@ def _try_register(import_path: str, class_name: str) -> None:
 
 
 _try_register("allscan.implementations.torch_ref", "TorchAllscan")
-_try_register("allscan.implementations.pypto.impl", "PytoAllscan")
+_try_register("allscan.implementations.pypto.impl", "PyPtoAllscan")
 _try_register("allscan.implementations.simpler.impl", "SimplerAllscan")

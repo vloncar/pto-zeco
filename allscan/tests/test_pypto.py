@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from allscan.common import expected_allscan, make_inputs
-from allscan.implementations.pypto.impl import PytoAllscan
+from allscan.implementations.pypto.impl import PyPtoAllscan
 
 
 @pytest.mark.parametrize("K", [1, 2, 4])
@@ -22,7 +22,7 @@ def test_pypto_allscan(test_config, device_ids, K):
     dk, dv = 64, 64
     S_locals, gammas, outputs = make_inputs(P, dk, dv)
 
-    impl = PytoAllscan()
+    impl = PyPtoAllscan()
     impl.build(dk, dv, K, P, device_ids=device_ids, platform=test_config.platform)
     try:
         impl.run(S_locals, gammas, outputs)
