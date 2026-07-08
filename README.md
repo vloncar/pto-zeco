@@ -98,7 +98,8 @@ segfaults, so the sole jit (stage2) must run last; and the wide-DAG stage2 kerne
 **hangs as a distributed chip kernel** (`507018`), so it cannot be fused into the
 distributed program and must stay on `@pl.jit`. A fully-fused single distributed
 pypto program (the "full" pypto ZeCO) is therefore **postponed** — see `issues/`.
-**Hardware-only:** the chunk kernels deadlock the a2a3sim simulator.
+Runs on both `a2a3sim` and `a2a3` (the earlier sim-scheduler deadlock on the
+wide-DAG chunk kernels was fixed upstream in the CPU-sim cross-core pipe model).
 
 Backends implement the `ZeCoImpl` interface (`build` once, then
 `forward(Q, K, V, A)` many, `close`). **Status:** forward done and verified
@@ -136,7 +137,7 @@ gla/
     pypto/
       program.py                stage2 @pl.jit chunk-recurrent GLA kernel (shape-baked)
       dist_program.py           stage1 + AllScan-ring fused as one distributed @pl.program
-      impl.py                   PyPtoZeCo — hybrid: fused dist stage1+ring, then @pl.jit stage2 (HW-only)
+      impl.py                   PyPtoZeCo — hybrid: fused dist stage1+ring, then @pl.jit stage2
     simpler/                    hand-written aic/aiv + orchestration kernels + impl.py (real AllScan boundary)
   tests/
     test_torch_gla.py           CPU: chunk==recurrent, in-process ZeCO, and gloo ring vs golden

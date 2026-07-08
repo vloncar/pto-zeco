@@ -28,8 +28,9 @@ At ``P == 1`` there is no boundary to exchange, so the fused distributed program
 is skipped entirely (``S_recv = 0``) and only ``@pl.jit`` stage2 runs — this also
 avoids a ``P=1`` loop-unroll codegen bug in the distributed ``device=r`` dispatch.
 
-**Hardware-only:** the chunk-recurrent kernels deadlock the a2a3sim simulator
-scheduler but run correctly on a2a3 hardware — see :mod:`.program`.
+Runs on both a2a3sim and a2a3 hardware (the earlier sim-scheduler deadlock on the
+wide-DAG chunk kernels was fixed upstream in the CPU-sim cross-core pipe model) —
+see :mod:`.program`.
 """
 
 from __future__ import annotations
@@ -65,8 +66,8 @@ class PyPtoZeCo(ZeCoImpl):
         prepared per ``forward`` (so its ``DistributedWorker`` never coexists with a
         ``@pl.jit`` dispatch on the same devices).
 
-        Note: the chunk-recurrent InCore kernels run on **a2a3 hardware only** — their
-        per-chunk body deadlocks the a2a3sim simulator scheduler (see
+        Note: the chunk-recurrent InCore kernels run on both a2a3sim and a2a3 (the
+        earlier a2a3sim wide-DAG deadlock was fixed upstream; see
         :mod:`gla.implementations.pypto.program`).
         """
         assert L % C == 0, f"L={L} not divisible by C={C}"

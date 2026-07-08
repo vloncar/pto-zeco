@@ -25,8 +25,8 @@ CORE_GROUP path, so it stays on jit and runs *after* this worker closes (the
 safe ``prepare -> close -> jit`` order). See :mod:`.program` for the
 sim-vs-hardware / loop-carry notes on the chunk kernels.
 
-Hardware-only: the chunk-recurrent stage1 body deadlocks the a2a3sim scheduler
-but runs on a2a3 hardware.
+Runs on both a2a3sim and a2a3 (the earlier a2a3sim deadlock on the chunk-recurrent
+stage1 body was fixed upstream in the CPU-sim cross-core pipe model).
 """
 
 from __future__ import annotations

@@ -13,8 +13,8 @@ Each parametrization runs in its own forked process (``@pytest.mark.forked``):
 within one process a ``@pl.jit`` dispatch (P=1 stage2) followed by a
 ``DistributedWorker.prepare()`` (P=2 stage1+ring) on the same devices is the
 unsupported jit-then-prepare coexistence and hangs — forking gives each case a
-clean device state. (Hardware-only: the chunk kernels deadlock the a2a3sim
-scheduler; run with ``--platform a2a3``.)
+clean device state. Runs on both ``--platform a2a3sim`` and ``a2a3`` (the earlier
+a2a3sim deadlock on the chunk kernels was fixed upstream).
 """
 
 import sys

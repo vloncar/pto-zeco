@@ -28,10 +28,10 @@ Design notes (all learned on-device):
   ``g_full[dk,dv] = exp(log(A)^T @ ones[C,dv])`` — instead of ``[*,1]`` vectors +
   ``row/col_expand_mul``.
 * **Simulator vs hardware**: this kernel's per-chunk body is a wide matmul DAG that
-  **deadlocks the a2a3sim scheduler** (rc=-100) but **runs correctly on a2a3 hardware**.
-  It is therefore a HARDWARE-ONLY backend until the sim scheduler bug is fixed (a
-  bisected repro + bug report live in ``pypto-loopcarry-fix/``). The O(L²) quadratic
-  form is kept in git history for sim/CI portability.
+  once **deadlocked the a2a3sim scheduler** (rc=-100) while running fine on a2a3
+  hardware. That was an upstream CPU-sim bug in the cross-core cube↔vector pipe model
+  and has since been **fixed upstream**, so the kernel now runs on both a2a3sim and
+  a2a3. (The O(L²) quadratic form kept in git history is no longer needed for sim/CI.)
 
 ``@pl.jit`` needs shapes as compile-time constants, so — as before — we source-gen the
 kernels into a temp module with ``L``/``C``/``dk``/``dv``/``N`` baked in and import them
