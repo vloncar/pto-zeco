@@ -10,7 +10,10 @@
  * INOUT tensor so the runtime serialises the recurrence across chunks.
  *
  * Args (Tensor*): [0]=KV [K,V] IN, [1]=decay [K,1] IN, [2]=S [K,V] INOUT,
- *                 [3]=s_snap [K,V] OUT;  scalar[0]=is_first.
+ *                 [3]=s_snap [K,V] OUT;  scalar[0]=is_first, scalar[1]=D.
+ *
+ * The state is [K,V] = [D,D] (K == V == head dim), so this stage is always square
+ * in D even when C != D; one dim scalar (D) drives the {16,32,64,128} dispatch.
  */
 
 #include <cstdint>
@@ -86,7 +89,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *s = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *ssnap = reinterpret_cast<__gm__ Tensor *>(args[3]);
     uint64_t is_first = static_cast<uint64_t>(args[4]);
-    int S = static_cast<int>(args[5]);  // tile size K==V (square: C==D)
+    int S = static_cast<int>(args[5]);  // head dim D (state is [D,D], always square)
 
     __gm__ float *kvp = reinterpret_cast<__gm__ float *>(kv->buffer.addr) + kv->start_offset;
     __gm__ float *decayp = reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset;

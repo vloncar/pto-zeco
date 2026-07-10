@@ -6,7 +6,9 @@
  *   k_eff[c,k] = k[c,k] * exp(-g_cs[c,k])     (can be large; kept fp32)
  *
  * Args (Tensor*): [0]=q [C,K] IN, [1]=k [C,K] IN, [2]=g_cs [C,K] IN,
- *                 [3]=q_eff [C,K] OUT, [4]=k_eff [C,K] OUT.
+ *                 [3]=q_eff [C,K] OUT, [4]=k_eff [C,K] OUT;
+ *                 scalar[0]=C, scalar[1]=D(=K).  C and D each dispatch over
+ *                 {16,32,64,128} (C == D reduces to the square case).
  */
 
 #include <cstdint>
@@ -80,13 +82,25 @@ static __aicore__ void prep_impl(__gm__ float *q, __gm__ float *k, __gm__ float 
     pipe_sync();
 }
 
+template <int C>
+static __aicore__ void prep_by_d(int d, __gm__ float *q, __gm__ float *k, __gm__ float *gcs,
+                                 __gm__ float *qeff, __gm__ float *keff) {
+    switch (d) {
+    case 16:  prep_impl<C, 16>(q, k, gcs, qeff, keff);   break;
+    case 32:  prep_impl<C, 32>(q, k, gcs, qeff, keff);   break;
+    case 64:  prep_impl<C, 64>(q, k, gcs, qeff, keff);   break;
+    default:  prep_impl<C, 128>(q, k, gcs, qeff, keff);  break;
+    }
+}
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *q = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *k = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *gcs = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *qeff = reinterpret_cast<__gm__ Tensor *>(args[3]);
     __gm__ Tensor *keff = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    int S = static_cast<int>(args[5]);  // tile size C==K (square: C==D)
+    int C = static_cast<int>(args[5]);  // chunk size (rows)
+    int D = static_cast<int>(args[6]);  // head dim K (cols)
 
     __gm__ float *qp = reinterpret_cast<__gm__ float *>(q->buffer.addr) + q->start_offset;
     __gm__ float *kp = reinterpret_cast<__gm__ float *>(k->buffer.addr) + k->start_offset;
@@ -94,10 +108,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ float *qeffp = reinterpret_cast<__gm__ float *>(qeff->buffer.addr) + qeff->start_offset;
     __gm__ float *keffp = reinterpret_cast<__gm__ float *>(keff->buffer.addr) + keff->start_offset;
 
-    switch (S) {
-    case 16:  prep_impl<16, 16>(qp, kp, gcsp, qeffp, keffp);   break;
-    case 32:  prep_impl<32, 32>(qp, kp, gcsp, qeffp, keffp);   break;
-    case 64:  prep_impl<64, 64>(qp, kp, gcsp, qeffp, keffp);   break;
-    default:  prep_impl<128, 128>(qp, kp, gcsp, qeffp, keffp); break;
+    switch (C) {
+    case 16:  prep_by_d<16>(D, qp, kp, gcsp, qeffp, keffp);   break;
+    case 32:  prep_by_d<32>(D, qp, kp, gcsp, qeffp, keffp);   break;
+    case 64:  prep_by_d<64>(D, qp, kp, gcsp, qeffp, keffp);   break;
+    default:  prep_by_d<128>(D, qp, kp, gcsp, qeffp, keffp);  break;
     }
 }

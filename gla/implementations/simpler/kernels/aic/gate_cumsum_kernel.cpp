@@ -6,15 +6,17 @@
  *
  *     g_cs = tril @ g          tril[t,s] = 1 for s <= t (lower-tri ones [C,C])
  *
- * so g_cs[t,d] = sum_{s<=t} g[s,d].  One [C,C] @ [C,D] matmul; the orchestration
- * (gate_cumsum_orch.cpp) submits one such task per chunk. D == C == TILE, a
- * runtime scalar dispatched to a compile-time template over {16,32,64,128}.
+ * so g_cs[t,d] = sum_{s<=t} g[s,d].  One [C,C] @ [C,D] matmul (NN, M=C, N=D,
+ * K=C); the orchestration (gate_cumsum_orch.cpp) submits one such task per chunk.
+ * C and D are runtime scalars, each dispatched to a compile-time template over
+ * {16,32,64,128} (C == D reduces to the square case).
  *
  * The cube-matmul body (TLOAD -> TMOV to L0A/L0B -> TMATMUL -> TSTORE, with pipe
  * sync) is the pattern from examples/.../benchmark_bgemm/kernels/aic/
  * kernel_gemm_tile.cpp.
  *
- * Args (Tensor*): [0]=tril [C,C] IN, [1]=g_chunk [C,D] IN, [2]=g_cs_chunk [C,D] OUT.
+ * Args (Tensor*): [0]=tril [C,C] IN, [1]=g_chunk [C,D] IN, [2]=g_cs_chunk [C,D] OUT;
+ *                 scalar[0]=C, scalar[1]=D.
  */
 
 #include <cstdint>
@@ -40,22 +42,26 @@ AICORE constexpr inline T CeilAlign(T a, T b) {
     return (b == 0) ? 0 : (a + b - 1) / b * b;
 }
 
-template <int TILE>
+// out[rM,rN] = tril[rM,rK] @ g[rK,rN]  (NN).  For gate_cumsum rM == rK == C, rN == D.
+template <int rM, int rN, int rK>
 static __aicore__ void trilmatmul_tile(__gm__ float *a, __gm__ float *b, __gm__ float *c) {
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
-    constexpr int M = CeilAlign<int>(TILE, 16);
-    constexpr int K = CeilAlign<int>(TILE, blockAlign);
-    constexpr int N = CeilAlign<int>(TILE, blockAlign);
+    constexpr int M = CeilAlign<int>(rM, 16);
+    constexpr int K = CeilAlign<int>(rK, blockAlign);
+    constexpr int N = CeilAlign<int>(rN, blockAlign);
 
-    using GlobalData =
-        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<TILE * TILE, TILE * TILE, TILE * TILE, TILE, 1>>;
-    GlobalData aG(a), bG(b), cG(c);
+    using GlobalA = GlobalTensor<float, Shape<1, 1, 1, rM, rK>, Stride<rM * rK, rM * rK, rM * rK, rK, 1>>;
+    using GlobalB = GlobalTensor<float, Shape<1, 1, 1, rK, rN>, Stride<rK * rN, rK * rN, rK * rN, rN, 1>>;
+    using GlobalC = GlobalTensor<float, Shape<1, 1, 1, rM, rN>, Stride<rM * rN, rM * rN, rM * rN, rN, 1>>;
+    GlobalA aG(a);
+    GlobalB bG(b);
+    GlobalC cG(c);
 
-    using TileMatA = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, TILE, TILE, SLayout::RowMajor, 512>;
-    using TileMatB = Tile<TileType::Mat, float, K, N, BLayout::ColMajor, TILE, TILE, SLayout::RowMajor, 512>;
-    using LeftTile = TileLeft<float, M, K, TILE, TILE>;
-    using RightTile = TileRight<float, K, N, TILE, TILE>;
-    using AccTile = TileAcc<float, M, N, TILE, TILE>;
+    using TileMatA = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, rM, rK, SLayout::RowMajor, 512>;
+    using TileMatB = Tile<TileType::Mat, float, K, N, BLayout::ColMajor, rK, rN, SLayout::RowMajor, 512>;
+    using LeftTile = TileLeft<float, M, K, rM, rK>;
+    using RightTile = TileRight<float, K, N, rK, rN>;
+    using AccTile = TileAcc<float, M, N, rM, rN>;
 
     TileMatA aMat;
     TileMatB bMat;
@@ -83,22 +89,34 @@ static __aicore__ void trilmatmul_tile(__gm__ float *a, __gm__ float *b, __gm__ 
     pipe_sync();
 }
 
+// Dispatch N (=D) for a compile-time C (drives both M and K, since tril is [C,C]).
+template <int C>
+static __aicore__ void trilmatmul_by_d(int d, __gm__ float *a, __gm__ float *b, __gm__ float *c) {
+    switch (d) {
+    case 16:  trilmatmul_tile<C, 16, C>(a, b, c);  break;
+    case 32:  trilmatmul_tile<C, 32, C>(a, b, c);  break;
+    case 64:  trilmatmul_tile<C, 64, C>(a, b, c);  break;
+    default:  trilmatmul_tile<C, 128, C>(a, b, c); break;
+    }
+}
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *a = reinterpret_cast<__gm__ Tensor *>(args[0]);  // tril [C,C]
     __gm__ Tensor *b = reinterpret_cast<__gm__ Tensor *>(args[1]);  // g_chunk [C,D]
     __gm__ Tensor *c = reinterpret_cast<__gm__ Tensor *>(args[2]);  // g_cs_chunk [C,D]
-    int S = static_cast<int>(args[3]);                              // tile size (square: C==D)
+    int C = static_cast<int>(args[3]);
+    int D = static_cast<int>(args[4]);
 
     __gm__ float *ap = reinterpret_cast<__gm__ float *>(a->buffer.addr) + a->start_offset;
     __gm__ float *bp = reinterpret_cast<__gm__ float *>(b->buffer.addr) + b->start_offset;
     __gm__ float *cp = reinterpret_cast<__gm__ float *>(c->buffer.addr) + c->start_offset;
 
-    // Runtime dispatch to a compile-time tile size (the benchmark_bgemm pattern):
-    // the whole GLA pipeline is square when C==D, so one size drives every tile.
-    switch (S) {
-    case 16:  trilmatmul_tile<16>(ap, bp, cp);  break;
-    case 32:  trilmatmul_tile<32>(ap, bp, cp);  break;
-    case 64:  trilmatmul_tile<64>(ap, bp, cp);  break;
-    default:  trilmatmul_tile<128>(ap, bp, cp); break;
+    // Runtime dispatch of C (M,K) and D (N) to compile-time tile sizes
+    // (the benchmark_bgemm pattern, extended to a rectangular tril @ g).
+    switch (C) {
+    case 16:  trilmatmul_by_d<16>(D, ap, bp, cp);  break;
+    case 32:  trilmatmul_by_d<32>(D, ap, bp, cp);  break;
+    case 64:  trilmatmul_by_d<64>(D, ap, bp, cp);  break;
+    default:  trilmatmul_by_d<128>(D, ap, bp, cp); break;
     }
 }

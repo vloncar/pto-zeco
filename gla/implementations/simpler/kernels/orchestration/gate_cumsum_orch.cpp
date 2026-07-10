@@ -49,7 +49,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         params.add_input(tril);
         params.add_input(g_view);
         params.add_output(gcs_view);
-        params.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
+        params.add_scalar(static_cast<uint64_t>(C));   // M == K (tril is [C,C])
+        params.add_scalar(static_cast<uint64_t>(Dd));  // N (g is [C,D])
         rt_submit_aic_task(FUNC_CUMSUM, params);
     }
 }

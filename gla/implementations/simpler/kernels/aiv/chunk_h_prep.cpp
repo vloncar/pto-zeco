@@ -9,11 +9,12 @@
  *   decay[k]    = exp(g_total[k])                                  -> [K,1]
  *
  * k_rest feeds the Cube matmul KV = k_rest^T @ v; decay row-scales the carried
- * state in chunk_h_update.  All fp32; K == C == S, a runtime tile size dispatched
- * to a compile-time template over {16,32,64,128}.
+ * state in chunk_h_update.  All fp32; K == D (head dim), C == chunk size, each a
+ * runtime scalar dispatched to a compile-time template over {16,32,64,128}.
  *
  * Args (Tensor*): [0]=g_cs [C,K] IN, [1]=g_total [1,K] IN, [2]=k [C,K] IN,
- *                 [3]=k_rest [C,K] OUT, [4]=decay [K,1] OUT.
+ *                 [3]=k_rest [C,K] OUT, [4]=decay [K,1] OUT;
+ *                 scalar[0]=C, scalar[1]=D(=K).
  */
 
 #include <cstdint>
@@ -89,13 +90,25 @@ static __aicore__ void prep_impl(__gm__ float *gcs, __gm__ float *gtot, __gm__ f
     pipe_sync();
 }
 
+template <int C>
+static __aicore__ void prep_by_d(int d, __gm__ float *gcs, __gm__ float *gtot, __gm__ float *k,
+                                 __gm__ float *krest, __gm__ float *decay) {
+    switch (d) {
+    case 16:  prep_impl<C, 16>(gcs, gtot, k, krest, decay);   break;
+    case 32:  prep_impl<C, 32>(gcs, gtot, k, krest, decay);   break;
+    case 64:  prep_impl<C, 64>(gcs, gtot, k, krest, decay);   break;
+    default:  prep_impl<C, 128>(gcs, gtot, k, krest, decay);  break;
+    }
+}
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *gcs = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *gtot = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *k = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *krest = reinterpret_cast<__gm__ Tensor *>(args[3]);
     __gm__ Tensor *decay = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    int S = static_cast<int>(args[5]);  // tile size C==K (square: C==D)
+    int C = static_cast<int>(args[5]);  // chunk size (rows)
+    int D = static_cast<int>(args[6]);  // head dim K (cols)
 
     __gm__ float *gcsp = reinterpret_cast<__gm__ float *>(gcs->buffer.addr) + gcs->start_offset;
     __gm__ float *gtotp = reinterpret_cast<__gm__ float *>(gtot->buffer.addr) + gtot->start_offset;
@@ -103,10 +116,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ float *krestp = reinterpret_cast<__gm__ float *>(krest->buffer.addr) + krest->start_offset;
     __gm__ float *decayp = reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset;
 
-    switch (S) {
-    case 16:  prep_impl<16, 16>(gcsp, gtotp, kp, krestp, decayp);   break;
-    case 32:  prep_impl<32, 32>(gcsp, gtotp, kp, krestp, decayp);   break;
-    case 64:  prep_impl<64, 64>(gcsp, gtotp, kp, krestp, decayp);   break;
-    default:  prep_impl<128, 128>(gcsp, gtotp, kp, krestp, decayp); break;
+    switch (C) {
+    case 16:  prep_by_d<16>(D, gcsp, gtotp, kp, krestp, decayp);   break;
+    case 32:  prep_by_d<32>(D, gcsp, gtotp, kp, krestp, decayp);   break;
+    case 64:  prep_by_d<64>(D, gcsp, gtotp, kp, krestp, decayp);   break;
+    default:  prep_by_d<128>(D, gcsp, gtotp, kp, krestp, decayp);  break;
     }
 }

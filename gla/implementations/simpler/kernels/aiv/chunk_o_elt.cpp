@@ -1,11 +1,12 @@
 /*
  * GLA chunk_o elementwise (simpler runtime, Vector core).
  *
- * out = A (op) B, elementwise over [R,Cc].  mode 0 = multiply (Aqk * tril mask),
- * mode 1 = add (o = inter + intra).  R == Cc == S, a runtime tile size dispatched
- * to a compile-time template over {16,32,64,128}.
+ * out = A (op) B, elementwise over [R,Cc].  mode 0 = multiply (Aqk * tril mask,
+ * shape [C,C]), mode 1 = add (o = inter + intra, shape [C,D]).  R and Cc are
+ * runtime scalars each dispatched to a compile-time template over {16,32,64,128}.
  *
- * Args (Tensor*): [0]=A IN, [1]=B IN, [2]=out OUT;  scalar[0]=mode.
+ * Args (Tensor*): [0]=A IN, [1]=B IN, [2]=out OUT;  scalar[0]=mode,
+ *                 scalar[1]=R, scalar[2]=Cc.
  */
 
 #include <cstdint>
@@ -55,21 +56,32 @@ static __aicore__ void elt_impl(__gm__ float *a, __gm__ float *b, __gm__ float *
     pipe_sync();
 }
 
+template <int R>
+static __aicore__ void elt_by_cc(int cc, __gm__ float *a, __gm__ float *b, __gm__ float *o, int mode) {
+    switch (cc) {
+    case 16:  elt_impl<R, 16>(a, b, o, mode);   break;
+    case 32:  elt_impl<R, 32>(a, b, o, mode);   break;
+    case 64:  elt_impl<R, 64>(a, b, o, mode);   break;
+    default:  elt_impl<R, 128>(a, b, o, mode);  break;
+    }
+}
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *a = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *b = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *o = reinterpret_cast<__gm__ Tensor *>(args[2]);
     int mode = static_cast<int>(args[3]);
-    int S = static_cast<int>(args[4]);  // tile size (square: C==D)
+    int R = static_cast<int>(args[4]);   // rows
+    int Cc = static_cast<int>(args[5]);  // cols
 
     __gm__ float *ap = reinterpret_cast<__gm__ float *>(a->buffer.addr) + a->start_offset;
     __gm__ float *bp = reinterpret_cast<__gm__ float *>(b->buffer.addr) + b->start_offset;
     __gm__ float *op = reinterpret_cast<__gm__ float *>(o->buffer.addr) + o->start_offset;
 
-    switch (S) {
-    case 16:  elt_impl<16, 16>(ap, bp, op, mode);   break;
-    case 32:  elt_impl<32, 32>(ap, bp, op, mode);   break;
-    case 64:  elt_impl<64, 64>(ap, bp, op, mode);   break;
-    default:  elt_impl<128, 128>(ap, bp, op, mode); break;
+    switch (R) {
+    case 16:  elt_by_cc<16>(Cc, ap, bp, op, mode);   break;
+    case 32:  elt_by_cc<32>(Cc, ap, bp, op, mode);   break;
+    case 64:  elt_by_cc<64>(Cc, ap, bp, op, mode);   break;
+    default:  elt_by_cc<128>(Cc, ap, bp, op, mode);  break;
     }
 }

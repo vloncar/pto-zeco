@@ -53,6 +53,12 @@ class TestGateCumsum(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"C": 32, "D": 32, "N": 2},
         },
+        {   # rectangular C != D (Phase 2): tril[C,C] @ g[C,D]
+            "name": "C32_D64_N2",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"C": 32, "D": 64, "N": 2},
+        },
     ]
 
     def generate_args(self, params):

@@ -56,6 +56,11 @@ class TestChunkH(SceneTestCase):
          "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 32, "N": 2}},
         {"name": "C32_N4", "platforms": ["a2a3"],
          "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 32, "N": 4}},
+        # rectangular C != D (Phase 2)
+        {"name": "C32_D64_N2", "platforms": ["a2a3sim", "a2a3"],
+         "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 64, "N": 2}},
+        {"name": "C32_D64_N4", "platforms": ["a2a3"],
+         "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 64, "N": 4}},
     ]
 
     def generate_args(self, params):
