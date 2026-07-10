@@ -6,18 +6,21 @@
  * (all dims are C or D in the GLA pipeline, both in that set).  A ``mode`` scalar
  * selects the transpose variant so a single kernel covers every GLA matmul:
  *
- *   mode 0 (NN): out[M,N] = A[M,Kc] @ B[Kc,N]        (q_eff@S, Aqk@v)
- *   mode 1 (TN): out[M,N] = A[Kc,M]^T @ B[Kc,N]      (k_rest^T@v  in chunk_h)
- *   mode 2 (NT): out[M,N] = A[M,Kc] @ B[N,Kc]^T      (q_eff@k_eff^T in chunk_o)
+ *   mode 0 (NN): out[M,N] = A[M,Kc] @ B[Kc,N]          (q_eff@S, Aqk@v)
+ *   mode 1 (TN): out[M,N] = A[Kc,M]^T @ B[Kc,N]        (k_rest^T@v  in chunk_h)
+ *   mode 2 (NT): out[M,N] = A[M,Kc] @ B[N,Kc]^T        (q_eff@k_eff^T in chunk_o)
  *
  * The GLA matmul shapes (M,N,Kc) are: KV=(D,D,C) TN, inter=(C,D,D) NN,
  * Aqk=(C,C,D) NT, intra=(C,D,C) NN.  When C==D they are all square SxSxS.
  *
+ * Every dim is <= 128 (one L0 tile), so no blocking is needed.  Tiles > 128 (head
+ * dim 256) are a follow-up (F3 Phase 3) blocked on fp32 cube K-accumulation being
+ * unsupported on a2a3 — see allscan/issues/fp32-cube-k-accumulation/.
+ *
  * Transpose is done by loading the operand row-major into an L1 "Mat" tile
  * (ColMajor block / RowMajor sub) and TRESHAPE-ing it to the transposed ZN
  * layout (RowMajor block / ColMajor sub) before TEXTRACT into L0A/L0B — the
- * recipe proven in the square kernel and in chunk_o_kda.cpp::gemm_oneshot.  Every
- * GLA matmul has Kc <= 128 == one L0 tile, so no K-slicing is needed.
+ * recipe proven in the square kernel and in chunk_o_kda.cpp::gemm_oneshot.
  *
  * Args (Tensor*): [0]=A IN, [1]=B IN, [2]=C OUT;
  *                 scalar[0]=mode, scalar[1]=M, scalar[2]=N, scalar[3]=Kc.
@@ -47,8 +50,7 @@ template <int R, int Cc>
 using GmData = GlobalTensor<float, Shape<1, 1, 1, R, Cc>, Stride<R * Cc, R * Cc, R * Cc, Cc, 1>>;
 
 // L1 "Mat" tile: ColMajor block layout, RowMajor sub-layout (loaded from a
-// row-major GM buffer).  ZN is the transposed reinterpretation (layouts swapped,
-// dims swapped) — a bitwise TRESHAPE that presents the operand transposed.
+// row-major GM buffer).  ZN is the transposed reinterpretation.
 template <int R, int Cc>
 using MatL1 = Tile<TileType::Mat, float, R, Cc, BLayout::ColMajor, R, Cc, SLayout::RowMajor, 512, PadValue::Zero>;
 template <int R, int Cc>
