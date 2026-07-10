@@ -59,10 +59,16 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *b = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *o = reinterpret_cast<__gm__ Tensor *>(args[2]);
     int mode = static_cast<int>(args[3]);
+    int S = static_cast<int>(args[4]);  // tile size (square: C==D)
 
-    elt_impl<128, 128>(
-        reinterpret_cast<__gm__ float *>(a->buffer.addr) + a->start_offset,
-        reinterpret_cast<__gm__ float *>(b->buffer.addr) + b->start_offset,
-        reinterpret_cast<__gm__ float *>(o->buffer.addr) + o->start_offset,
-        mode);
+    __gm__ float *ap = reinterpret_cast<__gm__ float *>(a->buffer.addr) + a->start_offset;
+    __gm__ float *bp = reinterpret_cast<__gm__ float *>(b->buffer.addr) + b->start_offset;
+    __gm__ float *op = reinterpret_cast<__gm__ float *>(o->buffer.addr) + o->start_offset;
+
+    switch (S) {
+    case 16:  elt_impl<16, 16>(ap, bp, op, mode);   break;
+    case 32:  elt_impl<32, 32>(ap, bp, op, mode);   break;
+    case 64:  elt_impl<64, 64>(ap, bp, op, mode);   break;
+    default:  elt_impl<128, 128>(ap, bp, op, mode); break;
+    }
 }

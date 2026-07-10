@@ -58,7 +58,9 @@ static __aicore__ void prep_impl(__gm__ float *gcs, __gm__ float *gtot, __gm__ f
 
     // coeff = exp(g_total_broadcast - g_cs)
     TCOLEXPAND(coeffT, gtotT);          // broadcast g_total[1,K] down C rows
-    pipe_barrier(PIPE_V);
+    pipe_barrier(PIPE_ALL);             // TCOLEXPAND lowers to a ubuf copy (not a pure
+                                        // PIPE_V op); a PIPE_V-only barrier can let TSUB
+                                        // read coeffT before the copy lands at S<128.
     TSUB(coeffT, coeffT, gcsT);
     pipe_barrier(PIPE_V);
     TEXP(coeffT, coeffT);
@@ -92,11 +94,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *k = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *krest = reinterpret_cast<__gm__ Tensor *>(args[3]);
     __gm__ Tensor *decay = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    int S = static_cast<int>(args[5]);  // tile size C==K (square: C==D)
 
-    prep_impl<128, 128>(
-        reinterpret_cast<__gm__ float *>(gcs->buffer.addr) + gcs->start_offset,
-        reinterpret_cast<__gm__ float *>(gtot->buffer.addr) + gtot->start_offset,
-        reinterpret_cast<__gm__ float *>(k->buffer.addr) + k->start_offset,
-        reinterpret_cast<__gm__ float *>(krest->buffer.addr) + krest->start_offset,
-        reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset);
+    __gm__ float *gcsp = reinterpret_cast<__gm__ float *>(gcs->buffer.addr) + gcs->start_offset;
+    __gm__ float *gtotp = reinterpret_cast<__gm__ float *>(gtot->buffer.addr) + gtot->start_offset;
+    __gm__ float *kp = reinterpret_cast<__gm__ float *>(k->buffer.addr) + k->start_offset;
+    __gm__ float *krestp = reinterpret_cast<__gm__ float *>(krest->buffer.addr) + krest->start_offset;
+    __gm__ float *decayp = reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset;
+
+    switch (S) {
+    case 16:  prep_impl<16, 16>(gcsp, gtotp, kp, krestp, decayp);   break;
+    case 32:  prep_impl<32, 32>(gcsp, gtotp, kp, krestp, decayp);   break;
+    case 64:  prep_impl<64, 64>(gcsp, gtotp, kp, krestp, decayp);   break;
+    default:  prep_impl<128, 128>(gcsp, gtotp, kp, krestp, decayp); break;
+    }
 }

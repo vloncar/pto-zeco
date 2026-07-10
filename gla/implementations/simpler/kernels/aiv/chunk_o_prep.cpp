@@ -86,11 +86,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *gcs = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *qeff = reinterpret_cast<__gm__ Tensor *>(args[3]);
     __gm__ Tensor *keff = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    int S = static_cast<int>(args[5]);  // tile size C==K (square: C==D)
 
-    prep_impl<128, 128>(
-        reinterpret_cast<__gm__ float *>(q->buffer.addr) + q->start_offset,
-        reinterpret_cast<__gm__ float *>(k->buffer.addr) + k->start_offset,
-        reinterpret_cast<__gm__ float *>(gcs->buffer.addr) + gcs->start_offset,
-        reinterpret_cast<__gm__ float *>(qeff->buffer.addr) + qeff->start_offset,
-        reinterpret_cast<__gm__ float *>(keff->buffer.addr) + keff->start_offset);
+    __gm__ float *qp = reinterpret_cast<__gm__ float *>(q->buffer.addr) + q->start_offset;
+    __gm__ float *kp = reinterpret_cast<__gm__ float *>(k->buffer.addr) + k->start_offset;
+    __gm__ float *gcsp = reinterpret_cast<__gm__ float *>(gcs->buffer.addr) + gcs->start_offset;
+    __gm__ float *qeffp = reinterpret_cast<__gm__ float *>(qeff->buffer.addr) + qeff->start_offset;
+    __gm__ float *keffp = reinterpret_cast<__gm__ float *>(keff->buffer.addr) + keff->start_offset;
+
+    switch (S) {
+    case 16:  prep_impl<16, 16>(qp, kp, gcsp, qeffp, keffp);   break;
+    case 32:  prep_impl<32, 32>(qp, kp, gcsp, qeffp, keffp);   break;
+    case 64:  prep_impl<64, 64>(qp, kp, gcsp, qeffp, keffp);   break;
+    default:  prep_impl<128, 128>(qp, kp, gcsp, qeffp, keffp); break;
+    }
 }

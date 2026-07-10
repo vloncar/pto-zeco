@@ -87,6 +87,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_prep.add_input(k_n);
         p_prep.add_output(krest_ci);
         p_prep.add_output(decay_ci);
+        p_prep.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         TaskOutputTensors prep_outs = rt_submit_aiv_task(FUNC_PREP, p_prep);
         const Tensor &krest = prep_outs.get_ref(0);
         const Tensor &decay = prep_outs.get_ref(1);
@@ -96,7 +97,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_mm.add_input(krest);
         p_mm.add_input(v_n);
         p_mm.add_output(kv_ci);
-        p_mm.add_scalar(static_cast<uint64_t>(1));
+        p_mm.add_scalar(static_cast<uint64_t>(1));    // mode TN
+        p_mm.add_scalar(static_cast<uint64_t>(C));    // tile size S (square: C==D)
         TaskOutputTensors mm_outs = rt_submit_aic_task(FUNC_MM, p_mm);
         const Tensor &KV = mm_outs.get_ref(0);
 
@@ -106,7 +108,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_up.add_input(decay);
         p_up.add_inout(S);
         p_up.add_inout(snap_n);
-        p_up.add_scalar(static_cast<uint64_t>(n == 0 ? 1 : 0));
+        p_up.add_scalar(static_cast<uint64_t>(n == 0 ? 1 : 0));  // is_first
+        p_up.add_scalar(static_cast<uint64_t>(C));               // tile size S (square: C==D)
         rt_submit_aiv_task(FUNC_UPDATE, p_up);
     }
     }  // PTO2_SCOPE

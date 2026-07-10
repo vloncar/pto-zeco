@@ -81,6 +81,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_prep.add_input(gcs_n);
         p_prep.add_output(qeff_ci);
         p_prep.add_output(keff_ci);
+        p_prep.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         TaskOutputTensors prep_outs = rt_submit_aiv_task(FUNC_PREP, p_prep);
         const Tensor &qeff = prep_outs.get_ref(0);
         const Tensor &keff = prep_outs.get_ref(1);
@@ -90,7 +91,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_inter.add_input(qeff);
         p_inter.add_input(s_n);
         p_inter.add_output(inter_ci);
-        p_inter.add_scalar(static_cast<uint64_t>(0));
+        p_inter.add_scalar(static_cast<uint64_t>(0));  // mode NN
+        p_inter.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         TaskOutputTensors inter_outs = rt_submit_aic_task(FUNC_MM, p_inter);
         const Tensor &inter = inter_outs.get_ref(0);
 
@@ -99,7 +101,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_aqk.add_input(qeff);
         p_aqk.add_input(keff);
         p_aqk.add_output(aqk_ci);
-        p_aqk.add_scalar(static_cast<uint64_t>(2));
+        p_aqk.add_scalar(static_cast<uint64_t>(2));  // mode NT
+        p_aqk.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         TaskOutputTensors aqk_outs = rt_submit_aic_task(FUNC_MM, p_aqk);
         const Tensor &aqk = aqk_outs.get_ref(0);
 
@@ -108,7 +111,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_mask.add_input(aqk);
         p_mask.add_input(tril);
         p_mask.add_output(aqkm_ci);
-        p_mask.add_scalar(static_cast<uint64_t>(0));
+        p_mask.add_scalar(static_cast<uint64_t>(0));  // mode mul
+        p_mask.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         TaskOutputTensors mask_outs = rt_submit_aiv_task(FUNC_ELT, p_mask);
         const Tensor &aqkm = mask_outs.get_ref(0);
 
@@ -117,7 +121,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_intra.add_input(aqkm);
         p_intra.add_input(v_n);
         p_intra.add_output(intra_ci);
-        p_intra.add_scalar(static_cast<uint64_t>(0));
+        p_intra.add_scalar(static_cast<uint64_t>(0));  // mode NN
+        p_intra.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         TaskOutputTensors intra_outs = rt_submit_aic_task(FUNC_MM, p_intra);
         const Tensor &intra = intra_outs.get_ref(0);
 
@@ -126,7 +131,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         p_out.add_input(inter);
         p_out.add_input(intra);
         p_out.add_inout(o_n);
-        p_out.add_scalar(static_cast<uint64_t>(1));
+        p_out.add_scalar(static_cast<uint64_t>(1));  // mode add
+        p_out.add_scalar(static_cast<uint64_t>(C));  // tile size S (square: C==D)
         rt_submit_aiv_task(FUNC_ELT, p_out);
     }
 }

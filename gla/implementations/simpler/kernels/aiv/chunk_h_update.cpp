@@ -86,11 +86,17 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *s = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *ssnap = reinterpret_cast<__gm__ Tensor *>(args[3]);
     uint64_t is_first = static_cast<uint64_t>(args[4]);
+    int S = static_cast<int>(args[5]);  // tile size K==V (square: C==D)
 
-    update_impl<128, 128>(
-        reinterpret_cast<__gm__ float *>(kv->buffer.addr) + kv->start_offset,
-        reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset,
-        reinterpret_cast<__gm__ float *>(s->buffer.addr) + s->start_offset,
-        reinterpret_cast<__gm__ float *>(ssnap->buffer.addr) + ssnap->start_offset,
-        is_first);
+    __gm__ float *kvp = reinterpret_cast<__gm__ float *>(kv->buffer.addr) + kv->start_offset;
+    __gm__ float *decayp = reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset;
+    __gm__ float *sp = reinterpret_cast<__gm__ float *>(s->buffer.addr) + s->start_offset;
+    __gm__ float *snapp = reinterpret_cast<__gm__ float *>(ssnap->buffer.addr) + ssnap->start_offset;
+
+    switch (S) {
+    case 16:  update_impl<16, 16>(kvp, decayp, sp, snapp, is_first);   break;
+    case 32:  update_impl<32, 32>(kvp, decayp, sp, snapp, is_first);   break;
+    case 64:  update_impl<64, 64>(kvp, decayp, sp, snapp, is_first);   break;
+    default:  update_impl<128, 128>(kvp, decayp, sp, snapp, is_first); break;
+    }
 }
