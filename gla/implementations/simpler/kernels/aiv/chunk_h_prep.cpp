@@ -9,7 +9,8 @@
  *   decay[k]    = exp(g_total[k])                                  -> [K,1]
  *
  * k_rest feeds the Cube matmul KV = k_rest^T @ v; decay row-scales the carried
- * state in chunk_h_update.  All fp32, K == C == 128.
+ * state in chunk_h_update.  All fp32; K == C == S, a runtime tile size dispatched
+ * to a compile-time template over {16,32,64,128}.
  *
  * Args (Tensor*): [0]=g_cs [C,K] IN, [1]=g_total [1,K] IN, [2]=k [C,K] IN,
  *                 [3]=k_rest [C,K] OUT, [4]=decay [K,1] OUT.

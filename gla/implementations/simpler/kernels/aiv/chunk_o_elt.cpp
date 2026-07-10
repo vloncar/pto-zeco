@@ -2,7 +2,8 @@
  * GLA chunk_o elementwise (simpler runtime, Vector core).
  *
  * out = A (op) B, elementwise over [R,Cc].  mode 0 = multiply (Aqk * tril mask),
- * mode 1 = add (o = inter + intra).  R,Cc == 128.
+ * mode 1 = add (o = inter + intra).  R == Cc == S, a runtime tile size dispatched
+ * to a compile-time template over {16,32,64,128}.
  *
  * Args (Tensor*): [0]=A IN, [1]=B IN, [2]=out OUT;  scalar[0]=mode.
  */

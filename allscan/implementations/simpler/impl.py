@@ -44,14 +44,12 @@ RUNTIME = "tensormap_and_ringbuffer"
 DTYPE_NBYTES = 4  # float32
 
 
-def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
+def build_chip_callable(platform: str):
     """Compile the forward AIV allscan kernel + its C++ orchestration shim.
 
     Args:
         platform: Target backend, e.g. ``"a2a3"`` (hardware) or ``"a2a3sim"``
             (simulator); a ``sim`` suffix skips the ELF ``.text`` extraction.
-        pto_isa_commit: Optional PTO-ISA commit/tag to fetch for the kernel
-            headers; ``None`` uses the default checkout.
 
     Returns:
         A ``ChipCallable`` (one AIV task per chip) ready to register on a Worker.
@@ -62,9 +60,6 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
     from simpler_setup.pto_isa import ensure_pto_isa_root
 
     kc = KernelCompiler(platform=platform)
-    # NOTE: upstream ensure_pto_isa_root() dropped the commit/clone_protocol kwargs
-    # (it now manages the pinned pto-isa root itself). pto_isa_commit is vestigial.
-    _ = pto_isa_commit
     pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(RUNTIME)
     # src/common — for platform_comm/comm_context.h
@@ -97,7 +92,7 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
     )
 
 
-def build_backward_chip_callable(platform: str, pto_isa_commit: str | None = None):
+def build_backward_chip_callable(platform: str):
     """Compile the AIV allscan *backward* kernel + its C++ orchestration shim.
 
     Kernel signature: g_out, gamma, out_prev (IN), dS, dgamma (OUT), scratch (INOUT).
@@ -105,7 +100,6 @@ def build_backward_chip_callable(platform: str, pto_isa_commit: str | None = Non
     Args:
         platform: Target backend (``"a2a3"`` / ``"a2a3sim"``); a ``sim`` suffix
             skips the ELF ``.text`` extraction.
-        pto_isa_commit: Optional PTO-ISA commit/tag for the kernel headers.
 
     Returns:
         A ``ChipCallable`` for the reverse-ring backward kernel.
@@ -116,9 +110,6 @@ def build_backward_chip_callable(platform: str, pto_isa_commit: str | None = Non
     from simpler_setup.pto_isa import ensure_pto_isa_root
 
     kc = KernelCompiler(platform=platform)
-    # NOTE: upstream ensure_pto_isa_root() dropped the commit/clone_protocol kwargs
-    # (it now manages the pinned pto-isa root itself). pto_isa_commit is vestigial.
-    _ = pto_isa_commit
     pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(RUNTIME)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
@@ -177,12 +168,7 @@ class SimplerAllscan(AllscanImpl):
     #: Number of AllScans dispatched per batched timing sample in measure().
     _MEASURE_BATCH = 16
 
-    def __init__(self, pto_isa_commit: str | None = None) -> None:
-        """Args:
-            pto_isa_commit: Optional PTO-ISA commit/tag to fetch for kernel
-                headers (passed through to the compilers); ``None`` = default.
-        """
-        self.pto_isa_commit = pto_isa_commit
+    def __init__(self) -> None:
         self.worker = None
 
     def build(self, dk, dv, K, P, device_ids, platform):
@@ -233,8 +219,8 @@ class SimplerAllscan(AllscanImpl):
         self._slot_floats = dk * dv + K
         self._slot_nbytes = self._slot_floats * DTYPE_NBYTES
 
-        chip_callable = build_chip_callable(platform, self.pto_isa_commit)
-        bwd_chip_callable = build_backward_chip_callable(platform, self.pto_isa_commit)
+        chip_callable = build_chip_callable(platform)
+        bwd_chip_callable = build_backward_chip_callable(platform)
         self.worker = Worker(
             level=3,
             platform=platform,
@@ -521,7 +507,6 @@ def main() -> int:
     parser.add_argument("--dk", type=int, default=64, help="Key dimension (rows). Default 64.")
     parser.add_argument("--dv", type=int, default=64, help="Value dimension (cols). Default 64.")
     parser.add_argument("--K", type=int, default=1, help="Pipeline depth / number of blocks. Default 1.")
-    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch.")
     cli = parser.parse_args()
 
     device_ids = _parse_device_range(cli.device)
@@ -529,7 +514,7 @@ def main() -> int:
     print(f"[simpler] platform={cli.platform} devices={device_ids} P={P} dk={cli.dk} dv={cli.dv} K={cli.K}")
 
     S_locals, gammas, outputs = make_inputs(P, cli.dk, cli.dv)
-    impl = SimplerAllscan(pto_isa_commit=cli.pto_isa_commit)
+    impl = SimplerAllscan()
     impl.build(cli.dk, cli.dv, cli.K, P, device_ids, cli.platform)
     try:
         impl.run(S_locals, gammas, outputs)

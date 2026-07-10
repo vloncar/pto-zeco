@@ -78,7 +78,7 @@ if sys.path[:1] != [str(_THIS_DIR)]:
     sys.path.insert(0, str(_THIS_DIR))
 
 from common.harness import parse_devices, percentile, print_table  # noqa: E402
-from gla.common import ZeCoImpl, expected_gla, flatten_seq, make_gla_inputs  # noqa: E402
+from gla.common import expected_gla, flatten_seq, make_gla_inputs  # noqa: E402
 from gla.implementations import REGISTRY  # noqa: E402
 
 

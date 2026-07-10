@@ -1,7 +1,9 @@
 /*
- * GLA generalised 128x128x128 matmul (simpler runtime, Cube core).
+ * GLA generalised square SxSxS matmul (simpler runtime, Cube core).
  *
- * out = op(A) @ op(B), all dims == TILE (128), fp32.  A ``mode`` scalar selects
+ * out = op(A) @ op(B), all dims == TILE == S, fp32; the tile size S is a runtime
+ * scalar dispatched to a compile-time template over {16,32,64,128} (square: the
+ * whole GLA pipeline is SxSxS when chunk C == head D).  A ``mode`` scalar selects
  * the transpose variant so a single kernel covers every matmul in the GLA
  * pipeline:
  *
@@ -11,8 +13,8 @@
  *
  * Transpose is the single-shot L1->L0 pattern proven in the vendored
  * chunk_o_kda.cpp::gemm_oneshot (TRESHAPE the L1 tile to a ZN layout, then
- * TEXTRACT into L0A/L0B).  Every GLA matmul has inner dim == 128 == one L0
- * tile, so no K-slicing is needed.
+ * TEXTRACT into L0A/L0B).  Every GLA matmul has inner dim == TILE <= 128 == one
+ * L0 tile, so no K-slicing is needed.
  *
  * Args (Tensor*): [0]=A [TILE,TILE] IN, [1]=B [TILE,TILE] IN, [2]=C [TILE,TILE] OUT;
  *                 scalar[0]=mode.

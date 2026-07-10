@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """De-risk the generalised GLA matmul kernel (NN / TN / NT modes) on HW.
 
-Each case runs a single 128x128x128 fp32 matmul in one transpose mode and
-compares against torch.  Establishes the transposed-matmul path (k_rest^T@v,
-q_eff@k_eff^T) shared by chunk_h and chunk_o before those kernels are built.
+Each case runs a single square SxSxS fp32 matmul in one transpose mode (S from
+the ``T`` param, dispatched over {16,32,64,128}) and compares against torch.
+Establishes the transposed-matmul path (k_rest^T@v, q_eff@k_eff^T) shared by
+chunk_h and chunk_o, and guards the runtime-size dispatch at S=32 and S=128.
 
 Run (base env)::
 

@@ -7,7 +7,8 @@
  *     g_cs = tril @ g          tril[t,s] = 1 for s <= t (lower-tri ones [C,C])
  *
  * so g_cs[t,d] = sum_{s<=t} g[s,d].  One [C,C] @ [C,D] matmul; the orchestration
- * (gate_cumsum_orch.cpp) submits one such task per chunk. D == C == TILE (128).
+ * (gate_cumsum_orch.cpp) submits one such task per chunk. D == C == TILE, a
+ * runtime scalar dispatched to a compile-time template over {16,32,64,128}.
  *
  * The cube-matmul body (TLOAD -> TMOV to L0A/L0B -> TMATMUL -> TSTORE, with pipe
  * sync) is the pattern from examples/.../benchmark_bgemm/kernels/aic/

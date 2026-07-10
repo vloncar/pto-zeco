@@ -225,7 +225,7 @@ class SimplerZeCo(ZeCoImpl):
 
     def _stage2(self, p, Q, K, V, g_cs, s_shift):
         """Run chunk_o on rank p's device -> O [L,D]."""
-        L, C, D = self.L, self.C, self.D
+        L, D = self.L, self.D
         o = torch.zeros(L, D, dtype=torch.float32)
         self._runners[p].run(
             "chunk_o", CHUNK_O_SPEC["orchestration"]["signature"],
