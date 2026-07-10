@@ -51,6 +51,14 @@ class TestChunkO(SceneTestCase):
          "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 128, "D": 128, "N": 2}},
         {"name": "C128_N4", "platforms": ["a2a3"],
          "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 128, "D": 128, "N": 4}},
+        {"name": "C32_N2", "platforms": ["a2a3sim", "a2a3"],
+         "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 32, "N": 2}},
+        {"name": "C32_N4", "platforms": ["a2a3"],
+         "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 32, "N": 4}},
+        {"name": "C32_N1", "platforms": ["a2a3sim", "a2a3"],
+         "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 32, "D": 32, "N": 1}},
+        {"name": "C64_N2", "platforms": ["a2a3sim", "a2a3"],
+         "config": {"aicpu_thread_num": 4, "block_dim": 24}, "params": {"C": 64, "D": 64, "N": 2}},
     ]
 
     def generate_args(self, params):

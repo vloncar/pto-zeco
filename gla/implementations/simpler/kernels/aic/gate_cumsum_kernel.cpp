@@ -86,10 +86,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *a = reinterpret_cast<__gm__ Tensor *>(args[0]);  // tril [C,C]
     __gm__ Tensor *b = reinterpret_cast<__gm__ Tensor *>(args[1]);  // g_chunk [C,D]
     __gm__ Tensor *c = reinterpret_cast<__gm__ Tensor *>(args[2]);  // g_cs_chunk [C,D]
+    int S = static_cast<int>(args[3]);                              // tile size (square: C==D)
 
     __gm__ float *ap = reinterpret_cast<__gm__ float *>(a->buffer.addr) + a->start_offset;
     __gm__ float *bp = reinterpret_cast<__gm__ float *>(b->buffer.addr) + b->start_offset;
     __gm__ float *cp = reinterpret_cast<__gm__ float *>(c->buffer.addr) + c->start_offset;
 
-    trilmatmul_tile<128>(ap, bp, cp);
+    // Runtime dispatch to a compile-time tile size (the benchmark_bgemm pattern):
+    // the whole GLA pipeline is square when C==D, so one size drives every tile.
+    switch (S) {
+    case 16:  trilmatmul_tile<16>(ap, bp, cp);  break;
+    case 32:  trilmatmul_tile<32>(ap, bp, cp);  break;
+    case 64:  trilmatmul_tile<64>(ap, bp, cp);  break;
+    default:  trilmatmul_tile<128>(ap, bp, cp); break;
+    }
 }

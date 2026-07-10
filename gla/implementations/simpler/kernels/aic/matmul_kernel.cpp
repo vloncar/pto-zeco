@@ -107,6 +107,18 @@ static __aicore__ void mm_impl(__gm__ float *a, __gm__ float *b, __gm__ float *c
     pipe_sync();
 }
 
+// Dispatch the (runtime) transpose mode for a compile-time tile size.
+template <int TILE>
+static __aicore__ void mm_dispatch_mode(int mode, __gm__ float *a, __gm__ float *b, __gm__ float *c) {
+    if (mode == 1) {
+        mm_impl<TILE, 1>(a, b, c);
+    } else if (mode == 2) {
+        mm_impl<TILE, 2>(a, b, c);
+    } else {
+        mm_impl<TILE, 0>(a, b, c);
+    }
+}
+
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
@@ -114,16 +126,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *b = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *c = reinterpret_cast<__gm__ Tensor *>(args[2]);
     int mode = static_cast<int>(args[3]);
+    int S = static_cast<int>(args[4]);  // tile size (square: C==D)
 
     __gm__ float *ap = reinterpret_cast<__gm__ float *>(a->buffer.addr) + a->start_offset;
     __gm__ float *bp = reinterpret_cast<__gm__ float *>(b->buffer.addr) + b->start_offset;
     __gm__ float *cp = reinterpret_cast<__gm__ float *>(c->buffer.addr) + c->start_offset;
 
-    if (mode == 1) {
-        mm_impl<128, 1>(ap, bp, cp);
-    } else if (mode == 2) {
-        mm_impl<128, 2>(ap, bp, cp);
-    } else {
-        mm_impl<128, 0>(ap, bp, cp);
+    // Every GLA matmul is square (M==N==Kc==S) when C==D, so one size drives all
+    // three transpose variants; runtime dispatch to a compile-time tile size.
+    switch (S) {
+    case 16:  mm_dispatch_mode<16>(mode, ap, bp, cp);  break;
+    case 32:  mm_dispatch_mode<32>(mode, ap, bp, cp);  break;
+    case 64:  mm_dispatch_mode<64>(mode, ap, bp, cp);  break;
+    default:  mm_dispatch_mode<128>(mode, ap, bp, cp); break;
     }
 }

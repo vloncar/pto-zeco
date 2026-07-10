@@ -17,8 +17,14 @@ whole ZeCO is one runtime, no torch-npu/pypto coexistence. The compute runs as
 hand-written PTO-ISA kernels in the simpler runtime (not torch-npu-launched
 ``.so`` kernels).
 
-Requires ``dk == dv == D`` and ``L % C == 0`` (kernels are specialised to
-``K == V == C == D == 128``).
+Requires ``dk == dv == D``, ``L % C == 0``, and — currently — ``C == D`` (square
+tiles). The incore kernels dispatch a runtime tile size to a compile-time template
+over ``{16, 32, 64, 128}`` (the ``benchmark_bgemm`` pattern), so the whole pipeline
+runs at any of those sizes as long as chunk == head dim. When ``C == D`` every GLA
+matmul is square (``M == N == Kc``), which is what lets a single size scalar drive
+all of gate_cumsum / chunk_h / chunk_o. Non-square ``C != D`` (e.g. the bench's
+``D == 64`` configs) needs the matmul kernel generalised to independent ``M, N, Kc``
+— a follow-up (F3 Phase 2).
 """
 
 from __future__ import annotations
@@ -180,6 +186,14 @@ class SimplerZeCo(ZeCoImpl):
     def build(self, P, L, C, dk, dv, device_ids, platform):
         assert dk == dv, f"simpler GLA kernels assume K == V (D); got dk={dk} dv={dv}"
         assert L % C == 0, f"L={L} not divisible by C={C}"
+        # The incore kernels dispatch one tile size over {16,32,64,128}; that only
+        # covers the GLA pipeline when every matmul is square, i.e. chunk == head dim.
+        # Non-square (C != D) needs the matmul kernel generalised to M,N,Kc (F3 P2).
+        assert C == dk, (
+            f"simpler GLA kernels currently require C == D (square tiles); got C={C} D={dk}. "
+            f"C != D (non-square) is not yet supported.")
+        assert C in (16, 32, 64, 128), (
+            f"simpler GLA tile size must be one of {{16,32,64,128}}; got C={C}")
         self.P, self.L, self.C, self.D = P, L, C, dk
         self.device_ids = list(device_ids[:P])
         self.platform = platform
