@@ -3,18 +3,17 @@
 Compiles and runs on the target platform selected via ``--platform`` (a2a3
 hardware or a2a3sim simulator) across the devices given by ``--device``.
 
-:class:`PyPtoZeCo` uses the chunk-recurrent GLA form in a hybrid composition —
-a fused distributed ``stage1 + AllScan-ring`` program, then a ``@pl.jit`` stage2
-(see :mod:`gla.implementations.pypto.impl`). ``P=1`` exercises the compute alone
-(no exchange, no distributed program); ``P>=2`` exercises the full SP path.
-Verified against the sequential :func:`gla.common.expected_gla` golden.
+:class:`PyPtoZeCo` runs the entire forward as ONE fully-fused distributed program —
+``stage1 + AllScan-ring + stage2``, all distributed InCore chip kernels, no ``@pl.jit``
+(see :mod:`gla.implementations.pypto.impl`). ``P=1`` is the native single-rank path
+(no boundary exchange); ``P>=2`` exercises the full SP path. Verified against the
+sequential :func:`gla.common.expected_gla` golden.
 
-Each parametrization runs in its own forked process (``@pytest.mark.forked``):
-within one process a ``@pl.jit`` dispatch (P=1 stage2) followed by a
-``DistributedWorker.prepare()`` (P=2 stage1+ring) on the same devices is the
-unsupported jit-then-prepare coexistence and hangs — forking gives each case a
-clean device state. Runs on both ``--platform a2a3sim`` and ``a2a3`` (the earlier
-a2a3sim deadlock on the chunk kernels was fixed upstream).
+Each parametrization runs in its own forked process (``@pytest.mark.forked``) so every
+case starts from clean device state (a fresh ``DistributedWorker.prepare()``/``close()``
+cycle per config). Runs on both ``--platform a2a3sim`` and ``a2a3`` — the fully-fused
+forward (including ``stage2`` as a distributed chip kernel) is verified on a2a3 hardware
+at P=1/2/4 after the upstream sim-scheduler and HW dist-chip fixes.
 """
 
 import sys

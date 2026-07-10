@@ -62,7 +62,10 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None = None):
     from simpler_setup.pto_isa import ensure_pto_isa_root
 
     kc = KernelCompiler(platform=platform)
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    # NOTE: upstream ensure_pto_isa_root() dropped the commit/clone_protocol kwargs
+    # (it now manages the pinned pto-isa root itself). pto_isa_commit is vestigial.
+    _ = pto_isa_commit
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(RUNTIME)
     # src/common — for platform_comm/comm_context.h
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
@@ -113,7 +116,10 @@ def build_backward_chip_callable(platform: str, pto_isa_commit: str | None = Non
     from simpler_setup.pto_isa import ensure_pto_isa_root
 
     kc = KernelCompiler(platform=platform)
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    # NOTE: upstream ensure_pto_isa_root() dropped the commit/clone_protocol kwargs
+    # (it now manages the pinned pto-isa root itself). pto_isa_commit is vestigial.
+    _ = pto_isa_commit
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(RUNTIME)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
 
