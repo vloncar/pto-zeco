@@ -26,6 +26,7 @@ Mapping to AllScan (``out[p] = S_local[p] + gamma[p] * out[p-1]``):
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 
 import torch
@@ -283,6 +284,46 @@ class ZeCoImpl(ABC):
         Returns:
             Outputs ``O``, shape ``[P, L, dv]`` (rank-major).
         """
+
+    #: Whether :meth:`measure` reports *steady-state* per-forward latency — i.e.
+    #: the fixed per-call orchestration setup (comm-domain / worker prepare) is
+    #: paid once at :meth:`build` time, not inside the timed loop. False means the
+    #: timed numbers include whatever per-call setup :meth:`forward` does.
+    amortized_timing: bool = False
+
+    def measure(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        A: torch.Tensor,
+        n_iters: int,
+    ) -> list[float]:
+        """Return ``n_iters`` per-forward latency samples in milliseconds.
+
+        Default implementation times :meth:`forward` once per sample, so the
+        numbers carry the full per-call overhead. Backends whose per-call cost is
+        dominated by fixed orchestration setup (e.g. a ``DistributedWorker``
+        prepare/close) override this to prepare once and time only the repeated
+        dispatch — the honest *steady-state* operator latency — and set
+        :attr:`amortized_timing` to True.
+
+        Args:
+            Q: Queries, shape ``[P, L, dk]``.
+            K: Keys, shape ``[P, L, dk]``.
+            V: Values, shape ``[P, L, dv]``.
+            A: Decay gates in ``(0, 1)``, shape ``[P, L, dk]``.
+            n_iters: Number of latency samples to collect.
+
+        Returns:
+            A list of ``n_iters`` per-forward latencies in milliseconds.
+        """
+        samples: list[float] = []
+        for _ in range(n_iters):
+            t0 = time.perf_counter()
+            self.forward(Q, K, V, A)
+            samples.append((time.perf_counter() - t0) * 1e3)
+        return samples
 
     def close(self) -> None:
         """Release resources (override if needed)."""

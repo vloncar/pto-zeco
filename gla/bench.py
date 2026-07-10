@@ -30,7 +30,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
+import os
 import statistics
 import sys
 import time
@@ -38,6 +40,35 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+
+#: Stale HCCL rendezvous files leaked by a killed distributed run — they make the
+#: next run hang at "Timeout waiting for rootinfo" (see the ``hccl-rootinfo-timeout``
+#: note). Cleaned between configs by default.
+_RENDEZVOUS_GLOB = "/tmp/barrier_pto_multi_comm_*"
+
+
+def clean_rendezvous() -> int:
+    """Delete stale HCCL rendezvous files; return how many were removed."""
+    removed = 0
+    for path in glob.glob(_RENDEZVOUS_GLOB):
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def check_preload(platform: str) -> None:
+    """Warn if a hardware run is missing the mandatory HCCL ``LD_PRELOAD`` — without
+    it every distributed pto run hangs at the rootinfo rendezvous."""
+    if platform.endswith("sim"):
+        return
+    if "libhccl" not in os.environ.get("LD_PRELOAD", ""):
+        print("  WARNING: LD_PRELOAD does not contain libhccl.so — distributed runs "
+              "will hang at rootinfo rendezvous.\n"
+              "           Prefix with: LD_PRELOAD=<cann>/aarch64-linux/lib64/libhccl.so",
+              file=sys.stderr)
 
 _THIS_DIR = Path(__file__).parent.parent  # repo root (pto-zeco/)
 # Repo root must precede the script dir (``gla/``) that Python auto-adds at sys.path[0]:
@@ -64,12 +95,22 @@ GLA_COLS = [
     ("min_ms", "Min(ms)", 9, ".2f"),
     ("p50_ms", "p50(ms)", 9, ".2f"),
     ("p95_ms", "p95(ms)", 9, ".2f"),
+    ("steady", "SS", 4, "s"),
     ("correct", "OK", 4, "s"),
 ]
 
 
 def bench_one(impl, P, L, C, dk, dv, device_ids, platform, n_warmup, n_iters, verify):
-    """Run one (impl, config) and return a result dict with forward-latency stats."""
+    """Run one (impl, config) and return a result dict with forward-latency stats.
+
+    Timing is **steady-state**: it uses ``impl.measure`` (not a raw ``forward`` loop),
+    so a backend that pays a fixed per-call orchestration setup (pypto's
+    ``DistributedWorker`` prepare/close) can amortize it — prepare once at ``build``,
+    time only the repeated dispatch. ``build_s`` (one-time compile + prepare) and
+    ``cold_ms`` (first forward) are reported separately so the honest split between
+    one-time cost, first-call cost, and steady-state operator latency is visible.
+    ``SS`` marks whether the backend reports amortized (steady-state) numbers.
+    """
     t0 = time.perf_counter()
     impl.build(P, L, C, dk, dv, device_ids[:P], platform)
     build_s = time.perf_counter() - t0
@@ -85,25 +126,24 @@ def bench_one(impl, P, L, C, dk, dv, device_ids, platform, n_warmup, n_iters, ve
         # on-device chunk math divides by within-chunk cumulative decay → looser than ref
         correct = bool(torch.allclose(O, exp, atol=1e-2))
 
-    # cold start (first timed call)
+    # cold start (first timed call). For an amortized backend prepare is already done in
+    # build(), so this is close to steady-state; otherwise it carries per-call setup.
     t0 = time.perf_counter()
     impl.forward(Q, K, V, A)
     cold_ms = (time.perf_counter() - t0) * 1e3
 
-    for _ in range(max(0, n_warmup - 1)):
+    for _ in range(max(0, n_warmup)):
         impl.forward(Q, K, V, A)
 
-    lat_ms = []
-    for _ in range(n_iters):
-        t0 = time.perf_counter()
-        impl.forward(Q, K, V, A)
-        lat_ms.append((time.perf_counter() - t0) * 1e3)
+    # steady-state samples (prepare-once backends time only the dispatch)
+    lat_ms = impl.measure(Q, K, V, A, n_iters)
 
     return {
         "impl": impl.name, "P": P, "L": L, "C": C, "D": dk,
         "build_s": build_s, "cold_ms": cold_ms,
         "mean_ms": statistics.mean(lat_ms), "min_ms": min(lat_ms),
         "p50_ms": percentile(lat_ms, 50), "p95_ms": percentile(lat_ms, 95),
+        "steady": "Y" if getattr(impl, "amortized_timing", False) else "N",
         "correct": correct, "max_diff": max_diff, "raw_ms": lat_ms,
     }
 
@@ -133,6 +173,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iters after cold call. Default: 3")
     parser.add_argument("--iters", type=int, default=10, help="Timed iters per config. Default: 10")
     parser.add_argument("--no-verify", action="store_true", help="Skip correctness check")
+    parser.add_argument("--no-clean", action="store_true",
+                        help="Do not delete stale /tmp/barrier_pto_multi_comm_* between configs")
     parser.add_argument("--impl", nargs="*", metavar="NAME",
                         help="Impls to run (default: all non-torch). Choices: "
                              + ", ".join(cls.name for cls in REGISTRY))
@@ -143,6 +185,7 @@ def main() -> None:
     print(f"Devices : {device_ids}  ({len(device_ids)} available)")
     print(f"Platform: {args.platform}")
     print(f"Warmup  : {args.warmup}   Iters: {args.iters}   Verify: {not args.no_verify}")
+    check_preload(args.platform)
 
     if args.impl:
         selected = set(args.impl)
@@ -157,10 +200,19 @@ def main() -> None:
     if not configs:
         sys.exit(f"Need at least 2 devices, got {len(device_ids)}")
 
+    if not args.no_clean:
+        n = clean_rendezvous()
+        if n:
+            print(f"Cleaned  : {n} stale rendezvous file(s) before start")
+
     all_rows: list[dict] = []
     for impl_obj in impls:
         print(f"\n=== {impl_obj.name} ===")
         for (P, L, C, D) in configs:
+            # Clean stale rendezvous before each config so a prior config's killed/leaked
+            # comm domain can't hang this one at rootinfo (F5 operational hardening).
+            if not args.no_clean:
+                clean_rendezvous()
             print(f"  P={P} L={L} C={C} D={D} ... ", end="", flush=True)
             try:
                 row = bench_one(impl_obj, P, L, C, D, D, device_ids, args.platform,
@@ -172,7 +224,11 @@ def main() -> None:
             except Exception as exc:
                 print(f"FAILED: {exc}")
             finally:
+                # Always release the worker AND clear any rendezvous it leaked, so a
+                # failed config (e.g. device 507018) can't poison the next one.
                 impl_obj.close()
+                if not args.no_clean:
+                    clean_rendezvous()
 
     print_table(all_rows, cols=GLA_COLS)
 
