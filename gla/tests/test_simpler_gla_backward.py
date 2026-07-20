@@ -24,8 +24,10 @@ import time
 import torch
 
 from gla.common import (
+    MultiHeadZeCo,
     ZeCoModule,
     expected_gla_backward,
+    expected_gla_multihead,
     flatten_seq,
     make_gla_inputs,
 )
@@ -219,6 +221,59 @@ def run_module(device_ids, platform="a2a3sim", L=256, C=128, D=128, dv=None):
     return ok
 
 
+def run_multihead(device_ids, platform="a2a3sim", H=2, L=256, C=128, D=128, dv=None,
+                  check_backward=True):
+    """Multi-head GLA via MultiHeadZeCo (host-loop over H heads on ONE built
+    single-head SimplerZeCo).  Checks forward vs the per-head golden and (unless
+    disabled) backward vs the per-head analytic golden; reports the forward
+    wall-clock (build excluded) — the baseline latency for the head-batching
+    go/no-go: the host-loop amortizes nothing across heads, so cost scales ~linearly
+    with H (each head re-cycles every worker + rebuilds the boundary AllScan)."""
+    P = len(device_ids)
+    dk = D
+    dv = dv if dv is not None else D
+    # H independent single-head input sets stacked on the head axis -> [P,H,L,.].
+    qs, ks, vs, as_ = [], [], [], []
+    for h in range(H):
+        Q, K, V, A = make_gla_inputs(P, L, dk, dv, seed=100 + h)
+        qs.append(Q); ks.append(K); vs.append(V); as_.append(A)
+    Q = torch.stack(qs, 1); K = torch.stack(ks, 1)
+    V = torch.stack(vs, 1); A = torch.stack(as_, 1)
+
+    impl = SimplerZeCo()
+    impl.build(P, L, C, dk, dv, device_ids=device_ids, platform=platform)
+    mh = MultiHeadZeCo(impl, H)
+    try:
+        t0 = time.perf_counter()
+        O = mh.forward(Q, K, V, A)
+        fwd_ms = (time.perf_counter() - t0) * 1e3
+        ok = True
+        ref = expected_gla_multihead(Q, K, V, A)
+        rel = ((O - ref).abs().max() / (ref.abs().max() + 1e-6)).item()
+        print(f"[simpler-gla-mh] P={P} H={H} L={L} C={C} dk={dk} dv={dv}  "
+              f"forward max_rel={rel:.3e}  forward_wall={fwd_ms:.0f}ms ({fwd_ms / H:.0f}ms/head)")
+        ok = ok and rel < 2e-2
+        if check_backward:
+            torch.manual_seed(999)
+            dO = torch.randn(P, H, L, dv, dtype=torch.float32)
+            dQ, dK, dV, dA = mh.backward(Q, K, V, A, dO)
+            worst_b = 0.0
+            for h in range(H):
+                gQ, gK, gV, gA = expected_gla_backward(
+                    flatten_seq(Q[:, h]), flatten_seq(K[:, h]), flatten_seq(V[:, h]),
+                    flatten_seq(A[:, h]), flatten_seq(dO[:, h]))
+                refs = (gQ.reshape(P, L, dk), gK.reshape(P, L, dk),
+                        gV.reshape(P, L, dv), gA.reshape(P, L, dk))
+                for got, r in zip((dQ[:, h], dK[:, h], dV[:, h], dA[:, h]), refs):
+                    worst_b = max(worst_b, ((got - r).abs().max() / (r.abs().max() + 1e-6)).item())
+            print(f"[simpler-gla-mh] P={P} H={H}  backward max_rel={worst_b:.3e}")
+            ok = ok and worst_b < 2e-2
+    finally:
+        impl.close()
+    print("[simpler-gla-mh] RESULT:", "PASS" if ok else "FAIL")
+    return ok
+
+
 def test_simpler_zeco_backward():
     """pytest entry: P=1 on the simulator by default (no NPU / no LD_PRELOAD)."""
     platform = os.environ.get("GLA_TEST_PLATFORM", "a2a3sim")
@@ -241,8 +296,14 @@ if __name__ == "__main__":
                     help="time ITERS backward passes (build excluded)")
     ap.add_argument("--module", action="store_true",
                     help="e2e differentiable operator: loss.backward() through ZeCoModule")
+    ap.add_argument("--multihead", type=int, default=0, metavar="H",
+                    help="multi-head GLA host-loop over H heads (fwd + bwd correctness + timing)")
+    ap.add_argument("--mh-no-bwd", action="store_true", help="multihead: forward only (timing)")
     args = ap.parse_args()
     devs = [int(x) for x in args.devices.split(",") if x != ""]
+    if args.multihead:
+        sys.exit(0 if run_multihead(devs, args.platform, args.multihead, args.L, args.C,
+                                    args.D, args.dv, check_backward=not args.mh_no_bwd) else 1)
     if args.module:
         sys.exit(0 if run_module(devs, args.platform, args.L, args.C, args.D, args.dv) else 1)
     if args.sweep:

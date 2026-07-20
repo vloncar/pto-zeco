@@ -261,25 +261,47 @@ class SimplerZeCo(ZeCoImpl):
              ("o", o), ("config", self._config)])
         return o
 
-    def _boundary(self, S_totals, A):
-        """AllScan prefix: returns out [P,dk,dv] (out[p] = S_total[p] + gamma[p]*out[p-1]).
+    # --- boundary AllScan (factored so ONE built worker can serve many heads) ---
+    # A device hosts one worker at a time, so the AllScan worker must be built +
+    # closed AROUND the compute (never held while the per-rank compute workers run).
+    # Within a boundary phase, though, one built worker can do many run()s — that is
+    # the multi-head amortization (F7.4): build once, run per head, close once,
+    # instead of a fresh HCCL distributed-worker build per head.
 
-        The AllScan worker is built + run + closed here so it never holds the
-        devices while the per-rank compute workers (also created/closed per call)
-        need them — a device hosts one worker at a time.
-        """
+    def _make_allscan(self):
+        """Build (and return) a SimplerAllscan worker; caller must close() it."""
         from allscan.implementations.simpler.impl import SimplerAllscan
-        P, dk, dv = self.P, self.dk, self.dv
-        gammas = torch.stack([A[p].reshape(-1, dk).prod(dim=0).reshape(dk, 1) for p in range(P)])
-        S_locals = torch.stack(S_totals)          # [P,dk,dv]
-        outputs = torch.zeros(P, dk, dv, dtype=torch.float32)
         allscan = SimplerAllscan()
-        allscan.build(dk, dv, 1, P, self.device_ids, self.platform)
+        allscan.build(self.dk, self.dv, 1, self.P, self.device_ids, self.platform)
+        return allscan
+
+    def _gammas(self, A):
+        """Per-rank total decay gamma [P,dk,1] = prod of A over the rank's tokens."""
+        dk = self.dk
+        return torch.stack([A[p].reshape(-1, dk).prod(dim=0).reshape(dk, 1) for p in range(self.P)])
+
+    def _boundary_on(self, allscan, S_totals, A):
+        """One forward AllScan run on an already-built worker -> out [P,dk,dv]."""
+        P, dk, dv = self.P, self.dk, self.dv
+        outputs = torch.zeros(P, dk, dv, dtype=torch.float32)
+        allscan.run(torch.stack(S_totals), self._gammas(A), outputs)
+        return outputs
+
+    def _boundary_backward_on(self, allscan, g_outs, A, outs):
+        """One reverse-ring AllScan run on an already-built worker -> (dS, dgamma)."""
+        P, dk, dv = self.P, self.dk, self.dv
+        dS = torch.zeros(P, dk, dv, dtype=torch.float32)
+        dgamma = torch.zeros(P, dk, 1, dtype=torch.float32)
+        allscan.run_backward(g_outs, self._gammas(A), outs, dS, dgamma)
+        return dS, dgamma
+
+    def _boundary(self, S_totals, A):
+        """Single-head forward boundary: build + one run + close."""
+        allscan = self._make_allscan()
         try:
-            allscan.run(S_locals, gammas, outputs)
+            return self._boundary_on(allscan, S_totals, A)
         finally:
             allscan.close()
-        return outputs
 
     def forward(self, Q, K, V, A):
         P, L, C, dk, dv = self.P, self.L, self.C, self.dk, self.dv
@@ -348,19 +370,12 @@ class SimplerZeCo(ZeCoImpl):
         return out
 
     def _boundary_backward(self, g_outs, A, outs):
-        """AllScan reverse ring: g_out[p] -> (dS_total[p], dgamma[p]) [dk,dv]/[dk,1]."""
-        from allscan.implementations.simpler.impl import SimplerAllscan
-        P, dk, dv = self.P, self.dk, self.dv
-        gammas = torch.stack([A[p].reshape(-1, dk).prod(dim=0).reshape(dk, 1) for p in range(P)])
-        dS = torch.zeros(P, dk, dv, dtype=torch.float32)
-        dgamma = torch.zeros(P, dk, 1, dtype=torch.float32)
-        allscan = SimplerAllscan()
-        allscan.build(dk, dv, 1, P, self.device_ids, self.platform)
+        """Single-head reverse-ring boundary: build + one run_backward + close."""
+        allscan = self._make_allscan()
         try:
-            allscan.run_backward(g_outs, gammas, outs, dS, dgamma)
+            return self._boundary_backward_on(allscan, g_outs, A, outs)
         finally:
             allscan.close()
-        return dS, dgamma
 
     def backward(self, Q, K, V, A, dO):
         """SP-decomposed ZeCO backward; args/return as in ZeCoImpl.backward."""
@@ -464,6 +479,168 @@ class SimplerZeCo(ZeCoImpl):
             dP = self._reverse_cumsum(p, dgcs_p)
             dA[p] = dP / A[p]
 
+        return dq, dk_full, dv_out, dA
+
+    # ---------------------------------------------------------------------
+    # Multi-head (F7.4): heads are independent GLA operators, so multi-head is H
+    # single-head passes — but the boundary AllScan is BATCHED across heads. All
+    # heads' stage-1 compute runs first (releasing the devices), then ONE AllScan
+    # worker is built and run once per head, then all heads' stage-2 compute — so
+    # the expensive HCCL distributed-worker build is paid ONCE per boundary phase
+    # instead of once per head (the dominant P>1 per-head cost). Compute still
+    # cycles per-kernel workers (runtime-forced). Same numerics as H single-head
+    # passes; `MultiHeadZeCo` dispatches here when present.
+    # ---------------------------------------------------------------------
+
+    def forward_multihead(self, Q, K, V, A):
+        """Multi-head forward with batched boundary; ``[P,H,L,dk/dv]`` in/out."""
+        P, L, C, dk, dv = self.P, self.L, self.C, self.dk, self.dv
+        H = Q.shape[1]
+        zkv = torch.zeros(dk, dv, dtype=torch.float32)
+
+        # Phase 1: stage-1 compute for every head (per-rank, per-kernel workers).
+        heads = []                                    # per head: (s_snaps, g_css, S_totals)
+        for h in range(H):
+            s_snaps, g_css, S_totals = [], [], []
+            for p in range(P):
+                s_snap, g_cs, S_total = self._stage1(p, Q[p, h], K[p, h], V[p, h], A[p, h])
+                s_snaps.append(s_snap); g_css.append(g_cs); S_totals.append(S_total)
+            heads.append((s_snaps, g_css, S_totals))
+
+        # Phase 2: ONE AllScan worker, one run per head (build/close amortized).
+        if P == 1:
+            S_recvs_h = [[zkv] for _ in range(H)]
+        else:
+            S_recvs_h = []
+            allscan = self._make_allscan()
+            try:
+                for h in range(H):
+                    outs = self._boundary_on(allscan, heads[h][2], A[:, h])
+                    S_recvs_h.append([zkv if p == 0 else outs[p - 1] for p in range(P)])
+            finally:
+                allscan.close()
+
+        # Phase 3: stage-2 compute for every head.
+        O = torch.zeros(P, H, L, dv, dtype=torch.float32)
+        for h in range(H):
+            s_snaps, g_css, _ = heads[h]
+            for p in range(P):
+                s_shift = _shift_snaps(s_snaps[p], A[p, h], S_recvs_h[h][p], L, C, dk)
+                O[p, h] = self._stage2(p, Q[p, h], K[p, h], V[p, h], g_css[p], s_shift)
+        return O
+
+    def backward_multihead(self, Q, K, V, A, dO):
+        """Multi-head backward with batched fwd/bwd boundaries; ``[P,H,L,.]`` in/out."""
+        P, L, C, dk, dv, N = self.P, self.L, self.C, self.dk, self.dv, self.N
+        H = Q.shape[1]
+        zkv = torch.zeros(dk, dv, dtype=torch.float32)
+
+        # ---- Phase A: stage-1 + host decay quantities, all heads ----
+        HA = []   # per head: (s_snaps, g_css, S_totals, gammas_n, cprev_n)
+        for h in range(H):
+            s_snaps, g_css, S_totals, gammas_n, cprev_n = [], [], [], [], []
+            for p in range(P):
+                s_snap, g_cs, S_total = self._stage1(p, Q[p, h], K[p, h], V[p, h], A[p, h])
+                s_snaps.append(s_snap); g_css.append(g_cs); S_totals.append(S_total)
+                g_last = g_cs.reshape(N, C, dk)[:, -1, :]
+                gam = torch.exp(g_last)
+                c = torch.ones(N, dk, dtype=torch.float32)
+                if N > 1:
+                    c[1:] = torch.cumprod(gam, dim=0)[:-1]
+                gammas_n.append(gam); cprev_n.append(c)
+            HA.append((s_snaps, g_css, S_totals, gammas_n, cprev_n))
+
+        # ---- Phase B1: batched forward AllScan (build once, run per head) ----
+        outs_h = [None] * H
+        S_recvs_h = []
+        if P == 1:
+            S_recvs_h = [[zkv] for _ in range(H)]
+        else:
+            allscan = self._make_allscan()
+            try:
+                for h in range(H):
+                    outs = self._boundary_on(allscan, HA[h][2], A[:, h])
+                    outs_h[h] = outs
+                    S_recvs_h.append([zkv if p == 0 else outs[p - 1] for p in range(P)])
+            finally:
+                allscan.close()
+
+        # ---- Phase C: grad_o + host gate_o, all heads ----
+        dq = torch.zeros(P, H, L, dk, dtype=torch.float32)
+        dk_o = torch.zeros(P, H, L, dk, dtype=torch.float32)
+        dgcs = torch.zeros(P, H, L, dk, dtype=torch.float32)
+        dv_out = torch.zeros(P, H, L, dv, dtype=torch.float32)
+        HC = []   # per head: (dH_all, dcprev_all, dS_recv)
+        for h in range(H):
+            s_snaps, g_css, _, _, cprev_n = HA[h]
+            dH_all, dcprev_all = [], []
+            dS_recv = torch.zeros(P, dk, dv, dtype=torch.float32)
+            for p in range(P):
+                Hf = _shift_snaps(s_snaps[p], A[p, h], S_recvs_h[h][p], L, C, dk)
+                dQt, dKin, dVi, dH = self._grad_o(p, Q[p, h], K[p, h], V[p, h], g_css[p], Hf, dO[p, h])
+                e = torch.exp(g_css[p]); ei = torch.exp(-g_css[p])
+                dqo = dQt * e; dko = dKin * ei
+                dq[p, h] = dqo; dk_o[p, h] = dko
+                dgcs[p, h] = dqo * Q[p, h] - dko * K[p, h]
+                dv_out[p, h] = dVi
+                dcp = torch.zeros(N, dk, dtype=torch.float32)
+                acc = torch.zeros(dk, dv, dtype=torch.float32)
+                for n in range(N):
+                    dcp[n] = (dH[n] * S_recvs_h[h][p]).sum(dim=1)
+                    acc += cprev_n[p][n].unsqueeze(1) * dH[n]
+                dH_all.append(dH); dcprev_all.append(dcp); dS_recv[p] = acc
+            HC.append((dH_all, dcprev_all, dS_recv))
+
+        # ---- Phase B2: batched backward AllScan (build once, run per head) ----
+        dS_totals_h, dgammas_h = [], []
+        if P == 1:
+            dS_totals_h = [[zkv] for _ in range(H)]
+            dgammas_h = [[torch.zeros(dk, dtype=torch.float32)] for _ in range(H)]
+        else:
+            allscan = self._make_allscan()
+            try:
+                for h in range(H):
+                    g_out = torch.zeros(P, dk, dv, dtype=torch.float32)
+                    g_out[:P - 1] = HC[h][2][1:]
+                    dS_b, dgamma_b = self._boundary_backward_on(allscan, g_out, A[:, h], outs_h[h])
+                    dS_totals_h.append([dS_b[p] for p in range(P)])
+                    dgammas_h.append([dgamma_b[p].squeeze(1) for p in range(P)])
+            finally:
+                allscan.close()
+
+        # ---- Phase D: reverse recurrence + grad_h + gate_h + reverse-cumsum ----
+        dA = torch.zeros(P, H, L, dk, dtype=torch.float32)
+        dk_full = torch.zeros(P, H, L, dk, dtype=torch.float32)
+        for h in range(H):
+            s_snaps, g_css, _, gammas_n, cprev_n = HA[h]
+            dH_all, dcprev_all, _ = HC[h]
+            for p in range(P):
+                dSloc = torch.zeros(N, dk, dv, dtype=torch.float32)
+                dcvec = torch.zeros(N, dk, dtype=torch.float32)
+                cur_S = dS_totals_h[h][p].clone(); cur_c = dgammas_h[h][p].clone()
+                for m in reversed(range(N)):
+                    dSloc[m] = cur_S; dcvec[m] = cur_c
+                    if m > 0:
+                        cur_S = gammas_n[p][m].unsqueeze(1) * cur_S + dH_all[p][m]
+                        cur_c = gammas_n[p][m] * cur_c + dcprev_all[p][m]
+
+                dKstate, dVs = self._grad_h(p, K[p, h], V[p, h], g_css[p], dSloc)
+                dgcs_p = dgcs[p, h].clone()
+                dk_h = torch.zeros(L, dk, dtype=torch.float32)
+                g_cs_ch = g_css[p].reshape(N, C, dk)
+                for n in range(N):
+                    lo, hi = n * C, (n + 1) * C
+                    gtot = g_cs_ch[n, -1, :]
+                    dkh = dKstate[lo:hi] * torch.exp(gtot.unsqueeze(0) - g_css[p][lo:hi])
+                    dk_h[lo:hi] = dkh
+                    dgcs_p[lo:hi] += -dkh * K[p, h][lo:hi]
+                    dgamma_state = (dSloc[n] * s_snaps[p][n]).sum(dim=1)
+                    dgamma_c = dcvec[n] * cprev_n[p][n]
+                    dgcs_p[hi - 1] += (dgamma_state + dgamma_c) * gammas_n[p][n] + (dkh * K[p, h][lo:hi]).sum(dim=0)
+                dv_out[p, h] += dVs
+                dk_full[p, h] = dk_o[p, h] + dk_h
+                dP = self._reverse_cumsum(p, dgcs_p)
+                dA[p, h] = dP / A[p, h]
         return dq, dk_full, dv_out, dA
 
     def close(self):

@@ -19,8 +19,10 @@ import pytest
 import torch
 
 from gla.common import (
+    MultiHeadZeCo,
     ZeCoModule,
     expected_gla_backward,
+    expected_gla_multihead,
     flatten_seq,
     make_gla_inputs,
 )
@@ -71,6 +73,56 @@ def test_zeco_module_backward_matches_golden(P, L, C, dk, dv):
     for name, leaf, r in zip(("dQ", "dK", "dV", "dA"), leaves, ref):
         assert torch.allclose(leaf.grad, r, atol=1e-4, rtol=1e-3), (
             f"{name} mismatch: max diff = {(leaf.grad - r).abs().max().item():.3e}")
+
+
+def _multihead_inputs(P, H, L, dk, dv, seed=0):
+    """Stack H independent single-head input sets into ``[P,H,L,.]`` tensors."""
+    qs, ks, vs, as_ = [], [], [], []
+    for h in range(H):
+        Q, K, V, A = make_gla_inputs(P, L, dk, dv, seed=seed + h)
+        qs.append(Q); ks.append(K); vs.append(V); as_.append(A)
+    return (torch.stack(qs, 1), torch.stack(ks, 1),
+            torch.stack(vs, 1), torch.stack(as_, 1))
+
+
+@pytest.mark.parametrize("P,H,L,C,dk,dv", [(1, 3, 16, 8, 12, 12), (2, 4, 16, 8, 16, 10)])
+def test_multihead_forward_matches_golden(P, H, L, C, dk, dv):
+    """MultiHeadZeCo host-loop forward == per-head sequential golden."""
+    Q, K, V, A = _multihead_inputs(P, H, L, dk, dv, seed=P + H)
+    mod, impl = _module(P, L, C, dk, dv)
+    try:
+        mh = MultiHeadZeCo(impl, H)
+        O = mh.forward(Q, K, V, A)
+    finally:
+        impl.close()
+    ref = expected_gla_multihead(Q, K, V, A)
+    assert torch.allclose(O, ref, atol=1e-4, rtol=1e-3), (
+        f"max diff = {(O - ref).abs().max().item():.3e}")
+
+
+@pytest.mark.parametrize("P,H,L,C,dk,dv", [(1, 3, 16, 8, 12, 12), (2, 4, 16, 8, 16, 10)])
+def test_multihead_differentiable_matches_golden(P, H, L, C, dk, dv):
+    """ZeCoModule(MultiHeadZeCo) — loss.backward() grads == per-head analytic golden."""
+    Q, K, V, A = _multihead_inputs(P, H, L, dk, dv, seed=P * 3 + H)
+    leaves = [t.clone().requires_grad_(True) for t in (Q, K, V, A)]
+    W = torch.randn(P, H, L, dv)                 # loss = (O*W).sum() -> dO = W
+    mod, impl = _module(P, L, C, dk, dv)
+    try:
+        module = ZeCoModule(MultiHeadZeCo(impl, H))
+        O = module(*leaves)
+        (O * W).sum().backward()
+    finally:
+        impl.close()
+    # Golden: per head, analytic backward over the flattened P*L sequence.
+    for h in range(H):
+        gQ, gK, gV, gA = expected_gla_backward(
+            flatten_seq(Q[:, h]), flatten_seq(K[:, h]), flatten_seq(V[:, h]),
+            flatten_seq(A[:, h]), flatten_seq(W[:, h]))
+        refs = (gQ.reshape(P, L, dk), gK.reshape(P, L, dk),
+                gV.reshape(P, L, dv), gA.reshape(P, L, dk))
+        for name, leaf, r in zip(("dQ", "dK", "dV", "dA"), leaves, refs):
+            assert torch.allclose(leaf.grad[:, h], r, atol=1e-4, rtol=1e-3), (
+                f"head {h} {name}: max diff = {(leaf.grad[:, h] - r).abs().max().item():.3e}")
 
 
 def test_zeco_module_training_step_reduces_loss():

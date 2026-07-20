@@ -115,6 +115,32 @@ def expected_gla_backward(
     return dQ, dK, dV, dA
 
 
+def expected_gla_multihead(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, A: torch.Tensor
+) -> torch.Tensor:
+    """Multi-head sequential GLA golden — :func:`expected_gla` per head.
+
+    Heads are independent GLA operators, each over its own full ``P*L``-token
+    sequence (rank ``p`` owns tokens ``[p*L, (p+1)*L)`` of every head).
+
+    Args:
+        Q, K, V, A: Multi-head inputs, shapes ``[P, H, L, dk]`` / ``[P, H, L, dk]``
+            / ``[P, H, L, dv]`` / ``[P, H, L, dk]`` (rank-major, head axis 1).
+
+    Returns:
+        Outputs ``O``, shape ``[P, H, L, dv]``.
+    """
+    P, H, L, dk = Q.shape
+    dv = V.shape[-1]
+    O = torch.zeros((P, H, L, dv), dtype=Q.dtype)
+    for h in range(H):
+        Oh = expected_gla(
+            Q[:, h].reshape(P * L, dk), K[:, h].reshape(P * L, dk),
+            V[:, h].reshape(P * L, dv), A[:, h].reshape(P * L, dk))
+        O[:, h] = Oh.reshape(P, L, dv)
+    return O
+
+
 def make_gla_inputs(
     P: int,
     L: int,
@@ -576,6 +602,59 @@ class ZeCoFunction(torch.autograd.Function):
                 grad_O.detach().contiguous())
         # One grad per forward input; ``impl`` (non-tensor) gets None.
         return dQ.detach(), dK.detach(), dV.detach(), dA.detach(), None
+
+
+class MultiHeadZeCo:
+    """Multi-head GLA as a host-loop over a single-head :class:`ZeCoImpl` (F7 baseline).
+
+    Heads are independent GLA operators — each has its own recurrent state and its
+    own boundary AllScan — so multi-head is exactly ``H`` single-head passes. This
+    wrapper reuses ONE already-built single-head backend across all heads (no
+    per-head build), looping its :meth:`~ZeCoImpl.forward` / :meth:`~ZeCoImpl.backward`
+    over the head axis. Inputs are ``[P, H, L, dk/dv]`` (rank-major, head axis 1).
+
+    It reuses the single-head kernels unchanged — the baseline against which head
+    *batching/fusion* (folding all ``H`` heads into one AllScan + one kernel
+    dispatch) is measured. Presents the same ``forward(Q,K,V,A)`` /
+    ``backward(Q,K,V,A,dO)`` surface as a backend, so :class:`ZeCoModule` wraps it
+    directly for a differentiable multi-head operator. The single-head backend's
+    build/close lifecycle stays with the caller.
+
+    If the backend provides ``forward_multihead`` / ``backward_multihead`` (e.g.
+    :class:`SimplerZeCo`, which batches the boundary AllScan across heads —
+    building the HCCL worker once per boundary phase instead of once per head),
+    those are used; otherwise it falls back to a plain per-head host-loop.
+    """
+
+    def __init__(self, impl: ZeCoImpl, H: int) -> None:
+        self.impl = impl
+        self.H = H
+
+    def forward(self, Q, K, V, A):
+        """Multi-head forward; ``[P,H,L,dk/dv]`` in, ``[P,H,L,dv]`` out."""
+        if hasattr(self.impl, "forward_multihead"):
+            return self.impl.forward_multihead(Q, K, V, A)
+        P, H, L, _ = Q.shape
+        dv = V.shape[-1]
+        O = torch.zeros((P, H, L, dv), dtype=Q.dtype)
+        for h in range(H):
+            O[:, h] = self.impl.forward(
+                Q[:, h].contiguous(), K[:, h].contiguous(),
+                V[:, h].contiguous(), A[:, h].contiguous())
+        return O
+
+    def backward(self, Q, K, V, A, dO):
+        """Multi-head backward; batched-boundary path if the backend has one, else a loop."""
+        if hasattr(self.impl, "backward_multihead"):
+            return self.impl.backward_multihead(Q, K, V, A, dO)
+        H = self.H
+        dQ, dK, dV, dA = (torch.zeros_like(t) for t in (Q, K, V, A))
+        for h in range(H):
+            gQ, gK, gV, gA = self.impl.backward(
+                Q[:, h].contiguous(), K[:, h].contiguous(), V[:, h].contiguous(),
+                A[:, h].contiguous(), dO[:, h].contiguous())
+            dQ[:, h], dK[:, h], dV[:, h], dA[:, h] = gQ, gK, gV, gA
+        return dQ, dK, dV, dA
 
 
 class ZeCoModule(torch.nn.Module):
