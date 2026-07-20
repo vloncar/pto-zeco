@@ -23,7 +23,12 @@ import time
 
 import torch
 
-from gla.common import expected_gla_backward, flatten_seq, make_gla_inputs
+from gla.common import (
+    ZeCoModule,
+    expected_gla_backward,
+    flatten_seq,
+    make_gla_inputs,
+)
 from gla.implementations.simpler.impl import SimplerZeCo
 
 
@@ -184,6 +189,36 @@ def bench(device_ids, platform="a2a3", iters=10, warmup=2, L=256, C=128, D=128, 
     return samples
 
 
+def run_module(device_ids, platform="a2a3sim", L=256, C=128, D=128, dv=None):
+    """End-to-end differentiable operator through the REAL simpler kernels: wrap
+    SimplerZeCo in ZeCoModule, run ``loss = (O*W).sum(); loss.backward()``, and
+    check the input ``.grad`` tensors against the analytic golden (dO == W).  This
+    exercises the autograd plumbing (ZeCoFunction) on the device backend."""
+    P = len(device_ids)
+    dk = D
+    dv = dv if dv is not None else D
+    Q, K, V, A = make_gla_inputs(P, L, dk, dv)
+    torch.manual_seed(4321)
+    W = torch.randn(P, L, dv, dtype=torch.float32)
+    leaves = [t.clone().requires_grad_(True) for t in (Q, K, V, A)]
+
+    impl = SimplerZeCo()
+    impl.build(P, L, C, dk, dv, device_ids=device_ids, platform=platform)
+    mod = ZeCoModule(impl)
+    try:
+        O = mod(*leaves)
+        (O * W).sum().backward()
+    finally:
+        impl.close()
+
+    ref = _golden(Q, K, V, A, W)
+    grads = tuple(leaf.grad for leaf in leaves)
+    worst = _worst_rel(*grads, ref, tag=f" [module] P={P} L={L} C={C} dk={dk} dv={dv}")
+    ok = worst < 2e-2
+    print("[simpler-gla-bwd-module] RESULT:", "PASS" if ok else "FAIL", f"(worst {worst:.3e})")
+    return ok
+
+
 def test_simpler_zeco_backward():
     """pytest entry: P=1 on the simulator by default (no NPU / no LD_PRELOAD)."""
     platform = os.environ.get("GLA_TEST_PLATFORM", "a2a3sim")
@@ -204,8 +239,12 @@ if __name__ == "__main__":
                     help="back-to-back backward stress: REPS fresh-input dispatches")
     ap.add_argument("--bench", type=int, default=0, metavar="ITERS",
                     help="time ITERS backward passes (build excluded)")
+    ap.add_argument("--module", action="store_true",
+                    help="e2e differentiable operator: loss.backward() through ZeCoModule")
     args = ap.parse_args()
     devs = [int(x) for x in args.devices.split(",") if x != ""]
+    if args.module:
+        sys.exit(0 if run_module(devs, args.platform, args.L, args.C, args.D, args.dv) else 1)
     if args.sweep:
         sys.exit(0 if run_sweep(devs, args.platform) else 1)
     if args.stress:

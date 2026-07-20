@@ -541,3 +541,55 @@ class ZeCoImpl(ABC):
 
     def close(self) -> None:
         """Release resources (override if needed)."""
+
+
+# ---------------------------------------------------------------------------
+# Autograd wrapper — make any ZeCoImpl a differentiable operator
+# ---------------------------------------------------------------------------
+
+class ZeCoFunction(torch.autograd.Function):
+    """``torch.autograd.Function`` binding a :class:`ZeCoImpl`'s forward + backward.
+
+    Wraps the opaque device (or reference) kernels so the ZeCO operator drops into
+    an autograd graph: the custom :meth:`backward` calls the backend's analytic
+    :meth:`ZeCoImpl.backward`, so ``loss.backward()`` produces ``(dQ,dK,dV,dA)``
+    through the real kernels rather than tracing the forward. The backend recomputes
+    the forward inside ``backward`` (stateless), so no forward activations are held.
+    """
+
+    @staticmethod
+    def forward(ctx, Q, K, V, A, impl):  # noqa: D102 - see class docstring
+        ctx.impl = impl
+        ctx.save_for_backward(Q, K, V, A)
+        return impl.forward(Q, K, V, A)
+
+    @staticmethod
+    def backward(ctx, grad_O):  # noqa: D102
+        Q, K, V, A = ctx.saved_tensors
+        # A Function's backward runs with grad tracking OFF; some backends (the
+        # torch reference) build a local autograd graph inside their .backward, so
+        # re-enable grad for the call. Detach in/out: the operator is not itself
+        # double-differentiable (first-order grads only), which is all we support.
+        with torch.enable_grad():
+            dQ, dK, dV, dA = ctx.impl.backward(
+                Q.detach(), K.detach(), V.detach(), A.detach(),
+                grad_O.detach().contiguous())
+        # One grad per forward input; ``impl`` (non-tensor) gets None.
+        return dQ.detach(), dK.detach(), dV.detach(), dA.detach(), None
+
+
+class ZeCoModule(torch.nn.Module):
+    """``nn.Module`` exposing a :class:`ZeCoImpl` backend as a differentiable GLA op.
+
+    ``mod = ZeCoModule(impl)`` then ``O = mod(Q, K, V, A)`` returns an autograd
+    tensor; ``O``'s gradient flows back to ``Q/K/V/A`` through the backend's
+    :meth:`ZeCoImpl.backward`. The backend is built/closed by the caller (its
+    lifecycle — device workers, comm domains — is not owned by the module).
+    """
+
+    def __init__(self, impl: ZeCoImpl) -> None:
+        super().__init__()
+        self.impl = impl
+
+    def forward(self, Q, K, V, A):  # noqa: D102 - see class docstring
+        return ZeCoFunction.apply(Q, K, V, A, self.impl)
