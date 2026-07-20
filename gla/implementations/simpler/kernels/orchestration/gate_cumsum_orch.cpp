@@ -5,8 +5,8 @@
  * n = 0 .. N-1. Reuses the tensormap_and_ringbuffer orchestration API pattern
  * (see examples/.../benchmark_bgemm/kernels/orchestration/bgemm_orch.cpp).
  *
- * Orchestration args: [0]=tril [C,C] IN, [1]=g [N*C,D] IN, [2]=g_cs [N*C,D] OUT,
- *                     [3]=config int64[3] = [C, D, N] IN.
+ * Orchestration args: [0]=tril [C,C] IN, [1]=g [N*C,dk] IN, [2]=g_cs [N*C,dk] OUT,
+ *                     [3]=config int64[4] = [C, dk, dv, N] IN.
  * The Cube incore (gate_cumsum_kernel.cpp) takes 3 args: [tril, g_chunk, g_cs_chunk].
  */
 
@@ -33,8 +33,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 
     int64_t *cfg = orch_args.tensor(3).ref().data_as<int64_t>();
     int C = static_cast<int>(cfg[0]);
-    int Dd = static_cast<int>(cfg[1]);
-    int N = static_cast<int>(cfg[2]);
+    int Dd = static_cast<int>(cfg[1]);  // dk — gates are per key dim, g is [C,dk]
+    int N = static_cast<int>(cfg[3]);
 
     uint64_t chunk_elems = static_cast<uint64_t>(C) * Dd;
     uint32_t chunk_shape[1] = {static_cast<uint32_t>(chunk_elems)};

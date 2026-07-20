@@ -17,13 +17,14 @@ whole ZeCO is one runtime, no torch-npu/pypto coexistence. The compute runs as
 hand-written PTO-ISA kernels in the simpler runtime (not torch-npu-launched
 ``.so`` kernels).
 
-Requires ``dk == dv == D`` and ``L % C == 0``; ``C`` and ``D`` may differ and each
-must be one of ``{16, 32, 64, 128}``.  The incore kernels dispatch the runtime
-tile dims to compile-time templates (the ``benchmark_bgemm`` pattern): the matmul
-kernel takes independent ``M, N, Kc`` (F3 Phase 2), so every GLA matmul —
-``KV=[D,D]<-[C,·]`` (TN), ``inter=[C,D]<-·[D,D]`` (NN), ``Aqk=[C,C]<-·`` (NT),
-``intra=[C,D]`` (NN) — and the rectangular vector stages run at any ``C != D``.
-Tiles above 128 (head dim 256) still need blocking (shared with pypto's ceiling).
+Requires ``L % C == 0``; ``C``, ``dk`` and ``dv`` may all differ and each must be
+one of ``{16, 32, 64, 128}``.  The incore kernels dispatch the runtime tile dims
+to compile-time templates (the ``benchmark_bgemm`` pattern): the matmul kernel
+takes independent ``M, N, Kc`` (F3 Phase 2), so every GLA matmul —
+``KV=[dk,dv]<-[C,·]`` (TN), ``inter=[C,dv]<-·[dk,dv]`` (NN), ``Aqk=[C,C]<-·`` (NT),
+``intra=[C,dv]`` (NN) — and the rectangular vector stages (state ``[dk,dv]``,
+gates ``[C,dk]``, values ``[C,dv]``) run at any ``C, dk, dv`` (F7).  Tiles above
+128 (head dim 256) still need blocking (shared with pypto's ceiling).
 """
 
 from __future__ import annotations
@@ -78,6 +79,24 @@ CHUNK_O_SPEC = _spec(
      (2, "ELT", "kernels/aiv/chunk_o_elt.cpp", "aiv", [_D.IN, _D.IN, _D.OUT])],
 )
 
+# --- backward (B3): grad_o (output-stage) + grad_h (state-stage) ---
+# Both reuse the general matmul + the forward prep/elt kernels, so they add no new
+# device kernel; the cross-chunk grad recurrence + gate arithmetic run on host.
+GRAD_O_SPEC = _spec(
+    "kernels/orchestration/grad_o_orch.cpp",
+    [_D.IN, _D.IN, _D.IN, _D.IN, _D.IN, _D.IN, _D.IN, _D.OUT, _D.OUT, _D.OUT, _D.OUT, _D.IN],
+    [(0, "MM", "kernels/aic/matmul_kernel.cpp", "aic", [_D.IN, _D.IN, _D.OUT]),
+     (1, "PREP", "kernels/aiv/chunk_o_prep.cpp", "aiv", [_D.IN, _D.IN, _D.IN, _D.OUT, _D.OUT]),
+     (2, "ELT", "kernels/aiv/chunk_o_elt.cpp", "aiv", [_D.IN, _D.IN, _D.OUT])],
+)
+
+GRAD_H_SPEC = _spec(
+    "kernels/orchestration/grad_h_orch.cpp",
+    [_D.IN, _D.IN, _D.IN, _D.IN, _D.OUT, _D.OUT, _D.IN],
+    [(0, "MM", "kernels/aic/matmul_kernel.cpp", "aic", [_D.IN, _D.IN, _D.OUT]),
+     (1, "PREP", "kernels/aiv/chunk_h_prep.cpp", "aiv", [_D.IN, _D.IN, _D.IN, _D.OUT, _D.OUT])],
+)
+
 
 # ---------------------------------------------------------------------------
 # Host-side pieces (pure torch; the ZeCO linearity glue — S_total advance,
@@ -85,8 +104,12 @@ CHUNK_O_SPEC = _spec(
 # base env with no torch-npu dependency)
 # ---------------------------------------------------------------------------
 
-def _S_total(s_snap, g_cs, k, v, L, C, D):
-    """Advance the last chunk snapshot through the last chunk -> local end state [D,D]."""
+def _S_total(s_snap, g_cs, k, v, L, C):
+    """Advance the last chunk snapshot through the last chunk -> local end state [dk,dv].
+
+    Shape-driven (g_cs/k are [.,dk], v is [.,dv]), so dk != dv is handled: the return
+    is exp(g_total)[:,None]*s_snap[-1] + k_rest^T @ v_last = [dk,dv].
+    """
     n_chunks = L // C
     off = (n_chunks - 1) * C
     g_cs_last = g_cs[off:off + C]
@@ -97,11 +120,15 @@ def _S_total(s_snap, g_cs, k, v, L, C, D):
     return torch.exp(g_total).unsqueeze(1) * s_snap[-1] + k_rest.t() @ v_last
 
 
-def _shift_snaps(s_snap, A_rank, S_recv, L, C, D):
-    """Fold the received boundary state into the chunk snapshots (host, fp32)."""
+def _shift_snaps(s_snap, A_rank, S_recv, L, C, dk):
+    """Fold the received boundary state into the chunk snapshots (host, fp32).
+
+    Gates are per key dim, so the cumulative decay ``c`` is [n_chunks, dk] and
+    broadcasts over the dv columns of the [dk,dv] state.
+    """
     n_chunks = L // C
-    A_ch = A_rank.reshape(n_chunks, C, D).prod(dim=1)          # [n_chunks, D]
-    c = torch.ones(n_chunks, D)
+    A_ch = A_rank.reshape(n_chunks, C, dk).prod(dim=1)         # [n_chunks, dk]
+    c = torch.ones(n_chunks, dk)
     if n_chunks > 1:
         c[1:] = torch.cumprod(A_ch, dim=0)[:-1]
     return s_snap + c.unsqueeze(-1) * S_recv.unsqueeze(0)
@@ -111,7 +138,8 @@ def _shift_snaps(s_snap, A_rank, S_recv, L, C, D):
 # Single-device compute runner (reuses the SceneTestCase L2 harness internals)
 # ---------------------------------------------------------------------------
 
-_SPECS = {"gate_cumsum": GATE_CUMSUM_SPEC, "chunk_h": CHUNK_H_SPEC, "chunk_o": CHUNK_O_SPEC}
+_SPECS = {"gate_cumsum": GATE_CUMSUM_SPEC, "chunk_h": CHUNK_H_SPEC, "chunk_o": CHUNK_O_SPEC,
+          "grad_o": GRAD_O_SPEC, "grad_h": GRAD_H_SPEC}
 
 
 class _ComputeRunner:
@@ -183,21 +211,22 @@ class SimplerZeCo(ZeCoImpl):
     name = "simpler"
 
     def build(self, P, L, C, dk, dv, device_ids, platform):
-        assert dk == dv, f"simpler GLA kernels assume K == V (D); got dk={dk} dv={dv}"
         assert L % C == 0, f"L={L} not divisible by C={C}"
         # The incore kernels dispatch each runtime tile dim to a compile-time template
-        # over {16,32,64,128}; the matmul kernel is rectangular (M,N,Kc), so C and D
-        # may differ but each must be a dispatchable size.  Tiles > 128 need blocking.
-        assert C in (16, 32, 64, 128), (
-            f"simpler GLA chunk size C must be one of {{16,32,64,128}}; got C={C}")
-        assert dk in (16, 32, 64, 128), (
-            f"simpler GLA head dim D must be one of {{16,32,64,128}}; got D={dk}")
-        self.P, self.L, self.C, self.D = P, L, C, dk
+        # over {16,32,64,128}; the matmul kernel is rectangular (M,N,Kc), so C, dk and
+        # dv may all differ, each must be a dispatchable size.  Tiles > 128 need blocking.
+        for nm, val in (("C", C), ("dk", dk), ("dv", dv)):
+            assert val in (16, 32, 64, 128), (
+                f"simpler GLA {nm} must be one of {{16,32,64,128}}; got {nm}={val}")
+        self.P, self.L, self.C, self.dk, self.dv = P, L, C, dk, dv
         self.device_ids = list(device_ids[:P])
         self.platform = platform
         self.N = L // C
         self._tril = torch.tril(torch.ones(C, C, dtype=torch.float32))
-        self._config = torch.tensor([C, dk, self.N], dtype=torch.int64)
+        # triu = tril^T: feeding it to the gate_cumsum kernel computes the REVERSE
+        # cumulative sum (triu @ dg_cs), the gate backward's b->a chain (B3).
+        self._triu = torch.triu(torch.ones(C, C, dtype=torch.float32))
+        self._config = torch.tensor([C, dk, dv, self.N], dtype=torch.int64)
         # Fully distributed: rank p's GLA shard is computed on its OWN device
         # (device_ids[p]) and the boundary state is exchanged over the real
         # multi-device AllScan collective. One compute runner per rank/device.
@@ -205,26 +234,26 @@ class SimplerZeCo(ZeCoImpl):
 
     def _stage1(self, p, Q, K, V, A):
         """Run gate_cumsum + chunk_h on rank p's device -> (s_snap, g_cs, S_total)."""
-        L, C, D, N = self.L, self.C, self.D, self.N
+        L, C, dk, dv, N = self.L, self.C, self.dk, self.dv, self.N
         r = self._runners[p]
         g_log = torch.log(A).contiguous()
 
-        g_cs = torch.zeros(L, D, dtype=torch.float32)
+        g_cs = torch.zeros(L, dk, dtype=torch.float32)
         r.run("gate_cumsum", GATE_CUMSUM_SPEC["orchestration"]["signature"],
               [("tril", self._tril), ("g", g_log), ("g_cs", g_cs), ("config", self._config)])
 
-        s_snap = torch.zeros(N, D, D, dtype=torch.float32)
+        s_snap = torch.zeros(N, dk, dv, dtype=torch.float32)
         r.run("chunk_h", CHUNK_H_SPEC["orchestration"]["signature"],
               [("k", K.contiguous()), ("v", V.contiguous()), ("g_cs", g_cs),
                ("s_snap", s_snap), ("config", self._config)])
 
-        S_total = _S_total(s_snap, g_cs, K, V, L, C, D)
+        S_total = _S_total(s_snap, g_cs, K, V, L, C)
         return s_snap, g_cs, S_total
 
     def _stage2(self, p, Q, K, V, g_cs, s_shift):
-        """Run chunk_o on rank p's device -> O [L,D]."""
-        L, D = self.L, self.D
-        o = torch.zeros(L, D, dtype=torch.float32)
+        """Run chunk_o on rank p's device -> O [L,dv]."""
+        L, dv = self.L, self.dv
+        o = torch.zeros(L, dv, dtype=torch.float32)
         self._runners[p].run(
             "chunk_o", CHUNK_O_SPEC["orchestration"]["signature"],
             [("q", Q.contiguous()), ("k", K.contiguous()), ("v", V.contiguous()),
@@ -233,19 +262,19 @@ class SimplerZeCo(ZeCoImpl):
         return o
 
     def _boundary(self, S_totals, A):
-        """AllScan prefix: returns out [P,D,D] (out[p] = S_total[p] + gamma[p]*out[p-1]).
+        """AllScan prefix: returns out [P,dk,dv] (out[p] = S_total[p] + gamma[p]*out[p-1]).
 
         The AllScan worker is built + run + closed here so it never holds the
         devices while the per-rank compute workers (also created/closed per call)
         need them — a device hosts one worker at a time.
         """
         from allscan.implementations.simpler.impl import SimplerAllscan
-        P, D = self.P, self.D
-        gammas = torch.stack([A[p].reshape(-1, D).prod(dim=0).reshape(D, 1) for p in range(P)])
-        S_locals = torch.stack(S_totals)          # [P,D,D]
-        outputs = torch.zeros(P, D, D, dtype=torch.float32)
+        P, dk, dv = self.P, self.dk, self.dv
+        gammas = torch.stack([A[p].reshape(-1, dk).prod(dim=0).reshape(dk, 1) for p in range(P)])
+        S_locals = torch.stack(S_totals)          # [P,dk,dv]
+        outputs = torch.zeros(P, dk, dv, dtype=torch.float32)
         allscan = SimplerAllscan()
-        allscan.build(D, D, 1, P, self.device_ids, self.platform)
+        allscan.build(dk, dv, 1, P, self.device_ids, self.platform)
         try:
             allscan.run(S_locals, gammas, outputs)
         finally:
@@ -253,24 +282,189 @@ class SimplerZeCo(ZeCoImpl):
         return outputs
 
     def forward(self, Q, K, V, A):
-        P, L, C, D = self.P, self.L, self.C, self.D
+        P, L, C, dk, dv = self.P, self.L, self.C, self.dk, self.dv
         s_snaps, g_css, S_totals = [], [], []
         for p in range(P):
             s_snap, g_cs, S_total = self._stage1(p, Q[p], K[p], V[p], A[p])
             s_snaps.append(s_snap); g_css.append(g_cs); S_totals.append(S_total)
 
         if P == 1:
-            S_recvs = [torch.zeros(D, D, dtype=torch.float32)]
+            S_recvs = [torch.zeros(dk, dv, dtype=torch.float32)]
         else:
             out = self._boundary(S_totals, A)                 # real multi-device AllScan
-            S_recvs = [torch.zeros(D, D, dtype=torch.float32) if p == 0 else out[p - 1]
+            S_recvs = [torch.zeros(dk, dv, dtype=torch.float32) if p == 0 else out[p - 1]
                        for p in range(P)]
 
-        O = torch.zeros(P, L, D, dtype=torch.float32)
+        O = torch.zeros(P, L, dv, dtype=torch.float32)
         for p in range(P):
-            s_shift = _shift_snaps(s_snaps[p], A[p], S_recvs[p], L, C, D)
+            s_shift = _shift_snaps(s_snaps[p], A[p], S_recvs[p], L, C, dk)
             O[p] = self._stage2(p, Q[p], K[p], V[p], g_css[p], s_shift)
         return O
+
+    # ---------------------------------------------------------------------
+    # Backward (B3): SP-decomposed GLA operator backward on the simpler kernels.
+    # grad_o (output stage) + grad_h (state stage) run the per-chunk backward
+    # matmuls on device; the AllScan-backward reverse ring carries the boundary
+    # gradient across devices; the cross-chunk grad recurrence + the gate
+    # arithmetic (dq/dk scaling, dg_cs assembly, reverse-cumsum -> dA) are the
+    # cheap host linear glue.  Mirrors gla.common.gla_chunk_backward op-for-op.
+    # ---------------------------------------------------------------------
+
+    def _grad_o(self, p, Q, K, V, g_cs, H, dO):
+        """Run grad_o on rank p's device -> (dQt, dKin, dVi, dH) raw adjoints."""
+        L, dk, dv, N = self.L, self.dk, self.dv, self.N
+        dQt = torch.zeros(L, dk, dtype=torch.float32)
+        dKin = torch.zeros(L, dk, dtype=torch.float32)
+        dVi = torch.zeros(L, dv, dtype=torch.float32)
+        dH = torch.zeros(N, dk, dv, dtype=torch.float32)
+        self._runners[p].run(
+            "grad_o", GRAD_O_SPEC["orchestration"]["signature"],
+            [("q", Q.contiguous()), ("k", K.contiguous()), ("v", V.contiguous()),
+             ("g_cs", g_cs), ("snap", H.contiguous()), ("dO", dO.contiguous()),
+             ("tril", self._tril), ("dQt", dQt), ("dKin", dKin), ("dVi", dVi),
+             ("dH", dH), ("config", self._config)])
+        return dQt, dKin, dVi, dH
+
+    def _grad_h(self, p, K, V, g_cs, dSloc):
+        """Run grad_h on rank p's device -> (dKstate, dVs) raw state adjoints."""
+        L, dk, dv = self.L, self.dk, self.dv
+        dKstate = torch.zeros(L, dk, dtype=torch.float32)
+        dVs = torch.zeros(L, dv, dtype=torch.float32)
+        self._runners[p].run(
+            "grad_h", GRAD_H_SPEC["orchestration"]["signature"],
+            [("k", K.contiguous()), ("v", V.contiguous()), ("g_cs", g_cs),
+             ("dSloc", dSloc.contiguous()), ("dKstate", dKstate), ("dVs", dVs),
+             ("config", self._config)])
+        return dKstate, dVs
+
+    def _reverse_cumsum(self, p, dg_cs):
+        """Per-chunk reverse cumulative sum via the gate_cumsum kernel + triu."""
+        L, dk = self.L, self.dk
+        out = torch.zeros(L, dk, dtype=torch.float32)
+        self._runners[p].run(
+            "gate_cumsum", GATE_CUMSUM_SPEC["orchestration"]["signature"],
+            [("triu", self._triu), ("dg_cs", dg_cs.contiguous()), ("out", out),
+             ("config", self._config)])
+        return out
+
+    def _boundary_backward(self, g_outs, A, outs):
+        """AllScan reverse ring: g_out[p] -> (dS_total[p], dgamma[p]) [dk,dv]/[dk,1]."""
+        from allscan.implementations.simpler.impl import SimplerAllscan
+        P, dk, dv = self.P, self.dk, self.dv
+        gammas = torch.stack([A[p].reshape(-1, dk).prod(dim=0).reshape(dk, 1) for p in range(P)])
+        dS = torch.zeros(P, dk, dv, dtype=torch.float32)
+        dgamma = torch.zeros(P, dk, 1, dtype=torch.float32)
+        allscan = SimplerAllscan()
+        allscan.build(dk, dv, 1, P, self.device_ids, self.platform)
+        try:
+            allscan.run_backward(g_outs, gammas, outs, dS, dgamma)
+        finally:
+            allscan.close()
+        return dS, dgamma
+
+    def backward(self, Q, K, V, A, dO):
+        """SP-decomposed ZeCO backward; args/return as in ZeCoImpl.backward."""
+        P, L, C, dk, dv, N = self.P, self.L, self.C, self.dk, self.dv, self.N
+        zkv = torch.zeros(dk, dv, dtype=torch.float32)
+
+        # --- Phase A: forward stage1 per rank (g_cs, unfolded snaps, S_total) ---
+        s_snaps, g_css, S_totals = [], [], []
+        for p in range(P):
+            s_snap, g_cs, S_total = self._stage1(p, Q[p], K[p], V[p], A[p])
+            s_snaps.append(s_snap); g_css.append(g_cs); S_totals.append(S_total)
+
+        # Per-rank host decay quantities: gamma_n [N,dk], cprev_n [N,dk].
+        gammas_n, cprev_n = [], []
+        for p in range(P):
+            g_last = g_css[p].reshape(N, C, dk)[:, -1, :]      # [N,dk] = g_total per chunk
+            gam = torch.exp(g_last)
+            c = torch.ones(N, dk, dtype=torch.float32)
+            if N > 1:
+                c[1:] = torch.cumprod(gam, dim=0)[:-1]
+            gammas_n.append(gam); cprev_n.append(c)
+
+        # --- Phase B1: forward AllScan -> outs (the S_recv values) ---
+        if P == 1:
+            outs = None
+            S_recvs = [zkv]
+        else:
+            outs = self._boundary(S_totals, A)
+            S_recvs = [zkv if p == 0 else outs[p - 1] for p in range(P)]
+
+        # --- Phase C: grad_o per rank + host gate_o -> dq, dk_o, dg_cs_o, dH, dS_recv ---
+        dq = torch.zeros(P, L, dk, dtype=torch.float32)
+        dk_o = torch.zeros(P, L, dk, dtype=torch.float32)
+        dgcs = torch.zeros(P, L, dk, dtype=torch.float32)
+        dv_out = torch.zeros(P, L, dv, dtype=torch.float32)
+        dH_all, dcprev_all = [], []
+        dS_recv = torch.zeros(P, dk, dv, dtype=torch.float32)
+        for p in range(P):
+            H = _shift_snaps(s_snaps[p], A[p], S_recvs[p], L, C, dk)
+            dQt, dKin, dVi, dH = self._grad_o(p, Q[p], K[p], V[p], g_css[p], H, dO[p])
+            e = torch.exp(g_css[p]); ei = torch.exp(-g_css[p])
+            dqo = dQt * e
+            dko = dKin * ei
+            dq[p] = dqo
+            dk_o[p] = dko
+            dgcs[p] = dqo * Q[p] - dko * K[p]               # dg_cs output stage
+            dv_out[p] = dVi
+            dH_all.append(dH)
+            # boundary-state grad (fed to the reverse ring) + dcprev for dcvec.
+            dcp = torch.zeros(N, dk, dtype=torch.float32)
+            acc = torch.zeros(dk, dv, dtype=torch.float32)
+            for n in range(N):
+                dcp[n] = (dH[n] * S_recvs[p]).sum(dim=1)
+                acc += cprev_n[p][n].unsqueeze(1) * dH[n]
+            dcprev_all.append(dcp)
+            dS_recv[p] = acc
+
+        # --- Phase B2: backward AllScan reverse ring -> dS_total, dgamma ---
+        if P == 1:
+            dS_totals = [zkv]
+            dgammas = [torch.zeros(dk, dtype=torch.float32)]
+        else:
+            g_out = torch.zeros(P, dk, dv, dtype=torch.float32)
+            g_out[:P - 1] = dS_recv[1:]
+            dS_b, dgamma_b = self._boundary_backward(g_out, A, outs)
+            dS_totals = [dS_b[p] for p in range(P)]
+            dgammas = [dgamma_b[p].squeeze(1) for p in range(P)]
+
+        # --- Phase D: reverse recurrence + grad_h + gate_h + reverse-cumsum ---
+        dA = torch.zeros(P, L, dk, dtype=torch.float32)
+        dk_full = torch.zeros(P, L, dk, dtype=torch.float32)
+        for p in range(P):
+            # reverse chunk recurrence -> dSloc[N,dk,dv], dcvec[N,dk] (host glue).
+            dSloc = torch.zeros(N, dk, dv, dtype=torch.float32)
+            dcvec = torch.zeros(N, dk, dtype=torch.float32)
+            cur_S = dS_totals[p].clone(); cur_c = dgammas[p].clone()
+            for m in reversed(range(N)):
+                dSloc[m] = cur_S; dcvec[m] = cur_c
+                if m > 0:
+                    cur_S = gammas_n[p][m].unsqueeze(1) * cur_S + dH_all[p][m]
+                    cur_c = gammas_n[p][m] * cur_c + dcprev_all[p][m]
+
+            dKstate, dVs = self._grad_h(p, K[p], V[p], g_css[p], dSloc)
+
+            # gate_h: dk_h, dg_cs_h + the g_total (row C-1) corrections, per chunk.
+            dgcs_p = dgcs[p].clone()
+            dk_h = torch.zeros(L, dk, dtype=torch.float32)
+            g_cs_ch = g_css[p].reshape(N, C, dk)
+            for n in range(N):
+                lo, hi = n * C, (n + 1) * C
+                gtot = g_cs_ch[n, -1, :]
+                dkh = dKstate[lo:hi] * torch.exp(gtot.unsqueeze(0) - g_css[p][lo:hi])
+                dk_h[lo:hi] = dkh
+                dgcs_p[lo:hi] += -dkh * K[p][lo:hi]
+                dgamma_state = (dSloc[n] * s_snaps[p][n]).sum(dim=1)     # [dk]
+                dgamma_c = dcvec[n] * cprev_n[p][n]                      # [dk]
+                dgcs_p[hi - 1] += (dgamma_state + dgamma_c) * gammas_n[p][n] + (dkh * K[p][lo:hi]).sum(dim=0)
+            dv_out[p] += dVs
+            dk_full[p] = dk_o[p] + dk_h
+            # gate backward: dA = reverse_cumsum(dg_cs) / a  (triu matmul on device).
+            dP = self._reverse_cumsum(p, dgcs_p)
+            dA[p] = dP / A[p]
+
+        return dq, dk_full, dv_out, dA
 
     def close(self):
         for r in getattr(self, "_runners", []):

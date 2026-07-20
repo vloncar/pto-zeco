@@ -28,10 +28,14 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from allscan.implementations.torch_ref import TorchAllscan  # noqa: E402
+from allscan.implementations.torch_ref import (  # noqa: E402
+    TorchAllscan,
+    _all_scan_backward_p2p,
+)
 from gla.common import (  # noqa: E402
     ZeCoImpl,
     expected_gla,
+    expected_gla_backward,
     flatten_seq,
     gla_chunk_scan,
     gla_reconstruct,
@@ -89,6 +93,84 @@ class TorchZeCo(ZeCoImpl):
             S_prev, c_prev, O_intra = caches[p]
             O[p] = gla_reconstruct(Q[p], A[p], C, S_prev, c_prev, S_recv, O_intra)
         return O
+
+    def backward(self, Q, K, V, A, dO):
+        """ZeCO backward; composes :meth:`TorchAllscan.run_backward` for the boundary.
+
+        The SP decomposition of the gradient, mirroring the forward's three stages
+        (each rank's stage A + stage C are differentiated *locally* by autograd;
+        only the cross-rank boundary is manual — exactly what B2/B3/B4 distribute):
+
+          1. **stage-C adjoint** (local): ``dS_recv[p] = dL/dS_recv_p`` from ``dO[p]``
+             — how rank ``p``'s output depends on its incoming boundary state.
+          2. **boundary** (reverse ring): the external grad on ``out[p]`` is
+             ``dS_recv[p+1]`` (``out[p]`` is rank ``p+1``'s ``S_recv``);
+             :meth:`run_backward` turns it into ``dS_total[p]`` / ``dgamma[p]``.
+          3. **stage-A adjoint** (local): full ``dQ,dK,dV,dA[p]`` from ``dO[p]``
+             *and* the boundary grads ``(dS_total[p], dgamma[p])`` on the outputs
+             ``(O_p, S_total, g_total)``.
+
+        Args/return as in :meth:`gla.common.ZeCoImpl.backward`.
+        """
+        P, C, dk, dv = self.P, self.C, self.dk, self.dv
+
+        # Stage A (local, per rank): build the chunk-scan graph and collect the
+        # local end-state / decay that feed the boundary AllScan.
+        stageA = []
+        S_locals = torch.zeros((P, dk, dv), dtype=Q.dtype)
+        gammas = torch.zeros((P, dk, 1), dtype=Q.dtype)
+        for p in range(P):
+            Qp = Q[p].clone().requires_grad_(True)
+            Kp = K[p].clone().requires_grad_(True)
+            Vp = V[p].clone().requires_grad_(True)
+            Ap = A[p].clone().requires_grad_(True)
+            S_prev, c_prev, O_intra, S_total, g_total = gla_chunk_scan(Qp, Kp, Vp, Ap, C)
+            stageA.append((Qp, Kp, Vp, Ap, S_prev, c_prev, O_intra, S_total, g_total))
+            S_locals[p] = S_total.detach()
+            gammas[p] = g_total.detach().unsqueeze(1)
+
+        # Boundary AllScan (forward) — gives the actual S_recv values, and run_backward
+        # later needs out[p-1] for dgamma.
+        outs = torch.zeros((P, dk, dv), dtype=Q.dtype)
+        self.allscan.run(S_locals, gammas, outs)
+
+        # Stage C (local, per rank): reconstruct with S_recv held at its ACTUAL
+        # boundary value (out[p-1]) as a fresh leaf — dQ/dA read hist = S_prev +
+        # c_prev*S_recv, so the value matters (only dO/dS_recv is value-free).
+        tapes = []
+        for p in range(P):
+            Qp, Kp, Vp, Ap, S_prev, c_prev, O_intra, S_total, g_total = stageA[p]
+            S_recv = (outs[p - 1] if p > 0 else torch.zeros((dk, dv), dtype=Q.dtype))
+            S_recv = S_recv.clone().detach().requires_grad_(True)
+            O_p = gla_reconstruct(Qp, Ap, C, S_prev, c_prev, S_recv, O_intra)
+            tapes.append((Qp, Kp, Vp, Ap, S_recv, O_p, S_total, g_total))
+
+        # Phase 1: stage-C adjoint dS_recv[p] = dL/dS_recv_p.
+        dS_recv = torch.zeros((P, dk, dv), dtype=Q.dtype)
+        for p in range(P):
+            _, _, _, _, S_recv, O_p, _, _ = tapes[p]
+            (g,) = torch.autograd.grad(O_p, S_recv, dO[p], retain_graph=True)
+            dS_recv[p] = g
+
+        # Phase 2: boundary reverse ring. out[p] feeds rank p+1's S_recv, so the
+        # external grad on out[p] is dS_recv[p+1]; out[P-1] is unused.
+        g_out = torch.zeros((P, dk, dv), dtype=Q.dtype)
+        if P > 1:
+            g_out[: P - 1] = dS_recv[1:]
+        dS = torch.zeros((P, dk, dv), dtype=Q.dtype)
+        dgamma = torch.zeros((P, dk, 1), dtype=Q.dtype)
+        self.allscan.run_backward(g_out, gammas, outs, dS, dgamma)
+
+        # Phase 3: stage-A adjoint — full input grads from dO[p] + boundary grads.
+        dQ, dK, dV, dA = (torch.zeros_like(t) for t in (Q, K, V, A))
+        for p in range(P):
+            Qp, Kp, Vp, Ap, _, O_p, S_total, g_total = tapes[p]
+            gQ, gK, gV, gA = torch.autograd.grad(
+                [O_p, S_total, g_total], [Qp, Kp, Vp, Ap],
+                [dO[p], dS[p], dgamma[p].squeeze(1)],
+            )
+            dQ[p], dK[p], dV[p], dA[p] = gQ, gK, gV, gA
+        return dQ, dK, dV, dA
 
     def close(self):
         self.allscan.close()
@@ -204,5 +286,107 @@ def run_distributed_zeco(
     return 0
 
 
+def _worker_zeco_backward(rank, world_size, Q, K, V, A, C, dO, output_queue):
+    """Per-rank gloo process body for the ZeCO backward reference.
+
+    Mirrors the forward worker, then runs the SP backward: local autograd for
+    stage A/C, one ``dS_recv`` exchange to hand each rank's stage-C boundary grad
+    down to its lower neighbour, and the reverse-ring AllScan backward for the
+    boundary-state gradient. Returns this rank's ``(dQ, dK, dV, dA)``.
+    """
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12358"
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    device = torch.device("cpu")
+
+    Qp = Q[rank].clone().requires_grad_(True)
+    Kp = K[rank].clone().requires_grad_(True)
+    Vp = V[rank].clone().requires_grad_(True)
+    Ap = A[rank].clone().requires_grad_(True)
+    S_prev, c_prev, O_intra, S_total, g_total = gla_chunk_scan(Qp, Kp, Vp, Ap, C)
+    gamma_r = g_total.detach().unsqueeze(1)
+
+    # Forward boundary ring -> the actual S_recv value entering this rank.
+    S_recv_val = _zeco_boundary_p2p(rank, world_size, S_total.detach(), gamma_r, device)
+    S_recv = S_recv_val.clone().detach().requires_grad_(True)
+    O_p = gla_reconstruct(Qp, Ap, C, S_prev, c_prev, S_recv, O_intra)
+
+    # Phase 1 (local): stage-C boundary adjoint dS_recv[rank].
+    (dS_recv_local,) = torch.autograd.grad(O_p, S_recv, dO[rank], retain_graph=True)
+
+    # Exchange: this rank's g_out = dS_recv[rank+1] (received from the higher
+    # neighbour); hand our own dS_recv[rank] down to the lower neighbour. Recv
+    # before send (high->low chain) so the blocking p2p can't deadlock.
+    g_out_r = torch.zeros_like(dS_recv_local)
+    if rank != world_size - 1:
+        dist.recv(tensor=g_out_r, src=rank + 1)
+    if rank != 0:
+        dist.send(tensor=dS_recv_local.contiguous(), dst=rank - 1)
+
+    # Phase 2: reverse-ring AllScan backward -> (dS_total, dgamma) for this rank.
+    dS_r, dgamma_r = _all_scan_backward_p2p(
+        rank, world_size, g_out_r, gamma_r, S_recv_val, 1, device
+    )
+
+    # Phase 3 (local): full input gradients from dO + the boundary grads.
+    gQ, gK, gV, gA = torch.autograd.grad(
+        [O_p, S_total, g_total], [Qp, Kp, Vp, Ap],
+        [dO[rank], dS_r, dgamma_r.squeeze(1)],
+    )
+    output_queue.put((rank, gQ.tolist(), gK.tolist(), gV.tolist(), gA.tolist()))
+    dist.destroy_process_group()
+
+
+def run_distributed_zeco_backward(
+    P: int = 4, L: int = 16, C: int = 8, dk: int = 16, dv: int = 16
+) -> int:
+    """Spawn one gloo process per rank and verify the ZeCO backward vs the golden.
+
+    Args are as in :func:`run_distributed_zeco`. Returns ``0`` if every rank's
+    ``(dQ, dK, dV, dA)`` matches :func:`~gla.common.expected_gla_backward` on the
+    full sequence, ``1`` otherwise.
+    """
+    import torch.multiprocessing as mp
+
+    Q, K, V, A = make_gla_inputs(P, L, dk, dv)
+    torch.manual_seed(P * 100 + dk + C)
+    dO = torch.randn(P, L, dv)
+
+    ctx = mp.get_context("spawn")
+    output_queue = ctx.Queue()
+    procs = []
+    for rank in range(P):
+        proc = ctx.Process(
+            target=_worker_zeco_backward, args=(rank, P, Q, K, V, A, C, dO, output_queue)
+        )
+        proc.start()
+        procs.append(proc)
+
+    dQ, dK, dV = (torch.zeros(P, L, dk), torch.zeros(P, L, dk), torch.zeros(P, L, dv))
+    dA = torch.zeros(P, L, dk)
+    for _ in range(P):
+        rank, gQ, gK, gV, gA = output_queue.get()
+        dQ[rank], dK[rank] = torch.tensor(gQ), torch.tensor(gK)
+        dV[rank], dA[rank] = torch.tensor(gV), torch.tensor(gA)
+    for proc in procs:
+        proc.join()
+
+    gQ, gK, gV, gA = expected_gla_backward(
+        flatten_seq(Q), flatten_seq(K), flatten_seq(V), flatten_seq(A), flatten_seq(dO)
+    )
+    ref = (gQ.reshape(P, L, dk), gK.reshape(P, L, dk),
+           gV.reshape(P, L, dv), gA.reshape(P, L, dk))
+    got = (dQ, dK, dV, dA)
+    max_diff = max((g - r).abs().max().item() for g, r in zip(got, ref))
+    print(f"[torch.distributed zeco-bwd] P={P} L={L} C={C} dk={dk} dv={dv}  max grad diff = {max_diff:.3e}")
+    if max_diff > 1e-4:
+        print("[torch.distributed zeco-bwd] FAILED")
+        return 1
+    print("[torch.distributed zeco-bwd] matches sequential GLA backward reference ✅")
+    return 0
+
+
 if __name__ == "__main__":
-    sys.exit(run_distributed_zeco())
+    sys.exit(run_distributed_zeco() or run_distributed_zeco_backward())

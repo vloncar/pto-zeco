@@ -34,6 +34,7 @@ import glob
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -69,6 +70,30 @@ def check_preload(platform: str) -> None:
               "will hang at rootinfo rendezvous.\n"
               "           Prefix with: LD_PRELOAD=<cann>/aarch64-linux/lib64/libhccl.so",
               file=sys.stderr)
+
+
+def is_drain_timeout(exc: BaseException) -> bool:
+    """True if ``exc`` looks like the ``507018`` AICore drain-timeout.
+
+    That error wedges the AICore(s) it ran on: follow-on configs reusing the same
+    device then fail with cascade errors (``-1``). So a config that hits it marks
+    its devices suspect and later configs skip them (F5 operational hardening).
+    """
+    return "507018" in str(exc)
+
+
+def npu_smi_snapshot() -> str:
+    """Best-effort ``npu-smi info`` chip summary for diagnostics; ``''`` if absent.
+
+    (AICore% is unreliable on driver 25.5.1 — it reads ~100% with no processes —
+    so this is for eyeballing HBM / process leaks on failure, not an auto-gate.)
+    """
+    try:
+        out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
+        lines = [ln for ln in out.stdout.splitlines() if "910" in ln or "HBM-Usage" in ln]
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 - diagnostics only, never fatal
+        return ""
 
 _THIS_DIR = Path(__file__).parent.parent  # repo root (pto-zeco/)
 # Repo root must precede the script dir (``gla/``) that Python auto-adds at sys.path[0]:
@@ -205,10 +230,20 @@ def main() -> None:
         if n:
             print(f"Cleaned  : {n} stale rendezvous file(s) before start")
 
+    # Devices wedged by a 507018 drain-timeout — skip later configs that reuse them
+    # so one bad config can't cascade -1 failures across the rest of the sweep.
+    suspect: set[int] = set()
+
     all_rows: list[dict] = []
     for impl_obj in impls:
         print(f"\n=== {impl_obj.name} ===")
         for (P, L, C, D) in configs:
+            used = device_ids[:P]
+            wedged = suspect.intersection(used)
+            if wedged:
+                print(f"  P={P} L={L} C={C} D={D} ... SKIP (devices {sorted(wedged)} "
+                      f"wedged by an earlier 507018; reset them to re-enable)")
+                continue
             # Clean stale rendezvous before each config so a prior config's killed/leaked
             # comm domain can't hang this one at rootinfo (F5 operational hardening).
             if not args.no_clean:
@@ -223,6 +258,13 @@ def main() -> None:
                 all_rows.append(row)
             except Exception as exc:
                 print(f"FAILED: {exc}")
+                if is_drain_timeout(exc):
+                    suspect.update(used)
+                    print(f"    -> 507018 drain-timeout: marking devices {used} suspect "
+                          f"(skipping later configs that reuse them).")
+                    snap = npu_smi_snapshot()
+                    if snap:
+                        print("    npu-smi at failure:\n      " + snap.replace("\n", "\n      "))
             finally:
                 # Always release the worker AND clear any rendezvous it leaked, so a
                 # failed config (e.g. device 507018) can't poison the next one.

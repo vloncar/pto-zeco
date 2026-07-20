@@ -53,20 +53,29 @@ class TestGateCumsum(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"C": 32, "D": 32, "N": 2},
         },
-        {   # rectangular C != D (Phase 2): tril[C,C] @ g[C,D]
+        {   # rectangular C != D (Phase 2): tril[C,C] @ g[C,dk]
             "name": "C32_D64_N2",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"C": 32, "D": 64, "N": 2},
         },
+        {   # dk != dv (F7): gate_cumsum uses only dk, but the config carries dv (and
+            # N at cfg[3]) — this guards that plumbing.
+            "name": "dk32_dv64_N2",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"C": 32, "dk": 32, "dv": 64, "N": 2},
+        },
     ]
 
     def generate_args(self, params):
-        C, Dd, N = params["C"], params["D"], params["N"]
+        C, N = params["C"], params["N"]
+        dk = params.get("dk", params.get("D"))
+        dv = params.get("dv", params.get("D"))
         tril = torch.tril(torch.ones(C, C, dtype=torch.float32))
-        g = torch.randn(N * C, Dd, dtype=torch.float32) * 0.05   # log-gate-ish magnitude
-        g_cs = torch.zeros(N * C, Dd, dtype=torch.float32)
-        config = torch.tensor([C, Dd, N], dtype=torch.int64)
+        g = torch.randn(N * C, dk, dtype=torch.float32) * 0.05   # log-gate-ish magnitude
+        g_cs = torch.zeros(N * C, dk, dtype=torch.float32)
+        config = torch.tensor([C, dk, dv, N], dtype=torch.int64)
         return TaskArgsBuilder(
             Tensor("tril", tril.flatten()),
             Tensor("g", g.flatten()),
@@ -75,10 +84,11 @@ class TestGateCumsum(SceneTestCase):
         )
 
     def compute_golden(self, args, params):
-        C, Dd, N = params["C"], params["D"], params["N"]
+        C, N = params["C"], params["N"]
+        dk = params.get("dk", params.get("D"))
         tril = args.tril.reshape(C, C)
-        g = args.g.reshape(N * C, Dd)
-        g_cs = args.g_cs.reshape(N * C, Dd)
+        g = args.g.reshape(N * C, dk)
+        g_cs = args.g_cs.reshape(N * C, dk)
         for n in range(N):
             g_cs[n * C:(n + 1) * C] = tril @ g[n * C:(n + 1) * C]
 

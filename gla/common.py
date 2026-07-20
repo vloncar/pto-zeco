@@ -61,6 +61,60 @@ def expected_gla(
     return O
 
 
+def expected_gla_backward(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, A: torch.Tensor, dO: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Analytic backward of :func:`expected_gla` — the golden for every ZeCO backend.
+
+    Reverse of the forward recurrence ``S_t = diag(a_t) S_{t-1} + k_t^T v_t``,
+    ``o_t = q_t S_t``.  Carrying the adjoint state ``dS`` (grad w.r.t. the running
+    state) *backwards* over ``t``::
+
+        dS_t   = q_t^T dO_t + diag(a_{t+1}) dS_{t+1}     (adjoint recurrence)
+        dQ_t   = S_t  dO_t^T -> dQ_t = S_t @ dO_t
+        dK_t   = dS_t V_t   (= dS_t @ v_t)
+        dV_t   = K_t dS_t   (= k_t @ dS_t)
+        dA_t   = rowsum_dv( dS_t * S_{t-1} )
+
+    Independent of autograd; :func:`~gla.tests.test_gla_backward` cross-checks it
+    against ``torch.autograd`` on :func:`expected_gla`.
+
+    Args:
+        Q, K, V, A: The forward inputs, shapes ``[T, dk]`` / ``[T, dk]`` /
+            ``[T, dv]`` / ``[T, dk]``.
+        dO: Upstream gradient of the outputs, shape ``[T, dv]``.
+
+    Returns:
+        ``(dQ, dK, dV, dA)`` matching the shapes of ``(Q, K, V, A)``.
+    """
+    T, dk = Q.shape
+    dv = V.shape[1]
+
+    # Re-run the forward, caching the state trajectory S_t (S_hist[t] == S_t;
+    # S_{-1} == 0) needed for dQ_t (uses S_t) and dA_t (uses S_{t-1}).
+    S = torch.zeros((dk, dv), dtype=Q.dtype)
+    S_hist = torch.zeros((T, dk, dv), dtype=Q.dtype)
+    for t in range(T):
+        S = A[t].unsqueeze(1) * S + torch.outer(K[t], V[t])
+        S_hist[t] = S
+
+    dQ = torch.zeros_like(Q)
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+    dA = torch.zeros_like(A)
+
+    dS = torch.zeros((dk, dv), dtype=Q.dtype)  # incoming diag(a_{t+1}) dS_{t+1}
+    for t in range(T - 1, -1, -1):
+        dS = dS + torch.outer(Q[t], dO[t])        # total adjoint of S_t
+        dQ[t] = S_hist[t] @ dO[t]
+        dK[t] = dS @ V[t]
+        dV[t] = K[t] @ dS
+        S_prev = S_hist[t - 1] if t > 0 else torch.zeros((dk, dv), dtype=Q.dtype)
+        dA[t] = (dS * S_prev).sum(dim=1)
+        dS = A[t].unsqueeze(1) * dS               # push through diag(a_t) to t-1
+    return dQ, dK, dV, dA
+
+
 def make_gla_inputs(
     P: int,
     L: int,
@@ -226,6 +280,143 @@ def gla_reconstruct(
     return O
 
 
+def gla_chunk_backward(
+    Qp: torch.Tensor,
+    Kp: torch.Tensor,
+    Vp: torch.Tensor,
+    Ap: torch.Tensor,
+    C: int,
+    S_recv: torch.Tensor,
+    dO: torch.Tensor,
+    dS_total: torch.Tensor,
+    dg_total: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One device's explicit chunk-parallel GLA backward (no autograd).
+
+    The hand-derived reverse of :func:`gla_chunk_scan` + :func:`gla_reconstruct`,
+    written op-for-op so the simpler / pypto **kernels** can implement it directly
+    (autograd is unavailable on-device). It is the local half of the SP backward:
+    the cross-device coupling enters as ``dS_total`` / ``dg_total`` (the grads on
+    this device's boundary outputs, produced by the AllScan-backward reverse ring)
+    and leaves as ``dS_recv`` (the grad on the received boundary state, fed into
+    that ring). For ``P == 1`` (``S_recv = dS_total = dg_total = 0``) it reduces to
+    :func:`expected_gla_backward` on the device's own tokens.
+
+    The blocks below are grouped by the kernel that will own them:
+
+    * **grad_o** (output-stage, per chunk, embarrassingly parallel): reconstruct +
+      intra adjoints — ``dQt``, ``dH_n = Qt^T dO``, ``dscores``, and the ``dS_recv``
+      accumulation.
+    * **grad_h** (state-stage, reverse chunk recurrence): carries the state adjoint
+      ``dSloc`` / decay adjoint ``dcvec`` backwards across chunks, producing
+      ``dKstate`` / the state-path ``dV`` / ``dgamma``.
+    * **gate backward** (per chunk): ``db -> dA`` via ``reverse_cumsum(db*b)/a``.
+
+    Args:
+        Qp, Kp, Vp, Ap: This device's forward inputs, ``[L,dk]`` / ``[L,dk]`` /
+            ``[L,dv]`` / ``[L,dk]``.
+        C: Chunk size (``L % C == 0``).
+        S_recv: Boundary state entering this device, ``[dk,dv]`` (zeros for rank 0).
+        dO: Upstream output gradient, ``[L,dv]``.
+        dS_total: Grad on the device's end-of-slice local state ``S_total``,
+            ``[dk,dv]`` (zeros when nothing downstream needs it, e.g. ``P == 1``).
+        dg_total: Grad on the device's total decay ``g_total``, ``[dk]``.
+
+    Returns:
+        ``(dQ, dK, dV, dA, dS_recv)`` — input grads matching ``(Q,K,V,A)`` shapes
+        plus the received-boundary-state grad ``[dk,dv]`` for the reverse ring.
+    """
+    L, dk = Qp.shape
+    dv = Vp.shape[1]
+    assert L % C == 0, f"L={L} not divisible by C={C}"
+    N = L // C
+    mask = torch.tril(torch.ones((C, C), dtype=Qp.dtype))
+
+    # --- forward recompute: cache the per-chunk quantities the backward reads ---
+    b_l, gamma_l, Sprev_l, cprev_l = [], [], [], []
+    scores_l, Kstate_l, Qt_l, Kintra_l = [], [], [], []
+    S = torch.zeros((dk, dv), dtype=Qp.dtype)
+    c = torch.ones((dk,), dtype=Qp.dtype)
+    for n in range(N):
+        lo, hi = n * C, (n + 1) * C
+        q, k, v, a = Qp[lo:hi], Kp[lo:hi], Vp[lo:hi], Ap[lo:hi]
+        b = torch.cumprod(a, dim=0)
+        gamma = b[-1]
+        Sprev_l.append(S.clone())
+        cprev_l.append(c.clone())
+        Qt = q * b
+        Kintra = k / b
+        scores = (Qt @ Kintra.t()) * mask
+        Kstate = k * (gamma / b)
+        b_l.append(b); gamma_l.append(gamma); scores_l.append(scores)
+        Kstate_l.append(Kstate); Qt_l.append(Qt); Kintra_l.append(Kintra)
+        S = gamma.unsqueeze(1) * S + Kstate.t() @ v
+        c = c * gamma
+
+    dQ = torch.zeros_like(Qp)
+    dK = torch.zeros_like(Kp)
+    dV = torch.zeros_like(Vp)
+    dA = torch.zeros_like(Ap)
+    dS_recv = torch.zeros((dk, dv), dtype=Qp.dtype)
+    db_l = [torch.zeros((C, dk), dtype=Qp.dtype) for _ in range(N)]
+    dSprev_l: list[torch.Tensor] = [None] * N        # type: ignore[list-item]
+    dcprev_l: list[torch.Tensor] = [None] * N        # type: ignore[list-item]
+
+    # --- grad_o: output-stage adjoint (per chunk, independent) ---
+    for n in range(N):
+        lo, hi = n * C, (n + 1) * C
+        q, k, v = Qp[lo:hi], Kp[lo:hi], Vp[lo:hi]
+        b, Qt, Kintra, scores = b_l[n], Qt_l[n], Kintra_l[n], scores_l[n]
+        dO_n = dO[lo:hi]
+        H_n = Sprev_l[n] + cprev_l[n].unsqueeze(1) * S_recv       # [dk,dv]
+        dQt = dO_n @ H_n.t()                                       # [C,dk]
+        dH = Qt.t() @ dO_n                                         # [dk,dv]
+        dSprev_l[n] = dH
+        dcprev_l[n] = (dH * S_recv).sum(dim=1)                     # [dk]
+        dS_recv = dS_recv + cprev_l[n].unsqueeze(1) * dH
+        # intra masked attention: O_intra = (scores∘mask) @ v
+        dsc = (dO_n @ v.t()) * mask                                # [C,C]
+        dV[lo:hi] += scores.t() @ dO_n
+        dQt = dQt + dsc @ Kintra
+        dKintra = dsc.t() @ Qt                                     # [C,dk]
+        dK[lo:hi] += dKintra / b                                   # Kintra = k / b
+        db = -dKintra * Kintra / b
+        dQ[lo:hi] += dQt * b                                       # Qt = q * b
+        db = db + dQt * q
+        db_l[n] = db
+
+    # --- grad_h: state-stage adjoint (reverse chunk recurrence) ---
+    dSloc = dS_total.clone()
+    dcvec = dg_total.clone()
+    for n in reversed(range(N)):
+        lo, hi = n * C, (n + 1) * C
+        k, v = Kp[lo:hi], Vp[lo:hi]
+        b, gamma, Kstate = b_l[n], gamma_l[n], Kstate_l[n]
+        dKstate = v @ dSloc.t()                                    # [C,dk]
+        dV[lo:hi] += Kstate @ dSloc
+        dgamma_state = (dSloc * Sprev_l[n]).sum(dim=1)             # [dk]
+        dSloc_prev = gamma.unsqueeze(1) * dSloc
+        dgamma_c = dcvec * cprev_l[n]                              # [dk]
+        dcvec_prev = dcvec * gamma
+        dK[lo:hi] += dKstate * (gamma / b)                        # Kstate = k*gamma/b
+        dgamma_kstate = (dKstate * k / b).sum(dim=0)              # [dk]
+        db_l[n] += -dKstate * Kstate / b
+        dgamma_n = dgamma_state + dgamma_c + dgamma_kstate        # gamma = b[-1]
+        db_l[n][-1] += dgamma_n
+        # S_{n-1}^loc / c_{n-1} feed both this update and reconstruct's H_n:
+        dSloc = dSloc_prev + (dSprev_l[n] if n > 0 else 0)
+        dcvec = dcvec_prev + (dcprev_l[n] if n > 0 else 0)
+
+    # --- gate backward: b -> a  (dA = reverse_cumsum(db*b) / a, per chunk) ---
+    for n in range(N):
+        lo, hi = n * C, (n + 1) * C
+        prod = db_l[n] * b_l[n]                                    # [C,dk]
+        rcs = prod.flip(0).cumsum(0).flip(0)                      # sum_{t>=j}
+        dA[lo:hi] = rcs / Ap[lo:hi]
+
+    return dQ, dK, dV, dA, dS_recv
+
+
 # ---------------------------------------------------------------------------
 # Implementation interface
 # ---------------------------------------------------------------------------
@@ -284,6 +475,29 @@ class ZeCoImpl(ABC):
         Returns:
             Outputs ``O``, shape ``[P, L, dv]`` (rank-major).
         """
+
+    def backward(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        A: torch.Tensor,
+        dO: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the ZeCO backward pass and return the input gradients.
+
+        Optional — backends that only implement the forward leave this raising
+        ``NotImplementedError``. The reference recomputes the forward internally,
+        so it is stateless (no dependence on a prior :meth:`forward` call).
+
+        Args:
+            Q, K, V, A: The forward inputs, shapes ``[P, L, dk/dv]`` (rank-major).
+            dO: Upstream gradient of the outputs, shape ``[P, L, dv]``.
+
+        Returns:
+            ``(dQ, dK, dV, dA)`` matching the shapes of ``(Q, K, V, A)``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no backward")
 
     #: Whether :meth:`measure` reports *steady-state* per-forward latency — i.e.
     #: the fixed per-call orchestration setup (comm-domain / worker prepare) is

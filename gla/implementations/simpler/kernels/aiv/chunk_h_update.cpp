@@ -10,10 +10,10 @@
  * INOUT tensor so the runtime serialises the recurrence across chunks.
  *
  * Args (Tensor*): [0]=KV [K,V] IN, [1]=decay [K,1] IN, [2]=S [K,V] INOUT,
- *                 [3]=s_snap [K,V] OUT;  scalar[0]=is_first, scalar[1]=D.
+ *                 [3]=s_snap [K,V] OUT;  scalar[0]=is_first, scalar[1]=dk, scalar[2]=dv.
  *
- * The state is [K,V] = [D,D] (K == V == head dim), so this stage is always square
- * in D even when C != D; one dim scalar (D) drives the {16,32,64,128} dispatch.
+ * The state is [K,V] = [dk,dv]; K (=dk) and V (=dv) are runtime scalars each
+ * dispatched over {16,32,64,128} (dk == dv reduces to the square case).
  */
 
 #include <cstdint>
@@ -83,23 +83,35 @@ static __aicore__ void update_impl(__gm__ float *kv, __gm__ float *decay, __gm__
     pipe_sync();
 }
 
+template <int K>
+static __aicore__ void update_by_v(int v, __gm__ float *kv, __gm__ float *decay,
+                                   __gm__ float *s, __gm__ float *ssnap, uint64_t is_first) {
+    switch (v) {
+    case 16:  update_impl<K, 16>(kv, decay, s, ssnap, is_first);   break;
+    case 32:  update_impl<K, 32>(kv, decay, s, ssnap, is_first);   break;
+    case 64:  update_impl<K, 64>(kv, decay, s, ssnap, is_first);   break;
+    default:  update_impl<K, 128>(kv, decay, s, ssnap, is_first);  break;
+    }
+}
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *kv = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *decay = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *s = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *ssnap = reinterpret_cast<__gm__ Tensor *>(args[3]);
     uint64_t is_first = static_cast<uint64_t>(args[4]);
-    int S = static_cast<int>(args[5]);  // head dim D (state is [D,D], always square)
+    int dk = static_cast<int>(args[5]);  // state rows (key dim)
+    int dv = static_cast<int>(args[6]);  // state cols (value dim)
 
     __gm__ float *kvp = reinterpret_cast<__gm__ float *>(kv->buffer.addr) + kv->start_offset;
     __gm__ float *decayp = reinterpret_cast<__gm__ float *>(decay->buffer.addr) + decay->start_offset;
     __gm__ float *sp = reinterpret_cast<__gm__ float *>(s->buffer.addr) + s->start_offset;
     __gm__ float *snapp = reinterpret_cast<__gm__ float *>(ssnap->buffer.addr) + ssnap->start_offset;
 
-    switch (S) {
-    case 16:  update_impl<16, 16>(kvp, decayp, sp, snapp, is_first);   break;
-    case 32:  update_impl<32, 32>(kvp, decayp, sp, snapp, is_first);   break;
-    case 64:  update_impl<64, 64>(kvp, decayp, sp, snapp, is_first);   break;
-    default:  update_impl<128, 128>(kvp, decayp, sp, snapp, is_first); break;
+    switch (dk) {
+    case 16:  update_by_v<16>(dv, kvp, decayp, sp, snapp, is_first);   break;
+    case 32:  update_by_v<32>(dv, kvp, decayp, sp, snapp, is_first);   break;
+    case 64:  update_by_v<64>(dv, kvp, decayp, sp, snapp, is_first);   break;
+    default:  update_by_v<128>(dv, kvp, decayp, sp, snapp, is_first);  break;
     }
 }
