@@ -244,7 +244,7 @@ class SimplerAllscan(AllscanImpl):
         self.host_dS = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
         self.host_dgamma = [torch.zeros((dk, 1), dtype=torch.float32).share_memory_() for _ in range(P)]
 
-    def _submit_iter(self, orch, handle, cfg, slot_off_floats):
+    def _submit_iter(self, orch, handle, cfg, slot_off_floats, bufs=None):
         """Submit one full P-rank forward AllScan into the given window slot.
 
         Args:
@@ -254,16 +254,20 @@ class SimplerAllscan(AllscanImpl):
             slot_off_floats: Offset (in floats) of this iteration's disjoint
                 recv+signal slot within the comm-domain scratch buffer — lets a
                 batch of iterations share one domain without racing.
+            bufs: Optional ``(host_s, host_g, host_out)`` per-rank buffer lists to
+                use instead of the shared ``self.host_*`` (for :meth:`run_multi`,
+                where each head/slot needs its own IO buffers).
         """
         Args = self._TaskArgs
         TT = self._TensorArgType
         mk = self._make_tensor_arg
+        host_s, host_g, host_out = bufs if bufs is not None else (self.host_s, self.host_g, self.host_out)
         for i in range(self.P):
             domain = handle[i]
             chip_args = Args()
-            chip_args.add_tensor(mk(self.host_s[i]), TT.INPUT)
-            chip_args.add_tensor(mk(self.host_g[i]), TT.INPUT)
-            chip_args.add_tensor(mk(self.host_out[i]), TT.OUTPUT_EXISTING)
+            chip_args.add_tensor(mk(host_s[i]), TT.INPUT)
+            chip_args.add_tensor(mk(host_g[i]), TT.INPUT)
+            chip_args.add_tensor(mk(host_out[i]), TT.OUTPUT_EXISTING)
             chip_args.add_tensor(
                 self._ContinuousTensor.make(
                     data=domain.buffer_ptrs["scratch"] + slot_off_floats * DTYPE_NBYTES,
@@ -281,7 +285,7 @@ class SimplerAllscan(AllscanImpl):
             chip_args.add_scalar(domain.device_ctx)
             orch.submit_next_level(self._cid, chip_args, cfg, worker=i)
 
-    def _submit_iter_backward(self, orch, handle, cfg, slot_off_floats):
+    def _submit_iter_backward(self, orch, handle, cfg, slot_off_floats, bufs=None):
         """Submit one full P-rank backward AllScan into the given window slot.
 
         Args:
@@ -290,18 +294,24 @@ class SimplerAllscan(AllscanImpl):
             cfg: The ``CallConfig`` for the submitted tasks.
             slot_off_floats: Offset (in floats) of this iteration's disjoint
                 recv+signal slot within the comm-domain scratch buffer.
+            bufs: Optional ``(gout, g, outprev, dS, dgamma)`` per-rank buffer lists
+                to use instead of the shared ``self.host_*`` (for
+                :meth:`run_multi_backward`).
         """
         Args = self._TaskArgs
         TT = self._TensorArgType
         mk = self._make_tensor_arg
+        gout, g, outprev, dS, dgamma = (
+            bufs if bufs is not None else
+            (self.host_gout, self.host_g, self.host_outprev, self.host_dS, self.host_dgamma))
         for i in range(self.P):
             domain = handle[i]
             chip_args = Args()
-            chip_args.add_tensor(mk(self.host_gout[i]), TT.INPUT)
-            chip_args.add_tensor(mk(self.host_g[i]), TT.INPUT)
-            chip_args.add_tensor(mk(self.host_outprev[i]), TT.INPUT)
-            chip_args.add_tensor(mk(self.host_dS[i]), TT.OUTPUT_EXISTING)
-            chip_args.add_tensor(mk(self.host_dgamma[i]), TT.OUTPUT_EXISTING)
+            chip_args.add_tensor(mk(gout[i]), TT.INPUT)
+            chip_args.add_tensor(mk(g[i]), TT.INPUT)
+            chip_args.add_tensor(mk(outprev[i]), TT.INPUT)
+            chip_args.add_tensor(mk(dS[i]), TT.OUTPUT_EXISTING)
+            chip_args.add_tensor(mk(dgamma[i]), TT.OUTPUT_EXISTING)
             chip_args.add_tensor(
                 self._ContinuousTensor.make(
                     data=domain.buffer_ptrs["scratch"] + slot_off_floats * DTYPE_NBYTES,
@@ -452,6 +462,97 @@ class SimplerAllscan(AllscanImpl):
         t0 = time.perf_counter()
         self.worker.run(orch_fn, args=None, config=self._CallConfig())
         return time.perf_counter() - t0
+
+    def _ensure_multi_bufs(self, H):
+        """Lazily allocate H sets of per-rank IO buffers for run_multi[_backward]."""
+        if getattr(self, "_mh_H", None) == H:
+            return
+        dk, dv, P = self.dk, self.dv, self.P
+
+        def _mk(shape):
+            return [[torch.zeros(shape, dtype=torch.float32).share_memory_() for _ in range(P)]
+                    for _ in range(H)]
+        self._mh_s = _mk((dk, dv))
+        self._mh_g = _mk((dk, 1))
+        self._mh_out = _mk((dk, dv))
+        self._mh_gout = _mk((dk, dv))
+        self._mh_outprev = _mk((dk, dv))
+        self._mh_dS = _mk((dk, dv))
+        self._mh_dgamma = _mk((dk, 1))
+        self._mh_H = H
+
+    def run_multi(self, S_locals_list, gammas_list, outputs_list):
+        """H forward AllScans (one per head) under ONE comm domain, disjoint slots.
+
+        Amortizes both the worker build (already persistent) and the comm-domain
+        alloc/free across the ``H`` heads: one ``worker.run`` allocates a single
+        ``H``-slot window and submits all heads, each reading its own IO buffers and
+        writing its own slot (the F7.5a multi-head boundary optimization). The
+        per-head slots are disjoint, so the ``H`` rings cannot race.
+
+        Args:
+            S_locals_list: ``H`` tensors of per-rank local state ``[P,dk,dv]``.
+            gammas_list: ``H`` tensors of per-rank decay ``[P,dk,1]``.
+            outputs_list: ``H`` tensors ``[P,dk,dv]`` filled in place with out[p].
+        """
+        assert self.worker is not None, "call build() first"
+        H = len(S_locals_list)
+        self._ensure_multi_bufs(H)
+        for h in range(H):
+            for i in range(self.P):
+                self._mh_s[h][i].copy_(S_locals_list[h][i])
+                self._mh_g[h][i].copy_(gammas_list[h][i])
+                self._mh_out[h][i].zero_()
+
+        def orch_fn(orch, _args, cfg):
+            with self._domain(orch, "allscan_multi", H) as handle:
+                for h in range(H):
+                    self._submit_iter(orch, handle, cfg, h * self._slot_floats,
+                                      bufs=(self._mh_s[h], self._mh_g[h], self._mh_out[h]))
+
+        self.worker.run(orch_fn, args=None, config=self._CallConfig())
+        for h in range(H):
+            for i in range(self.P):
+                outputs_list[h][i].copy_(self._mh_out[h][i])
+
+    def run_multi_backward(self, g_out_list, gammas_list, outs_list, dS_list, dgamma_list):
+        """H backward AllScans under ONE comm domain, disjoint slots (F7.5a).
+
+        Reverse-ring analogue of :meth:`run_multi`.
+
+        Args:
+            g_out_list: ``H`` tensors of upstream grad ``[P,dk,dv]``.
+            gammas_list: ``H`` tensors of per-rank decay ``[P,dk,1]``.
+            outs_list: ``H`` retained forward outputs ``[P,dk,dv]`` (for out_prev).
+            dS_list, dgamma_list: ``H`` output tensors filled in place.
+        """
+        assert self.worker is not None, "call build() first"
+        H = len(g_out_list)
+        self._ensure_multi_bufs(H)
+        for h in range(H):
+            for i in range(self.P):
+                self._mh_gout[h][i].copy_(g_out_list[h][i])
+                self._mh_g[h][i].copy_(gammas_list[h][i])
+                if i == 0:
+                    self._mh_outprev[h][i].zero_()
+                else:
+                    self._mh_outprev[h][i].copy_(outs_list[h][i - 1])
+                self._mh_dS[h][i].zero_()
+                self._mh_dgamma[h][i].zero_()
+
+        def orch_fn(orch, _args, cfg):
+            with self._domain(orch, "allscan_multi_bwd", H) as handle:
+                for h in range(H):
+                    self._submit_iter_backward(
+                        orch, handle, cfg, h * self._slot_floats,
+                        bufs=(self._mh_gout[h], self._mh_g[h], self._mh_outprev[h],
+                              self._mh_dS[h], self._mh_dgamma[h]))
+
+        self.worker.run(orch_fn, args=None, config=self._CallConfig())
+        for h in range(H):
+            for i in range(self.P):
+                dS_list[h][i].copy_(self._mh_dS[h][i])
+                dgamma_list[h][i].copy_(self._mh_dgamma[h][i])
 
     #: simpler amortizes the per-call comm-domain + drain overhead in measure().
     amortized_timing = True

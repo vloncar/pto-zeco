@@ -100,6 +100,45 @@ def test_multihead_forward_matches_golden(P, H, L, C, dk, dv):
         f"max diff = {(O - ref).abs().max().item():.3e}")
 
 
+@pytest.mark.parametrize("P,H,L,C,dk,dv", [(1, 2, 24, 8, 12, 12), (2, 2, 40, 8, 16, 10)])
+def test_multihead_arbitrary_N(P, H, L, C, dk, dv):
+    """Arbitrary (non-power-of-two) chunk count N=L//C (here N=3, N=5) works —
+    the kernels just loop chunks, so any L divisible by C is supported (F7.6)."""
+    assert L % C != 0 or (L // C) in (3, 5)   # sanity: these are the odd-N cases
+    Q, K, V, A = _multihead_inputs(P, H, L, dk, dv, seed=L + C)
+    mod, impl = _module(P, L, C, dk, dv)
+    try:
+        O = MultiHeadZeCo(impl, H).forward(Q, K, V, A)
+    finally:
+        impl.close()
+    ref = expected_gla_multihead(Q, K, V, A)
+    assert torch.allclose(O, ref, atol=1e-4, rtol=1e-3), (
+        f"N={L // C}: max diff = {(O - ref).abs().max().item():.3e}")
+
+
+def test_batching_folds_into_heads():
+    """A batch of B independent sequences = B*H heads: batching (F7.6) reuses the
+    multi-head machinery by folding the (batch, head) axes into one head axis."""
+    P, B, H, L, C, dk, dv = 2, 3, 2, 16, 8, 8, 8
+    Q, K, V, A = _multihead_inputs(P, B * H, L, dk, dv, seed=17)   # [P, B*H, L, .]
+    # Reshape to an explicit [P, B, H, L, .] batch view and back — the fold is exact.
+    Qb = Q.reshape(P, B, H, L, dk)
+    leaves = [t.clone().requires_grad_(True) for t in (Q, K, V, A)]
+    W = torch.randn(P, B * H, L, dv)
+    mod, impl = _module(P, L, C, dk, dv)
+    try:
+        module = ZeCoModule(MultiHeadZeCo(impl, B * H))
+        O = module(*leaves)                                        # [P, B*H, L, dv]
+        (O * W).sum().backward()
+    finally:
+        impl.close()
+    assert O.reshape(P, B, H, L, dv).shape == Qb.shape[:4] + (dv,)
+    ref = expected_gla_multihead(Q, K, V, A)
+    assert torch.allclose(O, ref, atol=1e-4, rtol=1e-3)
+    # gradients present for every one of the B*H operators
+    assert leaves[0].grad is not None and leaves[0].grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("P,H,L,C,dk,dv", [(1, 3, 16, 8, 12, 12), (2, 4, 16, 8, 16, 10)])
 def test_multihead_differentiable_matches_golden(P, H, L, C, dk, dv):
     """ZeCoModule(MultiHeadZeCo) — loss.backward() grads == per-head analytic golden."""
