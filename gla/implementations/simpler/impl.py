@@ -145,15 +145,26 @@ _SPECS = {"gate_cumsum": GATE_CUMSUM_SPEC, "chunk_h": CHUNK_H_SPEC, "chunk_o": C
 class _ComputeRunner:
     """Runs the GLA compute orchestrations on one device via the simpler L3 Worker.
 
-    Device/worker constraints (established empirically on this runtime):
-      * a device hosts one worker at a time (device-exclusive), and
-      * an L3 chip child binds to the first callable it runs — a *different*
-        callable on the same worker fails to stage.
-    So each kernel invocation stands up a fresh single-callable L3 worker
+    Each kernel invocation stands up a fresh single-callable L3 worker
     (``device_ids=[one]``, ``num_sub_workers=0``), submits one chip task via an
-    ``orch_fn`` (the AllScan launch pattern), and tears it down. The kernel
-    *compile* is session-cached, so only the (cheap) worker init/close repeats.
-    Tensors are staged through shared memory (the chip child is a subprocess).
+    ``orch_fn`` (the AllScan launch pattern), and tears it down. The kernel *compile*
+    is session-cached, so only the (cheap) worker init/close repeats. Tensors are
+    staged through shared memory (the chip child is a subprocess).
+
+    **This cycling is forced, not incidental** (re-measured 2026-07-22, F4.1). Two
+    runtime constraints combine:
+      * a device hosts one worker at a time (device-exclusive), and
+      * **an L3 chip child binds to the first callable it runs.** A second dispatch of
+        a *different* callable on the same worker does not raise — it silently returns
+        wrong data. Registering every callable up front (all pre-``init()``, which is
+        the supported ordering) does not help: the first dispatch is correct and the
+        next one is silently garbage. Registering post-``init()`` at least fails loudly
+        (``chip_process: run failed with code -1``).
+    Measured: a persistent multi-callable worker computes dQ/dK/dV correctly (~4e-7)
+    and dA at ``max_rel = 1.0`` — the reverse-cumsum is the 2nd ``gate_cumsum``
+    dispatch on an already-used worker. See
+    ``allscan/issues/simpler-second-callable-silent-corruption/``. Do not "optimise"
+    this into a persistent worker without re-checking that issue.
     """
 
     def __init__(self, device_id, platform):
@@ -180,6 +191,14 @@ class _ComputeRunner:
             shm.copy_(t.reshape(-1).to(dt))
             staged.append((t, shm, sig[i]))
 
+        def orch_fn_for(cid):
+            def orch_fn(orch, _args, cfg):
+                chip_args = TaskArgs()
+                for (_t, shm, d) in staged:
+                    chip_args.add_tensor(make_tensor_arg(shm), _tag[d])
+                orch.submit_next_level(cid, chip_args, cfg, worker=0)
+            return orch_fn
+
         key = f"{name}:{self.platform}:{self.device_id}"
         cc = _compile_chip_callable_from_spec(_SPECS[name], self.platform, RUNTIME, key)
         worker = Worker(level=3, device_ids=[self.device_id], num_sub_workers=0,
@@ -187,13 +206,7 @@ class _ComputeRunner:
         cid = worker.register(cc)
         worker.init()
         try:
-            def orch_fn(orch, _args, cfg):
-                chip_args = TaskArgs()
-                for (_t, shm, d) in staged:
-                    chip_args.add_tensor(make_tensor_arg(shm), _tag[d])
-                orch.submit_next_level(cid, chip_args, cfg, worker=0)
-
-            worker.run(orch_fn, args=None, config=CallConfig())
+            worker.run(orch_fn_for(cid), args=None, config=CallConfig())
         finally:
             worker.close()
 
@@ -203,6 +216,116 @@ class _ComputeRunner:
 
     def close(self):
         pass
+
+
+class _PersistentComputeRunner(_ComputeRunner):
+    """Holds ONE multi-callable L3 worker across many dispatches (steady-state path).
+
+    ``_ComputeRunner`` stands up and tears down a worker per kernel invocation, which
+    is what dominates this backend's per-call wall-clock (~35-43 s at P=2/4; ROADMAP
+    B5.3/F4). This variant pays that once and then only dispatches, so a benchmark can
+    report steady-state operator latency comparable to the pypto backend's.
+
+    Two runtime constraints shape the design, both re-verified on runtime ``9922afdb``
+    by ``scratchpad/probe_persistent_worker.py`` (2026-08-05):
+
+    * **Every ``share_memory_()`` buffer must exist before ``init()``.** ``init()``
+      eagerly forks the chip child, and a buffer allocated afterwards is invisible to
+      it (``run failed with code -1``). Hence the two-phase :meth:`prepare` (allocate +
+      register, no device work) / :meth:`open` (``init``) split, and why every dispatch
+      copies into the *same* buffers rather than allocating fresh ones.
+    * **A device hosts one worker at a time.** The AllScan boundary worker therefore
+      cannot coexist with these compute workers — callers must :meth:`close` around the
+      boundary phase and :meth:`open` again after. Reopening is still far cheaper than
+      the per-kernel cycling it replaces.
+
+    Multi-callable reuse was previously a silent-corruption trap
+    (``allscan/issues/simpler-second-callable-silent-corruption/``, runtime
+    ``a756969c``). It is re-checked end-to-end against ``expected_gla`` before this path
+    is used — see :meth:`SimplerZeCo._check_persistent`. Do not widen its use without
+    re-running that check.
+    """
+
+    def __init__(self, device_id, platform):
+        super().__init__(device_id, platform)
+        self._staged: dict[str, list] = {}
+        self._cids: dict[str, object] = {}
+        self._callables: dict[str, object] = {}
+        self._worker = None
+
+    def prepare(self, dispatches):
+        """Allocate every IO buffer and compile/hold every callable. No device work.
+
+        Args:
+            dispatches: ``(name, sig, named_tensors)`` triples — the same argument
+                lists :meth:`run` will later be called with (values are irrelevant
+                here; only shape/dtype/direction are captured).
+        """
+        from simpler_setup.scene_test import _compile_chip_callable_from_spec
+
+        for name, sig, named_tensors in dispatches:
+            staged = []
+            for i, (_lbl, t) in enumerate(named_tensors):
+                dt = torch.int64 if t.dtype == torch.int64 else torch.float32
+                shm = torch.zeros(t.numel(), dtype=dt).share_memory_()
+                staged.append((shm, sig[i]))
+            self._staged[name] = staged
+            key = f"{name}:{self.platform}:{self.device_id}"
+            self._callables[name] = _compile_chip_callable_from_spec(
+                _SPECS[name], self.platform, RUNTIME, key)
+
+    def open(self):
+        """Stand the worker up (registers all callables, then ``init``)."""
+        if self._worker is not None:
+            return
+        from simpler.worker import Worker
+
+        self._worker = Worker(level=3, device_ids=[self.device_id], num_sub_workers=0,
+                              platform=self.platform, runtime=RUNTIME)
+        for name, cc in self._callables.items():
+            self._cids[name] = self._worker.register(cc)
+        self._worker.init()
+
+    def run(self, name, sig, named_tensors):
+        """Dispatch ``name`` on the held worker, reusing its pre-allocated buffers."""
+        from simpler.task_interface import ArgDirection, CallConfig, TaskArgs, TensorArgType
+        from simpler_setup.torch_interop import make_tensor_arg
+
+        assert name in self._staged, f"{name} was not prepare()d on device {self.device_id}"
+        self.open()
+
+        D = ArgDirection
+        tag = {D.IN: TensorArgType.INPUT, D.OUT: TensorArgType.OUTPUT_EXISTING,
+               D.INOUT: TensorArgType.INOUT}
+        staged = self._staged[name]
+        assert len(staged) == len(named_tensors), (
+            f"{name}: prepared {len(staged)} args but dispatched {len(named_tensors)}")
+
+        for (shm, d), (_lbl, t) in zip(staged, named_tensors):
+            if d in (D.IN, D.INOUT):
+                shm.copy_(t.reshape(-1).to(shm.dtype))
+            else:
+                shm.zero_()
+
+        cid = self._cids[name]
+
+        def orch_fn(orch, _args, cfg):
+            chip_args = TaskArgs()
+            for (shm, d) in staged:
+                chip_args.add_tensor(make_tensor_arg(shm), tag[d])
+            orch.submit_next_level(cid, chip_args, cfg, worker=0)
+
+        self._worker.run(orch_fn, args=None, config=CallConfig())
+
+        for (shm, d), (_lbl, t) in zip(staged, named_tensors):
+            if d in (D.OUT, D.INOUT):
+                t.reshape(-1).copy_(shm.to(t.dtype))
+
+    def close(self):
+        if self._worker is not None:
+            self._worker.close()
+            self._worker = None
+            self._cids = {}
 
 
 class SimplerZeCo(ZeCoImpl):
@@ -250,6 +373,123 @@ class SimplerZeCo(ZeCoImpl):
         S_total = _S_total(s_snap, g_cs, K, V, L, C)
         return s_snap, g_cs, S_total
 
+    # ------------------------------------------------------------------
+    # Steady-state (amortized) path — see _PersistentComputeRunner.
+    # ------------------------------------------------------------------
+
+    def _persistent_dispatches(self):
+        """``(name, sig, named_tensors)`` templates for every kernel the forward runs.
+
+        Shapes/dtypes/directions only — the values are placeholders. Must list every
+        dispatch the forward will make, because all buffers have to exist before the
+        worker's ``init()`` forks the chip child.
+        """
+        L, dk, dv, N = self.L, self.dk, self.dv, self.N
+        z = torch.zeros
+        return [
+            ("gate_cumsum", GATE_CUMSUM_SPEC["orchestration"]["signature"],
+             [("tril", self._tril), ("g", z(L, dk)), ("g_cs", z(L, dk)),
+              ("config", self._config)]),
+            ("chunk_h", CHUNK_H_SPEC["orchestration"]["signature"],
+             [("k", z(L, dk)), ("v", z(L, dv)), ("g_cs", z(L, dk)),
+              ("s_snap", z(N, dk, dv)), ("config", self._config)]),
+            ("chunk_o", CHUNK_O_SPEC["orchestration"]["signature"],
+             [("q", z(L, dk)), ("k", z(L, dk)), ("v", z(L, dv)), ("g_cs", z(L, dk)),
+              ("s_snap", z(N, dk, dv)), ("tril", self._tril), ("o", z(L, dv)),
+              ("config", self._config)]),
+        ]
+
+    def _use_persistent_runners(self):
+        """Swap in prepared (not yet opened) persistent runners."""
+        runners = [_PersistentComputeRunner(d, self.platform) for d in self.device_ids]
+        dispatches = self._persistent_dispatches()
+        for r in runners:
+            r.prepare(dispatches)
+        self._runners = runners
+
+    def _use_plain_runners(self):
+        """Restore the per-kernel worker runners (the always-safe path)."""
+        for r in getattr(self, "_runners", []):
+            r.close()
+        self._runners = [_ComputeRunner(d, self.platform) for d in self.device_ids]
+
+    def _forward_persistent(self, Q, K, V, A):
+        """:meth:`forward` on held workers.
+
+        Identical to :meth:`forward` except the compute workers are closed around the
+        AllScan boundary — a device hosts one worker at a time, so the boundary's
+        distributed worker cannot coexist with them. Stage 2 reopens them.
+        """
+        P, L, C, dk, dv = self.P, self.L, self.C, self.dk, self.dv
+        s_snaps, g_css, S_totals = [], [], []
+        for p in range(P):
+            s_snap, g_cs, S_total = self._stage1(p, Q[p], K[p], V[p], A[p])
+            s_snaps.append(s_snap); g_css.append(g_cs); S_totals.append(S_total)
+
+        if P == 1:
+            S_recvs = [torch.zeros(dk, dv, dtype=torch.float32)]
+        else:
+            for r in self._runners:      # free the devices for the AllScan worker
+                r.close()
+            out = self._boundary(S_totals, A)
+            S_recvs = [torch.zeros(dk, dv, dtype=torch.float32) if p == 0 else out[p - 1]
+                       for p in range(P)]
+
+        O = torch.zeros(P, L, dv, dtype=torch.float32)
+        for p in range(P):
+            s_shift = _shift_snaps(s_snaps[p], A[p], S_recvs[p], L, C, dk)
+            O[p] = self._stage2(p, Q[p], K[p], V[p], g_css[p], s_shift)
+        return O
+
+    def measure(self, Q, K, V, A, n_iters):
+        """Steady-state per-forward latency, with a correctness gate on the fast path.
+
+        The persistent path reuses one multi-callable worker per device, which was a
+        silent-corruption trap on an older runtime
+        (``allscan/issues/simpler-second-callable-silent-corruption/``). So it is never
+        trusted blind: one persistent forward is checked against the per-kernel-worker
+        forward first, and any mismatch (or any error) falls back to the safe path with
+        ``amortized_timing`` left False, so the benchmark reports what it actually
+        measured.
+        """
+        import time
+        import warnings
+
+        self._use_plain_runners()
+        baseline = self.forward(Q, K, V, A)
+
+        try:
+            self._use_persistent_runners()
+            got = self._forward_persistent(Q, K, V, A)
+            err = (got - baseline).abs().max().item()
+        except Exception as exc:  # noqa: BLE001 — degrade to the safe path
+            warnings.warn(f"simpler: persistent-worker path unusable ({type(exc).__name__}: "
+                          f"{str(exc)[:120]}); timing the per-kernel path instead", stacklevel=2)
+            self._use_plain_runners()
+            return super().measure(Q, K, V, A, n_iters)
+
+        tol = 1e-3 * max(1.0, float(baseline.abs().max()))
+        if not (err < tol):
+            warnings.warn(f"simpler: persistent-worker forward disagrees with the per-kernel "
+                          f"forward (max_abs_err={err:.3e} > {tol:.1e}) — see "
+                          f"allscan/issues/simpler-second-callable-silent-corruption/; "
+                          f"timing the per-kernel path instead", stacklevel=2)
+            self._use_plain_runners()
+            return super().measure(Q, K, V, A, n_iters)
+
+        lat_ms = []
+        try:
+            for _ in range(n_iters):
+                t0 = time.perf_counter()
+                self._forward_persistent(Q, K, V, A)
+                lat_ms.append((time.perf_counter() - t0) * 1e3)
+        finally:
+            for r in self._runners:
+                r.close()
+
+        self.amortized_timing = True
+        return lat_ms
+
     def _stage2(self, p, Q, K, V, g_cs, s_shift):
         """Run chunk_o on rank p's device -> O [L,dv]."""
         L, dv = self.L, self.dv
@@ -268,11 +508,16 @@ class SimplerZeCo(ZeCoImpl):
     # the multi-head amortization (F7.4): build once, run per head, close once,
     # instead of a fresh HCCL distributed-worker build per head.
 
-    def _make_allscan(self):
-        """Build (and return) a SimplerAllscan worker; caller must close() it."""
+    def _make_allscan(self, multi_h=None):
+        """Build (and return) a SimplerAllscan worker; caller must close() it.
+
+        ``multi_h``: number of heads if the worker will drive ``run_multi`` /
+        ``run_multi_backward`` — the per-head share_memory buffers must be
+        allocated before the worker's eager chip-child fork (simpler #1397).
+        """
         from allscan.implementations.simpler.impl import SimplerAllscan
         allscan = SimplerAllscan()
-        allscan.build(self.dk, self.dv, 1, self.P, self.device_ids, self.platform)
+        allscan.build(self.dk, self.dv, 1, self.P, self.device_ids, self.platform, multi_h=multi_h)
         return allscan
 
     def _gammas(self, A):
@@ -516,7 +761,7 @@ class SimplerZeCo(ZeCoImpl):
             S_locals_list = [torch.stack(heads[h][2]) for h in range(H)]
             gammas_list = [self._gammas(A[:, h]) for h in range(H)]
             outs_list = [torch.zeros(P, dk, dv, dtype=torch.float32) for _ in range(H)]
-            allscan = self._make_allscan()
+            allscan = self._make_allscan(H)
             try:
                 allscan.run_multi(S_locals_list, gammas_list, outs_list)
             finally:
@@ -563,7 +808,7 @@ class SimplerZeCo(ZeCoImpl):
             S_locals_list = [torch.stack(HA[h][2]) for h in range(H)]
             gammas_list = [self._gammas(A[:, h]) for h in range(H)]
             outs_list = [torch.zeros(P, dk, dv, dtype=torch.float32) for _ in range(H)]
-            allscan = self._make_allscan()
+            allscan = self._make_allscan(H)
             try:
                 allscan.run_multi(S_locals_list, gammas_list, outs_list)
             finally:
@@ -612,7 +857,7 @@ class SimplerZeCo(ZeCoImpl):
             gammas_list = [self._gammas(A[:, h]) for h in range(H)]
             dS_list = [torch.zeros(P, dk, dv, dtype=torch.float32) for _ in range(H)]
             dgamma_list = [torch.zeros(P, dk, 1, dtype=torch.float32) for _ in range(H)]
-            allscan = self._make_allscan()
+            allscan = self._make_allscan(H)
             try:
                 allscan.run_multi_backward(g_out_list, gammas_list, outs_h, dS_list, dgamma_list)
             finally:
