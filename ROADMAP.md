@@ -282,12 +282,33 @@ rendezvous files hang the next run at rootinfo and `507018` on one config broke 
       `DistributedWorker` serves its fused program and is held across calls.
       `stage2` >> `stage1` for the same reason: it reopens the workers the boundary forced
       closed (device-exclusivity), not because `chunk_o` is slow.
-- [ ] **F6.4 — Decompose the last two blocks before quoting a comm number.** `as_run`
-      (2.4 s) and the `stage2` reopen (2.2 s) are still lumped. `as_run` at 2.4 s for a
-      `[32,32]` boundary exchange is not credible as pure comm — it likely carries per-run
-      HCCL sync — and it sits awkwardly against the earlier amortized AllScan result
-      (comm competitive, tied at P=4/128², [[allscan-amortized-benchmark]]). Do not claim
-      anything about relative comm cost until this is split.
+- [x] **F6.4 — Decomposed (2026-08-05, `scratchpad/f6_comm_breakdown.py`, P=2/L=128/C=D=32,
+      5 repeats each).** Both composites split by repeating the operation on a warm worker:
+
+      | | ms |
+      |---|---|
+      | gate_cumsum + chunk_h + chunk_o, **warm** | **6.0** (2.0 / 1.9 / 2.0) |
+      | boundary collective, **warm** | **135.9** (min 111.8; first run 2456.2) |
+      | AllScan worker build | 22740.0 |
+      | compute worker `open()` — the stage2 reopen tax | 2793.0 |
+      | AllScan first-run warmup | ~2320 |
+      | AllScan worker close | 1146.6 |
+
+      `as_run`'s 2.4 s **was** mostly first-run warmup (18x drop once warm), as suspected.
+      **But the conclusion changes:** stripping *all* worker lifecycle, simpler still costs
+      6.0 + 135.9 = **~142 ms/call vs pypto's 12.15 ms for its whole fused forward**. So:
+      - the hand-written **compute kernels are fast** — 6.0 ms, below pypto's entire call;
+      - the **collective is not competitive** at this config — 136 ms is ~11x pypto's whole
+        forward. The fused single-program design wins on the boundary, not on kernels.
+      - **99.5%** of simpler's as-implemented 29 s/call is worker lifecycle, which is a
+        runtime-integration artifact rather than a property of either implementation.
+
+      Caveat before quoting the 136 ms as "comm": it bundles host glue (`torch.stack`,
+      `_gammas`' per-rank prod over L tokens, shm staging) with dispatch and the HCCL
+      exchange. It is an *as-implemented boundary-phase* number, not wire time. It also
+      does not obviously contradict [[allscan-amortized-benchmark]] (comm tied at
+      P=4/128²) — different shape (32x32 here) and a different harness; reconcile the two
+      before drawing a general conclusion about AllScan comm.
 - [ ] **F6.5 — Realistic sizes** (`C=64/128`, `D=64/128`, `L` up to 1–4k): still blocked on
       **F3.1** (pypto tile-blocking; pypto caps at `C=32`).
 
