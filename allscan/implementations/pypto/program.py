@@ -47,14 +47,11 @@ def build_allscan_program(dk: int, dv: int, K: int, P: int):
                 # Store local output — capture return value (SSA: store returns updated ref)
                 S_out = pl.store(S_send_k, [offset_k, 0], S_out)
 
-                # Push block to peer
+                # Push block to peer. remote_store self-drains its MTE3 payload
+                # (trailing `pto.barrier <PIPE_ALL>` in the codegen, parity with
+                # pld.tile.put/get) so the notify below cannot overtake the store
+                # — the F1 data-before-signal race (PTOAS #872 / #744).
                 pld.tile.remote_store(S_send_k, target=dst, peer=peer_next, offsets=[offset_k, 0])
-
-                # Memory-ordering barrier: drain the MTE3 store pipe so the data
-                # is globally visible before the signal lands (Ascend 910B NoC is
-                # weakly ordered; without this the peer can observe the notify
-                # before the remote_store data — the producer-side race).
-                pld.system.fence()
 
                 # Notify peer (AtomicAdd matches the simpler reference kernel and
                 # is forward-compatible with epoch-based batching).
@@ -115,11 +112,9 @@ def build_allscan_program(dk: int, dv: int, K: int, P: int):
 
                 S_out = pl.store(S_send_k, [offset_k, 0], S_out)
 
+                # remote_store self-drains (see allscan_first_step) so the notify
+                # below cannot overtake this store — the F1 data-before-signal race.
                 pld.tile.remote_store(S_send_k, target=dst, peer=peer_next, offsets=[offset_k, 0])
-
-                # See allscan_first_step: fence before notify so data is visible
-                # before the signal on the weakly-ordered NoC.
-                pld.system.fence()
 
                 pld.system.notify(
                     target=signal,
@@ -237,9 +232,10 @@ def build_allscan_program(dk: int, dv: int, K: int, P: int):
             signal_buf = pld.alloc_window_buffer(K * 4)
 
             for r in pl.range(P):
-                # Pre-slice unconditionally so the compiler emits slice assignments
-                # before the if/elif/else — slices inside conditionals are not
-                # hoisted by the code generator and would produce a KeyError.
+                # Slice this rank's inputs ONCE, before the if/elif/else. Creating a
+                # slice/window inside a branch and consuming it there risks the
+                # cross-branch host-codegen miscompile that the fused stage2 hits
+                # (see fused_program.py / issues/pypto-crossbranch-phi-nameerror).
                 S_local_r = S_locals[r]
                 gamma_r = gammas[r]
                 output_r = outputs[r]

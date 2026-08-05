@@ -80,9 +80,8 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
                 msg_k = pl.tile.row_expand_mul(d_k, gamma_k)
                 pld.tile.remote_store(msg_k, target=dst, peer=peer_prev, offsets=[offset_k, 0])
 
-                # Drain the store pipe so the data is globally visible before the
-                # signal lands (weakly-ordered NoC; see forward program).
-                pld.system.fence()
+                # Data-before-signal ordering (pipe drain + DDR fence) is emitted
+                # by pypto's notify codegen, so it cannot be forgotten at a call site.
                 pld.system.notify(
                     target=signal,
                     peer=peer_prev,
@@ -153,7 +152,6 @@ def build_allscan_backward_program(dk: int, dv: int, K: int, P: int):
                 msg_out_k = pl.tile.row_expand_mul(d_k, gamma_k)
                 pld.tile.remote_store(msg_out_k, target=dst, peer=peer_prev, offsets=[offset_k, 0])
 
-                pld.system.fence()
                 pld.system.notify(
                     target=signal,
                     peer=peer_prev,
