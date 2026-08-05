@@ -63,6 +63,10 @@ static __aicore__ void prep_impl(__gm__ float *gcs, __gm__ float *gtot, __gm__ f
     pipe_barrier(PIPE_ALL);             // TCOLEXPAND lowers to a ubuf copy (not a pure
                                         // PIPE_V op); a PIPE_V-only barrier can let TSUB
                                         // read coeffT before the copy lands at S<128.
+                                        // Measured on a2a3 (see issues/tcolexpand-pipe-sync):
+                                        // PIPE_ALL is the ONLY correct barrier here —
+                                        // PIPE_V and PIPE_MTE3 give wrong values at C=32,
+                                        // and PIPE_MTE1 (pto-isa PR #212) faults the core.
     TSUB(coeffT, coeffT, gcsT);
     pipe_barrier(PIPE_V);
     TEXP(coeffT, coeffT);
