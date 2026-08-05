@@ -80,14 +80,12 @@ class PyPtoZeCo(ZeCoImpl):
         # children that leak if not closed).
         self.close()
 
-        # Host-side constant tiles for the chunk kernels: within-chunk lower-triangular ones
-        # (cumprod matmul), causal mask, two all-ones matrices to broadcast the per-chunk
-        # gamma without illegal 1-column tiles, and a zero S-init / rank-0 boundary. Shared
-        # so they can be passed to the reusable worker in place.
+        # Host-side constant tiles for the chunk kernels: the within-chunk lower-triangular
+        # ones matrix (it drives the cumprod matmul *and* is the causal mask — same values),
+        # and a zero S-init / rank-0 boundary. Shared so they can be passed to the reusable
+        # worker in place. (The two all-ones gamma-broadcast matrices are gone: the kernels
+        # now reduce with col_sum + row_expand_mul — see fused_program's F3.1 note.)
         self._tril = torch.tril(torch.ones(C, C, dtype=torch.float32)).share_memory_()
-        self._mask = torch.tril(torch.ones(C, C, dtype=torch.float32)).share_memory_()
-        self._ones_cc = torch.ones(C, C, dtype=torch.float32).share_memory_()
-        self._ones_cdv = torch.ones(C, dv, dtype=torch.float32).share_memory_()
         self._zero = torch.zeros(dk, dv, dtype=torch.float32).share_memory_()
 
         from pypto import ir
@@ -123,7 +121,7 @@ class PyPtoZeCo(ZeCoImpl):
         """Run one fused-forward dispatch on the prepared worker (inputs already staged)."""
         self._h_O.zero_()
         self._rt(self._h_Q, self._h_K, self._h_V, self._h_A, self._h_g,
-                 self._tril, self._mask, self._ones_cc, self._ones_cdv, self._zero, self._h_O)
+                 self._tril, self._zero, self._h_O)
 
     def forward(self, Q, K, V, A):
         """ZeCO forward; args/return as in :meth:`gla.common.ZeCoImpl.forward`."""
@@ -136,8 +134,7 @@ class PyPtoZeCo(ZeCoImpl):
         gammas = A.prod(dim=1).reshape(self.P, self.dk, 1)
         O = torch.zeros((self.P, self.L, self.dv), dtype=torch.float32)
         run_fused_forward(
-            self._compiled, Q, K, V, A, gammas,
-            self._tril, self._mask, self._ones_cc, self._ones_cdv, self._zero, O,
+            self._compiled, Q, K, V, A, gammas, self._tril, self._zero, O,
             platform=self.platform, device_ids=self.device_ids,
         )
         return O

@@ -31,8 +31,26 @@ the uniform ``[P, ...]`` entry and stays a distributed program (same ``prepare``
 the single-trip ``for r in pl.range(1)`` folds ``r`` → 0 in the ``device=`` attr; before that
 fix codegen emitted an unbound ``r__idx_v0`` → NameError). Use :func:`run_fused_forward`, which
 also falls back to a non-distributed single-device run if a config compiles P=1 without a HOST
-orchestrator (entry then = stage2's own signature ``(Q, Kmat, Vmat, A, tril, mask, ones_cc,
-ones_cdv, Srecv, O)``).
+orchestrator (entry then = stage2's own signature ``(Q, Kmat, Vmat, A, tril, Srecv, O)``).
+
+**Vec-buffer budget (F3.1).** Both chunk kernels keep the whole per-chunk working set live in
+the 184 KB vector buffer, so `C` used to cap at 32 (`C=64` needed 200704 B). Three tiles were
+pure scaffolding and are gone:
+
+* ``mask`` was bit-identical to ``tril`` (both ``torch.tril(ones(C, C))``) — one ``[C, C]``
+  tile now serves the within-chunk cumprod matmul *and* the causal mask.
+* ``ones_cc``/``ones_cdv`` existed only to broadcast the whole-chunk decay
+  ``gamma[i] = prod_c A[c, i]`` into ``[C, DK]`` and ``[DK, DV]`` via matmul, because a
+  ``[·, 1]`` matmul operand is illegal. ``pl.tile.col_sum`` + ``reshape`` produces that
+  ``[DK, 1]`` vector directly, and ``pl.tile.row_expand_mul`` broadcasts it.
+* The state update then factors, exactly as the torch reference writes it
+  (``S = gamma[:, None] * S + (k * (gamma / b)).t() @ v``)::
+
+      S_new = gamma * (S + (K/b)^T @ V)      # one row_expand_mul, was two [DK, DV] tiles
+
+  which also drops ``kbar``, so ``(K/b)^T`` is now shared with the ``scores`` matmul.
+
+Net: 5 fewer live tiles, 2 fewer matmuls and 1 fewer transpose per chunk.
 
 **P=1 and P>1 MUST be built by separate factory functions** (not one class with an
 ``if P == 1:`` branch): conditionally-defined methods in a ``@pl.program`` class body are
@@ -49,20 +67,20 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 
-def run_fused_forward(compiled, Q, K, V, A, gammas, tril, mask, ones_cc, ones_cdv, zero, O,
+def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
                       *, platform, device_ids):
     """Run a compiled fused-forward program, hiding the P==1 vs P>1 run-API split.
 
     P>1 compiles to a distributed program (``prepare``/``rt``/``close``, share-memory
     tensors). P==1 has no communication, so pypto compiles it to a plain single-device
     ``CompiledProgram`` whose entry is stage2's own signature
-    ``(Q, Kmat, Vmat, A, tril, mask, ones_cc, ones_cdv, Srecv, O)`` — run directly with the
-    rank-0 slices and ``zero`` as ``Srecv``. Writes results in place into ``O`` (``[P, L, dv]``).
+    ``(Q, Kmat, Vmat, A, tril, Srecv, O)`` — run directly with the rank-0 slices and
+    ``zero`` as ``Srecv``. Writes results in place into ``O`` (``[P, L, dv]``).
     """
     if hasattr(compiled, "prepare"):
         def sm(t):
             return t if t.is_shared() else t.clone().share_memory_()
-        h = [sm(t) for t in (Q, K, V, A, gammas, tril, mask, ones_cc, ones_cdv, zero)]
+        h = [sm(t) for t in (Q, K, V, A, gammas, tril, zero)]
         h_O = sm(O)
         rt = compiled.prepare()
         try:
@@ -74,7 +92,7 @@ def run_fused_forward(compiled, Q, K, V, A, gammas, tril, mask, ones_cc, ones_cd
         return O
     # P==1: non-distributed single-device program, entry = stage2 signature (rank-0 slices).
     from pypto.runtime.runner import RunConfig
-    compiled(Q[0], K[0], V[0], A[0], tril, mask, ones_cc, ones_cdv, zero, O[0],
+    compiled(Q[0], K[0], V[0], A[0], tril, zero, O[0],
              config=RunConfig(platform=platform, device_id=device_ids[0]))
     return O
 
@@ -100,17 +118,11 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            mask: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, DV], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ mask)@V_n; carry S from Srecv."""
+            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv."""
             tril_t = pl.load(tril, [0, 0], [C, C])
-            mask_t = pl.load(mask, [0, 0], [C, C])
-            ones_cc_t = pl.load(ones_cc, [0, 0], [C, C])
-            ones_cdv_t = pl.load(ones_cdv, [0, 0], [C, DV])
             s_init = pl.load(Srecv, [0, 0], [DK, DV])
             out = O
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
@@ -121,20 +133,18 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
                 a = pl.load(A, [off, 0], [C, DK])
                 la = pl.log(a)
                 b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                g_row_full = pl.exp(pl.matmul(ones_cc_t, la, out_dtype=pl.FP32))
-                g_full = pl.exp(pl.matmul(pl.transpose(la, 0, 1), ones_cdv_t, out_dtype=pl.FP32))
+                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
                 qt = pl.mul(q, b)
                 kb = pl.div(k, b)
-                scores = pl.mul(pl.matmul(qt, pl.transpose(kb, 0, 1), out_dtype=pl.FP32), mask_t)
+                kbt = pl.transpose(kb, 0, 1)
+                scores = pl.mul(pl.matmul(qt, kbt, out_dtype=pl.FP32), tril_t)
                 o_intra = pl.matmul(scores, v, out_dtype=pl.FP32)
                 s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul (raw iter_arg stays in vec)
                 o_inter = pl.matmul(qt, s_run_v, out_dtype=pl.FP32)
                 o_n = pl.add(o_inter, o_intra)
                 out = pl.store(o_n, [off, 0], out)
-                kbar = pl.mul(kb, g_row_full)
-                kv = pl.matmul(pl.transpose(kbar, 0, 1), v, out_dtype=pl.FP32)
-                s_scaled = pl.mul(s_run, g_full)
-                s_new = pl.add(s_scaled, kv)
+                kv = pl.matmul(kbt, v, out_dtype=pl.FP32)
+                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
                 s_run = pl.yield_(s_new)
             return out
 
@@ -146,13 +156,10 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            mask: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, DV], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            return self.gla_stage2(Q, Kmat, Vmat, A, tril, mask, ones_cc, ones_cdv, Srecv, O)
+            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, O)
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
@@ -163,9 +170,6 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
             A: pl.Tensor[[P, L, dk], pl.FP32],
             gammas: pl.Tensor[[P, dk, 1], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            mask: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, dv], pl.FP32],
             zero: pl.Tensor[[dk, dv], pl.FP32],
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
@@ -176,8 +180,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
                 V_r = Vmat[r]
                 A_r = A[r]
                 O_r = O[r]
-                self.chip_orch_stage2(
-                    Q_r, K_r, V_r, A_r, tril, mask, ones_cc, ones_cdv, zero, O_r, device=r)
+                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, zero, O_r, device=r)
             return O
 
     return FusedForwardP1Program
@@ -215,14 +218,10 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, DV], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ) -> pl.Tensor[[DK, DV], pl.FP32]:
             tril_t = pl.load(tril, [0, 0], [C, C])
-            ones_cc_t = pl.load(ones_cc, [0, 0], [C, C])
-            ones_cdv_t = pl.load(ones_cdv, [0, 0], [C, DV])
             s_init = pl.load(zero, [0, 0], [DK, DV])
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
@@ -231,13 +230,10 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 a = pl.load(A, [off, 0], [C, DK])
                 la = pl.log(a)
                 b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                g_row_full = pl.exp(pl.matmul(ones_cc_t, la, out_dtype=pl.FP32))
-                g_full = pl.exp(pl.matmul(pl.transpose(la, 0, 1), ones_cdv_t, out_dtype=pl.FP32))
+                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
                 kb = pl.div(k, b)
-                kbar = pl.mul(kb, g_row_full)
-                kv = pl.matmul(pl.transpose(kbar, 0, 1), v, out_dtype=pl.FP32)
-                s_scaled = pl.mul(s_run, g_full)
-                s_new = pl.add(s_scaled, kv)
+                kv = pl.matmul(pl.transpose(kb, 0, 1), v, out_dtype=pl.FP32)
+                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
                 s_fin = pl.yield_(s_new)
             # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
             # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
@@ -261,12 +257,10 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, DV], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ) -> pl.Tensor[[DK, DV], pl.FP32]:
-            return self.gla_stage1(A, Kmat, Vmat, tril, ones_cc, ones_cdv, zero, Stot)
+            return self.gla_stage1(A, Kmat, Vmat, tril, zero, Stot)
 
         # ---- phase 3: chunk-recurrent GLA stage2 (output from boundary S_recv) ----
         @pl.function(type=pl.FunctionType.InCore)
@@ -277,17 +271,11 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            mask: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, DV], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ mask)@V_n; carry S from Srecv."""
+            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv."""
             tril_t = pl.load(tril, [0, 0], [C, C])
-            mask_t = pl.load(mask, [0, 0], [C, C])
-            ones_cc_t = pl.load(ones_cc, [0, 0], [C, C])
-            ones_cdv_t = pl.load(ones_cdv, [0, 0], [C, DV])
             s_init = pl.load(Srecv, [0, 0], [DK, DV])
             out = O
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
@@ -298,20 +286,18 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 a = pl.load(A, [off, 0], [C, DK])
                 la = pl.log(a)
                 b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                g_row_full = pl.exp(pl.matmul(ones_cc_t, la, out_dtype=pl.FP32))
-                g_full = pl.exp(pl.matmul(pl.transpose(la, 0, 1), ones_cdv_t, out_dtype=pl.FP32))
+                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
                 qt = pl.mul(q, b)
                 kb = pl.div(k, b)
-                scores = pl.mul(pl.matmul(qt, pl.transpose(kb, 0, 1), out_dtype=pl.FP32), mask_t)
+                kbt = pl.transpose(kb, 0, 1)
+                scores = pl.mul(pl.matmul(qt, kbt, out_dtype=pl.FP32), tril_t)
                 o_intra = pl.matmul(scores, v, out_dtype=pl.FP32)
                 s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul (raw iter_arg stays in vec)
                 o_inter = pl.matmul(qt, s_run_v, out_dtype=pl.FP32)
                 o_n = pl.add(o_inter, o_intra)
                 out = pl.store(o_n, [off, 0], out)
-                kbar = pl.mul(kb, g_row_full)
-                kv = pl.matmul(pl.transpose(kbar, 0, 1), v, out_dtype=pl.FP32)
-                s_scaled = pl.mul(s_run, g_full)
-                s_new = pl.add(s_scaled, kv)
+                kv = pl.matmul(kbt, v, out_dtype=pl.FP32)
+                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
                 s_run = pl.yield_(s_new)
             return out
 
@@ -323,13 +309,10 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            mask: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, DV], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            return self.gla_stage2(Q, Kmat, Vmat, A, tril, mask, ones_cc, ones_cdv, Srecv, O)
+            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, O)
 
         # ---- phase 2: AllScan ring (first/middle/last), emitting S_recv ----
         @pl.function(type=pl.FunctionType.InCore)
@@ -433,9 +416,6 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             A: pl.Tensor[[P, L, dk], pl.FP32],
             gammas: pl.Tensor[[P, dk, 1], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
-            mask: pl.Tensor[[C, C], pl.FP32],
-            ones_cc: pl.Tensor[[C, C], pl.FP32],
-            ones_cdv: pl.Tensor[[C, dv], pl.FP32],
             zero: pl.Tensor[[dk, dv], pl.FP32],
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
@@ -461,8 +441,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 dst = pld.window(dst_buf, [dk, dv], dtype=pl.FP32)
                 signal = pld.window(signal_buf, [K, 1], dtype=pl.INT32)
 
-                sl_r = self.chip_orch_stage1(
-                    A_r, K_r, V_r, tril, ones_cc, ones_cdv, zero, S_local_r, device=r)
+                sl_r = self.chip_orch_stage1(A_r, K_r, V_r, tril, zero, S_local_r, device=r)
 
                 # The ring picks this rank's boundary: rank 0 has none (S_recv = 0), the
                 # others take the received out[r-1]. stage2 then consumes the merged value
@@ -481,8 +460,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                     boundary = self.chip_orch_middle(
                         sl_r, gamma_r, S_recv_r, dst, signal, r + 1, device=r)
 
-                self.chip_orch_stage2(
-                    Q_r, K_r, V_r, A_r, tril, mask, ones_cc, ones_cdv, boundary, O_r, device=r)
+                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, boundary, O_r, device=r)
             return O
 
     return FusedForwardProgram

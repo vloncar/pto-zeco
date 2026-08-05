@@ -143,9 +143,44 @@ Both backends were single-size only; the fair benchmark needs them at a *shared*
   `[C,D]`, `[D,D]` tiles (no blocking), so `C=64` overflows the 184 KB vec-buffer limit
   ("Vec buffer usage exceeds platform limit"). `D=64` fits only because `C` drives the
   `[C,C]` tiles.
-  - [ ] **F3.1 (pypto tiling):** Block/tile the chunk kernels (stage1, stage2) so `C` and `D`
-        scale independently under the vec-buffer budget; keep the loop-carry detach +
-        gamma-broadcast tricks.
+  - [x] **F3.1 (pypto) — `C=32` → `C=64, D=64`, by deleting scaffolding rather than tiling.**
+        The premise ("needs blocking") turned out to be wrong for the first 4x: three of the
+        live tiles were not algorithm, they were workarounds.
+    - `mask` was bit-identical to `tril` (both `torch.tril(ones(C, C))`) — one `[C, C]`
+          tile now serves the cumprod matmul *and* the causal mask.
+    - `ones_cc` / `ones_cdv` existed only to broadcast the whole-chunk decay
+          `gamma[i] = prod_c A[c,i]` via matmul, because a `[·, 1]` matmul operand is illegal.
+          `pl.tile.col_sum` + `reshape` yields that `[DK, 1]` vector directly and
+          `pl.tile.row_expand_mul` broadcasts it — no `[C, C]` / `[C, DV]` constant, no matmul.
+    - The state update then factors exactly as the torch reference already writes it
+          (`S = gamma[:,None] * S + (k*(gamma/b)).t() @ v`), i.e.
+          `S_new = gamma * (S + (K/b)^T @ V)`. That drops `kbar`, `g_row_full`, `g_full` and
+          `s_scaled`, and lets `(K/b)^T` be shared with the `scores` matmul.
+    - Net **5 fewer live tiles, 2 fewer matmuls, 1 fewer transpose per chunk**, and a ~35%
+          smaller vector footprint at every shape (`scratchpad/f31_compile_probe.py` reports
+          peak per-space usage by parsing the `AllocateMemoryAddr` dump):
+
+          | L, C, D | stage2 Vec before | after |
+          |---|---|---|
+          | 128, 32, 32 | 69632 B (37%) | 45184 B (24%) |
+          | 128, 32, 64 | 184320 B (98%) | 135424 B (72%) |
+          | 128, 64, 32 | overflow — FAIL | 135296 B (72%) |
+          | 256, 64, 64 | overflow — FAIL | 180480 B (96%) |
+
+        Correct on a2a3sim at all 5 P=1 configs incl. the new `C=D=64` (P>=2 is blocked on
+        sim by a *pre-existing, unrelated* break — see F3.6). Covered by
+        `test_pypto_gla.py::test_pypto_zeco_sizes`.
+  - [ ] **F3.1b — beyond `C=64, D=64` genuinely needs blocking.** `C=D=64` sits at **96%** of
+        the 188416 B vector buffer, so it is the last shape reachable by tidying; every next
+        step overflows by 3-4x, and `C=128` / `D=128` *also* blow the 65536 B cube `Left`/
+        `Right` operand buffers. The live set is dominated by 5 `[DK, DV]` state tiles and
+        5-6 `[C, DK]` row tiles, so:
+    - **DV blocking alone is not enough** — at `DK=128` the `[C, DK]` family alone is
+          ~164 KB of the 184 KB budget.
+    - **DK blocking is therefore required**, and `o_inter = qt @ S` and
+          `scores = qt @ (K/b)^T` both contract over `DK` — so partials must be summed in the
+          **vector unit**, exactly the design F3.4 landed on for simpler (fp32 cube
+          K-accumulation is broken on a2a3). Same design serves both backends.
 - **simpler** — the 6 incore kernels had `TILE=128` hard-coded (never ran at any other size;
   the `507018`/nan at `C=32` was OOB from 128-sized tiles on 32-sized buffers).
   - [x] **F3.2 — Phase 1 (square `C==D`, sizes `{16,32,64,128}`) — DONE, HW-validated.** Each incore
@@ -197,7 +232,18 @@ Both backends were single-size only; the fair benchmark needs them at a *shared*
           Also worth a retry: fp32 `BK=64` ping-pong with `flash_atten`'s deferred sync (the 507018
           may be my inline `M`-drain, not a fundamental limit).
     - Still shares the tile-blocking need with pypto's ceiling below (head dim 256).
-- [ ] pypto still needs the tile-blocking above (F3.1) to reach `C>32`.
+- [x] pypto reaches `C=64, D=64` (F3.1); past that it needs the real blocking of F3.1b.
+- [ ] **F3.6 — a2a3sim cannot compile ANY pypto distributed (P>=2) program right now.**
+      Found while validating F3.1; **pre-existing and unrelated** — the pristine pre-F3.1
+      tree fails identically. pto-isa's CPU stub leaks a bare
+      `#define SINGLE_CACHE_LINE 0` (`include/pto/common/cpu_stub.hpp:93`) with no
+      `cache_line_t` type, while PTOAS emits the *qualified*
+      `dcci(ptr, cache_line_t::SINGLE_CACHE_LINE)` — which the macro rewrites to
+      `cache_line_t::0`, so `allscan_first_step.cpp` fails to compile. HW is unaffected
+      (bisheng provides the real `cache_line_t`). Fix belongs in the stub: declare an
+      unscoped `enum cache_line_t { ENTIRE_DATA_CACHE, SINGLE_CACHE_LINE, ... }` (unscoped
+      keeps pto-isa's own unqualified uses working) instead of `#define`-ing the members.
+      Worth filing upstream — a public header should not leak `SINGLE_CACHE_LINE` as a macro.
 - [x] **F3.5 —** Larger-shape correctness sweep for **simpler** (`test_simpler_gla.py --sweep`): 8 curated
       shapes (square + rectangular `C≠D`, `C,D∈{16,32,64,128}`, larger `L` → `N` up to 16) all
       HW-pass P=1 (~1e-7), plus P=2 rect `C=64/D=128` with real AllScan. pypto still capped at
