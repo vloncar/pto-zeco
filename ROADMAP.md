@@ -311,6 +311,43 @@ rendezvous files hang the next run at rootinfo and `507018` on one config broke 
       before drawing a general conclusion about AllScan comm.
 - [ ] **F6.5 — Realistic sizes** (`C=64/128`, `D=64/128`, `L` up to 1–4k): still blocked on
       **F3.1** (pypto tile-blocking; pypto caps at `C=32`).
+- [ ] **F6.6 — Work-placement parity: simpler runs part of the algorithm on the HOST, pypto
+      does not.** Raised 2026-08-05; a gap in this roadmap's own definition of "fair", which
+      until now only ever meant *same problem size* (F3), *steady-state timing* (F4/F5) and
+      *verified correctness*. Nothing tracked **where the work runs**.
+
+      simpler's forward computes on host, per rank per call:
+      - `_S_total` — `exp(g_total)*s_snap[-1] + k_rest^T @ v_last`, i.e. a real matmul plus
+        two `exp` broadcasts;
+      - `_shift_snaps` — the boundary shift across all chunks, including a `cumprod`;
+      - `_gammas` — the decay product over all `L` tokens.
+
+      The backward is further out: its own comments call the cross-chunk grad recurrence,
+      the gate arithmetic and the reverse-cumsum "the cheap host linear glue". pypto does
+      all of it **on device** inside the fused program.
+
+      Not negligible: stage1 measured **13.3 ms** for two ranks while its warm kernels
+      account for only **7.8 ms** (2 x (2.0 + 1.9)) — leaving **~5.5 ms on the host**,
+      comparable to the kernel time itself. (Subtraction across two runs; measure directly.)
+
+      **What this does and does not invalidate.** The F6 end-to-end numbers stand — host glue
+      runs inside the measured wall-clock for both backends, so 29 s vs 12.15 ms is a valid
+      *operator-as-implemented* comparison. What breaks is any **kernel-vs-kernel or
+      compute-vs-comm claim**, including the "simpler compute = 6.0 ms" figure in F6.4, which
+      counted device dispatches only and dropped the host portion.
+
+      Two ways to close it:
+      1. **Port the glue on-device** — extend the simpler kernels so `S_total`, the snapshot
+         shift and the gamma products run in-core. Real parity, and it removes host
+         round-trips from the critical path. Touches the hand-written kernels, so sequence it
+         after **F3.1** (same code).
+      2. **Scope the claim** — keep the split, define simpler's "compute" as device + host,
+         and never quote the device-only number. Cheap and honest, but leaves the two
+         implementations doing structurally different work, so "hand-written vs generated
+         kernels" stays unanswerable.
+
+      Only (1) delivers what this section set out to compare. Until one is done, **do not
+      publish a compute-vs-comm split** (see also F6.4's caveat on the 136 ms).
 
 ### F7 — Generalization (stretch, for "general-purpose")
 - [x] **F7.1 — `dk != dv` for simpler** (DONE 2026-07-10, HW-validated). The three GLA dims are now
