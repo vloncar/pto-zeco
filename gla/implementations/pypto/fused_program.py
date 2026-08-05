@@ -16,9 +16,12 @@ rank ``r`` (device ``r``) the single ``host_orch`` runs three phases:
    historically only survived ``@pl.jit``; running it as a distributed chip kernel here is
    the point of the fusion.
 
-stage2 is dispatched **inside each first/middle/last branch** (never after the ``if/else``
-merge) so a threaded ref is consumed within its branch — a cross-branch phi of a ref trips
-the host codegen (KeyError ``*__phi_*``).
+stage2 is dispatched **once, after the ``if/elif/else`` merge**, consuming the boundary phi
+(``zero`` for rank 0 vs the ring's returned ``out[r-1]`` for middle/last). That cross-branch phi
+used to miscompile the host orchestrator — ``ir.compile`` clean, then ``NameError:
+zero__ssa_v0 not defined`` in the generated ``host_orch.py`` at ``prepare()`` — which forced a
+dispatch-inside-every-branch workaround. Fixed upstream by pypto PR #2183 (merged 2026-07-30),
+so the workaround is gone; see ``issues/pypto-crossbranch-phi-nameerror/``.
 
 **P == 1** is a native path (:func:`_build_p1_forward_program`): a single rank has no
 communication at all, so there is no ring and stage1 is dead (its ``S_total`` only feeds the
@@ -236,12 +239,19 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 s_scaled = pl.mul(s_run, g_full)
                 s_new = pl.add(s_scaled, kv)
                 s_fin = pl.yield_(s_new)
-            # NOTE (F2, pypto-chunk-loopcarry-nbug): reading the loop-carry final value
-            # here miscompiles for N>2 under this heavy body in the multi-rank context.
-            # A per-iteration output store (stage2's pattern) is a PARTIAL mitigation
-            # (lifts P=2's threshold N>=4 -> N>=8) but does NOT fix the bigger bench
-            # configs (P=4, C=32 still wrong at N=4), so it is not applied. Realistic
-            # large-N needs the upstream pypto distributed loop-carry codegen fix.
+            # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
+            # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
+            # two directions of a bidirectional cube<->vector TPipe indexed the SAME GM slots
+            # (the per-direction entryOffset the ISA reference specifies is never applied), so
+            # the cube's matmul results and the vector's operands overwrote each other. The
+            # loop-carried state was simply the visible victim.
+            # Fixed by two upstream-bound diffs (carried locally):
+            #   pto-isa: set the V2C entry offset in the TPipe ctor for DIR_BOTH
+            #   pypto:   size the GM pipe workspace for BOTH rings, honour slot_num
+            # With those, stock ring depth, the fused forward is 12/12 at C=16 and 12/12 at
+            # C=32. See allscan/issues/pypto-incore-loop-cube-vector-race/ROOT-CAUSE.md.
+            # (The post-loop carry read below is fine and always was: swapping it for a
+            # per-iteration store left the old failures bit-identical.)
             return pl.store(s_fin, [0, 0], Stot)
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -336,7 +346,6 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 S_send_k = pl.load(S_local, [offset_k, 0], [BLOCK, dv])
                 S_out = pl.store(S_send_k, [offset_k, 0], S_out)
                 pld.tile.remote_store(S_send_k, target=dst, peer=peer_next, offsets=[offset_k, 0])
-                pld.system.fence()
                 pld.system.notify(target=signal, peer=peer_next, offsets=[kk, 0], value=1, op=pld.NotifyOp.AtomicAdd)
             return S_out
 
@@ -362,7 +371,6 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 scaled_recv_k = pl.tile.row_expand_mul(S_recv_k, gamma_k)
                 S_send_k = pl.tile.add(S_local_k, scaled_recv_k)
                 pld.tile.remote_store(S_send_k, target=dst, peer=peer_next, offsets=[offset_k, 0])
-                pld.system.fence()
                 pld.system.notify(target=signal, peer=peer_next, offsets=[kk, 0], value=1, op=pld.NotifyOp.AtomicAdd)
             return S_recv
 
@@ -432,8 +440,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
             """Per rank r on device r: stage1 -> ring (first/middle/last, emitting S_recv)
-            -> stage2 reading S_recv (zero for rank 0). stage2 dispatched inside each branch
-            so its threaded S_recv ref is consumed within-branch (no cross-branch phi)."""
+            -> stage2 reading S_recv (zero for rank 0), dispatched once after the merge."""
             dst_buf = pld.alloc_window_buffer(dk * dv * 4)
             signal_buf = pld.alloc_window_buffer(K * 4)
             S_local = pl.create_tensor([P, dk, dv], dtype=pl.FP32)     # stage1 local S_total (ring input)
@@ -441,7 +448,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             S_recv_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)  # received boundary out[r-1] per rank
 
             for r in pl.range(P):
-                # Pre-slice unconditionally (slices inside conditionals are not hoisted).
+                # Slice this rank's inputs once, before the if/elif/else.
                 Q_r = Qmat[r]
                 K_r = Kmat[r]
                 V_r = Vmat[r]
@@ -457,20 +464,25 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 sl_r = self.chip_orch_stage1(
                     A_r, K_r, V_r, tril, ones_cc, ones_cdv, zero, S_local_r, device=r)
 
+                # The ring picks this rank's boundary: rank 0 has none (S_recv = 0), the
+                # others take the received out[r-1]. stage2 then consumes the merged value
+                # ONCE, after the if/elif/else — the natural way to write this.
+                # (Until pypto PR #2183 this cross-branch phi — an input tensor `zero` in one
+                # branch vs an Orchestration SSA result in the others — miscompiled the host
+                # orchestrator into an out-of-scope name: `NameError: zero__ssa_v0 not
+                # defined` at prepare(). That fix is merged, so the workaround of dispatching
+                # stage2 inside every branch is gone. See issues/pypto-crossbranch-phi-nameerror/.)
                 if r == 0:
                     self.chip_orch_first(sl_r, S_out_r, dst, signal, r + 1, device=r)
-                    # rank 0 has no boundary: S_recv = 0
-                    self.chip_orch_stage2(
-                        Q_r, K_r, V_r, A_r, tril, mask, ones_cc, ones_cdv, zero, O_r, device=r)
+                    boundary = zero
                 elif r == P - 1:
-                    rv_r = self.chip_orch_last(sl_r, gamma_r, S_recv_r, dst, signal, device=r)
-                    self.chip_orch_stage2(
-                        Q_r, K_r, V_r, A_r, tril, mask, ones_cc, ones_cdv, rv_r, O_r, device=r)
+                    boundary = self.chip_orch_last(sl_r, gamma_r, S_recv_r, dst, signal, device=r)
                 else:
-                    rv_r = self.chip_orch_middle(
+                    boundary = self.chip_orch_middle(
                         sl_r, gamma_r, S_recv_r, dst, signal, r + 1, device=r)
-                    self.chip_orch_stage2(
-                        Q_r, K_r, V_r, A_r, tril, mask, ones_cc, ones_cdv, rv_r, O_r, device=r)
+
+                self.chip_orch_stage2(
+                    Q_r, K_r, V_r, A_r, tril, mask, ones_cc, ones_cdv, boundary, O_r, device=r)
             return O
 
     return FusedForwardProgram
