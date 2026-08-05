@@ -171,19 +171,28 @@ class SimplerAllscan(AllscanImpl):
     def __init__(self) -> None:
         self.worker = None
 
-    def build(self, dk, dv, K, P, device_ids, platform):
+    def build(self, dk, dv, K, P, device_ids, platform, multi_h=None):
         """Compile both kernels and stand up the persistent Worker.
 
         Args as in :meth:`common.AllscanImpl.build`. Registers the forward and
         backward chip callables on one Worker (a single Worker can host both;
         it is preparing *two distributed workers* on a device set that collides).
         Allocates the per-rank shared-memory IO tensors reused across dispatches.
+
+        ``multi_h``: if set, pre-allocate ``multi_h`` sets of per-head IO buffers
+        for :meth:`run_multi` / :meth:`run_multi_backward` *before* ``init()``.
+        These share_memory_ buffers MUST exist before the eager chip-child fork
+        (simpler #1397); a post-fork allocation is invisible to the children.
         """
         # Tear down any Worker from a previous config before standing up a new
         # one: build() is called once per benchmark config on a reused impl
         # object, and a forked L3 Worker that isn't closed leaks its chip child
         # processes (they busy-wait forever).
         self.close()
+        # Reset fork/multi-buffer state: build() may be reused across configs, so
+        # a stale _post_init/_mh_H from a prior build must not gate this one.
+        self._post_init = False
+        self._mh_H = None
 
         if dk % K != 0:
             raise ValueError(f"dk ({dk}) must be divisible by K ({K})")
@@ -230,8 +239,15 @@ class SimplerAllscan(AllscanImpl):
         )
         self._cid = self.worker.register(chip_callable)
         self._cid_bwd = self.worker.register(bwd_chip_callable)
-        self.worker.init()
 
+        # Allocate ALL share_memory_() host tensors BEFORE worker.init(): the
+        # updated runtime's init() eagerly forks the chip children (simpler
+        # #1397 "eager, transactional, recursive Worker.init() for L3+"), and
+        # share_memory_ regions created *after* the fork are not visible to the
+        # children — staging such a tensor fails in the child with ACL
+        # INVALID_HANDLE (107017). Pre-fork allocation lets the forked children
+        # inherit the mappings. (Worked before because the old init() forked
+        # lazily at run() time, after these were allocated.)
         # Per-rank shared-memory tensors (one private input/output per chip child).
         self.host_s = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
         self.host_g = [torch.zeros((dk, 1), dtype=torch.float32).share_memory_() for _ in range(P)]
@@ -243,6 +259,13 @@ class SimplerAllscan(AllscanImpl):
         self.host_outprev = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
         self.host_dS = [torch.zeros((dk, dv), dtype=torch.float32).share_memory_() for _ in range(P)]
         self.host_dgamma = [torch.zeros((dk, 1), dtype=torch.float32).share_memory_() for _ in range(P)]
+
+        # Multi-head run_multi buffers, if requested, must also predate the fork.
+        if multi_h is not None:
+            self._ensure_multi_bufs(multi_h)
+
+        self.worker.init()  # eagerly forks chip children — must be AFTER the allocations above
+        self._post_init = True
 
     def _submit_iter(self, orch, handle, cfg, slot_off_floats, bufs=None):
         """Submit one full P-rank forward AllScan into the given window slot.
@@ -464,9 +487,23 @@ class SimplerAllscan(AllscanImpl):
         return time.perf_counter() - t0
 
     def _ensure_multi_bufs(self, H):
-        """Lazily allocate H sets of per-rank IO buffers for run_multi[_backward]."""
+        """Allocate H sets of per-rank IO buffers for run_multi[_backward].
+
+        Must run BEFORE worker.init() (the updated runtime eagerly forks the chip
+        children, simpler #1397; share_memory_ regions created after the fork are
+        invisible to the children). ``build(multi_h=H)`` calls this pre-fork; a
+        post-fork call for a new H cannot work and raises loudly rather than
+        failing later with an opaque ACL INVALID_HANDLE (107017) during staging.
+        """
         if getattr(self, "_mh_H", None) == H:
             return
+        if getattr(self, "_post_init", False):
+            raise RuntimeError(
+                f"run_multi needs its {H} per-head share_memory buffers allocated "
+                f"before worker.init() (eager chip-child fork, simpler #1397). "
+                f"Pass build(..., multi_h={H}); pre-allocated H="
+                f"{getattr(self, '_mh_H', None)}."
+            )
         dk, dv, P = self.dk, self.dv, self.P
 
         def _mk(shape):
