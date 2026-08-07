@@ -24,7 +24,7 @@ kernels), `pypto` (fully-fused distributed `@pl.program`).
   it lowers to *split* `pipe_barrier(MTE2/MTE3/FIX)+dsb` which **deadlocks** this comm InCore
   kernel (`SCHEDULER_TIMEOUT`, all K), and `pl.system.bar_all` has no PTO codegen — so the DSL
   cannot express the safe combined drain. Writeup + patch:
-  `allscan/issues/ptoas050-commremoteoffset-inline/ptoas052-remote-store-drain.{md,patch}`.
+  `ptoas052-remote-store-drain.{md,patch}` (archived 2026-08-07 in `allscan/.archive/issues-resolved-2026-08-07.tar.gz`).
   Proof the underlying base is sound: pypto's **own** distributed HW tests pass under 0.52
   (`test_l3_notify_wait`, `test_l3_remote_store` — 3/3). The earlier "0.52 AIV `507015` fault"
   was our stale `efb78378` running the reverted-buggy InsertCommFence against 0.52 — a local
@@ -65,7 +65,7 @@ proof into a robust operator. Dependency order: **F2 is now the correctness gate
 (N>2 must work before anything scales), F3 gates larger tiles, F4–F5 gate fair
 measurement, F6 delivers the numbers. F1 (the race) is **fixed**, bar upstreaming.
 
-### F1 — pypto ring correctness race  *(FIXED 2026-07-27 on the ptoas-0.52 base: combined `pto.barrier <PIPE_ALL>` drain in the remote_store codegen; race guard 0/32. DSL `pl.system.fence()` was tried and rejected — deadlocks on 0.52. See the 07-27 update at top + `issues/ptoas050-commremoteoffset-inline/ptoas052-remote-store-drain.md`)*
+### F1 — pypto ring correctness race  *(FIXED 2026-07-27 on the ptoas-0.52 base: combined `pto.barrier <PIPE_ALL>` drain in the remote_store codegen; race guard 0/32. DSL `pl.system.fence()` was tried and rejected — deadlocks on 0.52. See the 07-27 update at top + `ptoas052-remote-store-drain.md`, archived)*
 The cross-rank producer race (`pypto-allscan-race-fix` / `pypto-allscan-race-rootcause`) is
 **reproduced and matched to known upstream issues**. Reproduced deterministically: back-to-back
 batched AllScan at 128² fails **262/640 (41%)** rings with **no** mitigation. It is
@@ -88,7 +88,7 @@ signal store is the missing piece.
       **removed**: the `/opt/pto-isa` `TNotify.hpp` stopgap (wiped by the env refresh, left
       stock) and the DSL `pld.system.fence()` calls (deleted from all three programs). The
       ordering is now **compiler-emitted** by a local pypto patch
-      (`allscan/issues/ptoas050-commremoteoffset-inline/pypto-ptoas050-adoption.patch`):
+      (`pypto-ptoas050-adoption.patch`, archived):
       `MakeNotifyCodegenPTO` emits `pto.barrier <PIPE_ALL>` **+** `pto.fence.barrier_all <gm>`
       before every `tnotify`, giving exactly `TSTORE → pipe_barrier(PIPE_ALL) → dsb(DSB_DDR) →
       TNOTIFY`. **Key finding: PR 873's fence alone is NOT sufficient** — PTOAS 0.50 lowers
@@ -112,7 +112,7 @@ cube's matmul results and the vector's operands overwrote each other; `gla_stage
 tile was just the visible victim. Writeup: `issues/pypto-incore-loop-cube-vector-race/`
 (`ROOT-CAUSE.md`, `ISSUE.md`, standalone `repro.py`, two diffs).
 - **Isolated to one InCore kernel on ONE device** — no distribution, no ring, no stage2. A stage
-  split of the fused program (`scratchpad/f2_diag.py` + `f2_diag_prog.py`) showed the AllScan ring
+  split of the fused program (`../devtools/f2_diag.py` + `f2_diag_prog.py`) showed the AllScan ring
   bitwise exact and stage2 correct given its actual boundary; only stage1's own output was wrong.
 - **Established as a race, three ways:** the same binary + same inputs gave different results
   across dispatches; the device code for a passing N=4 and a failing N=8 was byte-identical except
@@ -157,7 +157,7 @@ Both backends were single-size only; the fair benchmark needs them at a *shared*
           `S_new = gamma * (S + (K/b)^T @ V)`. That drops `kbar`, `g_row_full`, `g_full` and
           `s_scaled`, and lets `(K/b)^T` be shared with the `scores` matmul.
     - Net **5 fewer live tiles, 2 fewer matmuls, 1 fewer transpose per chunk**, and a ~35%
-          smaller vector footprint at every shape (`scratchpad/f31_compile_probe.py` reports
+          smaller vector footprint at every shape (`../devtools/f31_compile_probe.py` reports
           peak per-space usage by parsing the `AllocateMemoryAddr` dump):
 
           | L, C, D | stage2 Vec before | after |
@@ -167,9 +167,42 @@ Both backends were single-size only; the fair benchmark needs them at a *shared*
           | 128, 64, 32 | overflow — FAIL | 135296 B (72%) |
           | 256, 64, 64 | overflow — FAIL | 180480 B (96%) |
 
-        Correct on a2a3sim at all 5 P=1 configs incl. the new `C=D=64` (P>=2 is blocked on
-        sim by a *pre-existing, unrelated* break — see F3.6). Covered by
-        `test_pypto_gla.py::test_pypto_zeco_sizes`.
+        Covered by `test_pypto_gla.py::test_pypto_zeco_sizes`. Validation:
+
+        | | result |
+        |---|---|
+        | a2a3sim, P=1, all 5 configs | **pass**, incl. the new `C=D=64` |
+        | a2a3sim, P>=2 | needs the F3.6 stub fix; with it, `P=2` compiles and **passes** |
+        | a2a3 HW (card 0), P=1 | **4/5** — `C=D=64` **passes**; `C=64, D=32` is **wrong** |
+
+  - [ ] **F3.1c — `C > D` is wrong on HW (`C=64, D=32`: max diff 72), and only on HW.**
+        a2a3sim computes that same shape correctly, and the other three shapes pass on the
+        same card, so it is neither a compile nor a math error. Ruled out so far:
+    - **not the new gamma chain** — `../devtools/f31_gamma_probe.py` checks `col_sum` ->
+          `reshape` -> `exp` -> `row_expand_mul` in isolation at exactly `C=64, DK=DV=32` and
+          all four are correct to 1e-12 (the reshape-free `row_sum(la^T)` route agrees too).
+    - **not shape-generic** — `C < D` (`C=32, D=64`) and `C == D` (`64`, `32`) all pass.
+    - **NOT the shared `kbt` transpose** (tested 2026-08-07, hypothesis **rejected**).
+          `kbt = transpose(kb)` is computed once and used as the **B** operand of
+          `scores = qt @ kbt` *and* the **A** operand of `kv = kbt @ v`. Un-sharing it into
+          two inline `pl.transpose(kb, 0, 1)` expressions **does** take effect — pypto does
+          not CSE them, and 2 transposes survive to `33_after_AllocateMemoryAddr` (1 in the
+          shared version) — but `C=64, D=32` still **fails** on HW while the other three P=1
+          shapes pass. So the second tile is pure cost with no benefit; the edit was reverted.
+        Remaining F3.1-introduced suspect, still *sharing* a tile across two roles:
+    - `tril_t` is now both a **cube matmul A-operand** and a **vector elementwise** mask
+          (it used to be two separate tensors, `tril` and `mask`).
+        Note un-sharing it costs a full `[C, C]` tile, which `C=D=64` (96% of budget) cannot
+        afford — so the fix likely has to be a short-lived normalisation copy, not a second
+        long-lived tile. Given the `kbt` result above, tile-sharing may be the wrong theory
+        altogether; worth re-deriving before spending another tile on it.
+  - [ ] **F3.1d — bad cards masquerade as code bugs.** Cards **1 and 6** fail *any* pypto
+        program at device bring-up (`halMemCtl rc=42` in `init_aicore_register_addresses`,
+        `host_regs.cpp:133`) before any kernel math, so it presents as a kernel failure. Cost
+        ~5 runs and a wrong "box-wide outage" call before an A/B against a pristine pre-F3.1
+        worktree exonerated the change and card 0 ran clean. `npu-smi` reports Health OK for
+        all 8 and the TaskQueue bad-card table was empty — **neither tool flags these**. If a
+        pypto HW run fails at bring-up, re-run on another card before believing it.
   - [ ] **F3.1b — beyond `C=64, D=64` genuinely needs blocking.** `C=D=64` sits at **96%** of
         the 188416 B vector buffer, so it is the last shape reachable by tidying; every next
         step overflows by 3-4x, and `C=128` / `D=128` *also* blow the 65536 B cube `Left`/
@@ -233,17 +266,37 @@ Both backends were single-size only; the fair benchmark needs them at a *shared*
           may be my inline `M`-drain, not a fundamental limit).
     - Still shares the tile-blocking need with pypto's ceiling below (head dim 256).
 - [x] pypto reaches `C=64, D=64` (F3.1); past that it needs the real blocking of F3.1b.
-- [ ] **F3.6 — a2a3sim cannot compile ANY pypto distributed (P>=2) program right now.**
-      Found while validating F3.1; **pre-existing and unrelated** — the pristine pre-F3.1
-      tree fails identically. pto-isa's CPU stub leaks a bare
-      `#define SINGLE_CACHE_LINE 0` (`include/pto/common/cpu_stub.hpp:93`) with no
-      `cache_line_t` type, while PTOAS emits the *qualified*
-      `dcci(ptr, cache_line_t::SINGLE_CACHE_LINE)` — which the macro rewrites to
-      `cache_line_t::0`, so `allscan_first_step.cpp` fails to compile. HW is unaffected
-      (bisheng provides the real `cache_line_t`). Fix belongs in the stub: declare an
-      unscoped `enum cache_line_t { ENTIRE_DATA_CACHE, SINGLE_CACHE_LINE, ... }` (unscoped
-      keeps pto-isa's own unqualified uses working) instead of `#define`-ing the members.
-      Worth filing upstream — a public header should not leak `SINGLE_CACHE_LINE` as a macro.
+- [x] **F3.6 — sim `P>=2` restored by bumping the pto-isa pin (2026-08-05).** Found while
+      validating F3.1; **pre-existing and unrelated** — the pristine pre-F3.1 tree failed
+      identically. On the old pin (`83d01313`) pto-isa's CPU stub leaked a bare
+      `#define SINGLE_CACHE_LINE 0` with no `cache_line_t` type, while PTOAS emits the
+      *qualified* `dcci(ptr, cache_line_t::SINGLE_CACHE_LINE)` — the macro rewrote that to
+      `cache_line_t::0`, so `allscan_first_step.cpp` would not compile. HW was unaffected.
+      **Already fixed upstream** by `2d9d4288`, so nothing to file (write-up removed
+      2026-08-07; archived in `allscan/.archive/issues-resolved-2026-08-07.tar.gz`).
+  - **Pin: `83d01313` → `1cb027c8`**, with `/opt/pypto/runtime/pto_isa.pin` updated to match
+        (the runtime enforces `HEAD == pin`) and PR #227's DIR_BOTH fix re-applied on top via
+        `git cherry-pick -n 0eeb9710` — 3-way merge, because 291 commits landed in the range
+        including a repo-wide clang-format reflow that defeats context patching.
+  - **Not `main`:** the tip is broken for CPU-SIM `TASSIGN` — `cpu/TAssign.hpp` calls a
+        2-arg `Tile::assignData` that `82c91680` removed. Bisected `1cb027c8` COMPILES /
+        `82c91680` FAILS / tip FAILS. **Live and unreported**; write-up + minimal repro at
+        `allscan/issues/pto-isa-cpu-sim-tassign-arity/`. `1cb027c8` = `82c91680^` is the
+        newest commit with the cache-line fix and without that regression.
+  - **BUMP REVERTED — but NOT because of the HW failures.** On `1cb027c8`, sim `P=1/2/4`
+        at the small shape passed natively (no `PTO_ISA_ROOT` override), but
+        **`P=1, L=128, C=32, D=32` HANGS** on sim — reproduced standalone, and that config
+        was fine on the old pin. Suspect the CPU-SIM churn in the range (`2d9d4288` also
+        touched "CPU 仿真初始化 / TWait 调度识别"; TWait scheduling is what a sim hang looks
+        like). Not bisected. **That sim hang is the whole case against the bump.**
+  - **CORRECTION — do not blame the bump for the HW failures.** The bumped pin failed 5 of 7
+        HW suites, and I initially attributed that to the bump. **Wrong**: after reverting to
+        `83d01313`, HW reproduces the *same* results — pypto GLA 6 failed / 4 passed, and
+        `test_pypto_allscan[1]` / `[2]` failing. So those failures are **independent of the
+        pin** and were simply never exercised in today's earlier runs (which used one card,
+        so every `P=2` case skipped, or landed on the faulty cards 1/6). `test_pypto_allscan[1]`
+        is P=1 on a single card, so it is not an HCCS or device-count artifact either.
+        **Under investigation — see F3.7.**
 - [x] **F3.5 —** Larger-shape correctness sweep for **simpler** (`test_simpler_gla.py --sweep`): 8 curated
       shapes (square + rectangular `C≠D`, `C,D∈{16,32,64,128}`, larger `L` → `N` up to 16) all
       HW-pass P=1 (~1e-7), plus P=2 rect `C=64/D=128` with real AllScan. pypto still capped at
@@ -309,7 +362,7 @@ rendezvous files hang the next run at rootinfo and `507018` on one config broke 
       trap (`allscan/issues/simpler-second-callable-silent-corruption/`) is **gone on
       runtime `9922afdb`**; it was real on `a756969c`. Per-call: 35–43 s → 29–32 s.
 - [x] **F6.3 — Phase breakdown: the remaining gap is orchestration, not compute.**
-      `scratchpad/f6_phase_breakdown.py`, P=2/L=128/C=D=32, mean of 3:
+      `../devtools/f6_phase_breakdown.py`, P=2/L=128/C=D=32, mean of 3:
 
       | phase | ms | share |
       |---|---|---|
@@ -328,7 +381,7 @@ rendezvous files hang the next run at rootinfo and `507018` on one config broke 
       `DistributedWorker` serves its fused program and is held across calls.
       `stage2` >> `stage1` for the same reason: it reopens the workers the boundary forced
       closed (device-exclusivity), not because `chunk_o` is slow.
-- [x] **F6.4 — Decomposed (2026-08-05, `scratchpad/f6_comm_breakdown.py`, P=2/L=128/C=D=32,
+- [x] **F6.4 — Decomposed (2026-08-05, `../devtools/f6_comm_breakdown.py`, P=2/L=128/C=D=32,
       5 repeats each).** Both composites split by repeating the operation on a warm worker:
 
       | | ms |
