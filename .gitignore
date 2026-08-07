@@ -16,3 +16,4 @@ pa_build/
 KNOWN_ISSUES.md
 *.log
 results_*.json
+scratchpad/
