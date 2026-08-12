@@ -72,6 +72,26 @@ class PyPtoZeCo(ZeCoImpl):
         ``K=1`` is the ring pipeline depth.
         """
         assert L % C == 0, f"L={L} not divisible by C={C}"
+        # dv < C is silently WRONG on a2a3 hardware (correct on a2a3sim), so refuse to build
+        # rather than return corrupt results. Root cause is NOT in this operator, and not in
+        # matmul either: a cross-core TPipe strides the consumer's local ring by the popped
+        # tile's own size instead of the ring's SLOT_SIZE, so two differently-sized tiles held
+        # at once alias in L1. For [M,K] @ [K,N] the operands overlap iff K*N < M*K, i.e.
+        # N < M — which is every [C, dv] tile in the output path exactly when dv < C. dk is
+        # unaffected: `b = tril[C,C] @ la[C,dk]` is tall when dk < C but is consumed on-chip
+        # and never stored, and dk < C measures correct.
+        # Root cause + reproducer: allscan/issues/pto-isa-fifo-local-slot-alias/ (ROADMAP
+        # F3.1c). Fix filed upstream as pto-isa issue #521 / MR !1457; drop this guard once
+        # that merges and PTO_ISA_ROOT is re-pinned past it.
+        # ZECO_ALLOW_TALL=1 bypasses the guard, to validate a candidate pto-isa fix against
+        # the shapes it is supposed to repair. Never set it for real work on a stock stack.
+        assert dv >= C or os.environ.get("ZECO_ALLOW_TALL") == "1", (
+            f"dv={dv} < C={C} produces silently WRONG results on a2a3 hardware "
+            f"(pto-isa FIFO local-slot aliasing, issue #521; see "
+            f"allscan/issues/pto-isa-fifo-local-slot-alias/). "
+            f"Use dv >= C, or a smaller chunk size C <= {dv}. "
+            f"Set ZECO_ALLOW_TALL=1 only to test a pto-isa fix."
+        )
         self.P, self.L, self.C, self.dk, self.dv = P, L, C, dk, dv
         self.platform = platform
         self.device_ids = list(device_ids[:P])

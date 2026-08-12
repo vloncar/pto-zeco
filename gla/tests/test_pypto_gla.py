@@ -64,8 +64,20 @@ def test_pypto_zeco(test_config, device_ids, P):
 SIZES = [
     (128, 32, 32, 32),    # the pre-F3.1 ceiling — regression guard
     (128, 32, 64, 64),    # D=64 was already reachable (only C drives the [C,C] tiles)
-    (128, 64, 32, 32),    # C=64, small head dim
+    (128, 64, 32, 64),    # dk < C: fine, and the case proving the trigger is dv, not dk
     (256, 64, 64, 64),    # C=64, D=64: the mainstream GLA config, N=4 chunks
+]
+
+# dv < C is silently wrong on a2a3 HARDWARE (correct on a2a3sim) — not an operator bug but a
+# pto-isa one: a cross-core TPipe strides the consumer's local ring by the popped tile's own
+# size instead of SLOT_SIZE, so a matmul's two operands alias in L1 whenever N < M
+# (allscan/issues/pto-isa-fifo-local-slot-alias/, ROADMAP F3.1c; upstream issue #521).
+# `build()` now refuses these shapes rather than returning corrupt results, so the case is
+# kept here to assert that the guard fires. Turn it back into a correctness case once the
+# upstream fix merges and PTO_ISA_ROOT is re-pinned past it.
+GUARDED_SIZES = [
+    (128, 64, 32, 32),    # C=64, dv=32
+    (128, 32, 16, 16),    # C=32, dv=16 — same defect at half the size
 ]
 
 
@@ -78,6 +90,18 @@ def test_pypto_zeco_sizes(test_config, device_ids, P, L, C, dk, dv):
         pytest.skip(f"need {P} devices, got {device_ids}")
     err = _run_case(test_config.platform, device_ids, P, L, C, dk, dv)
     assert err < 1e-2, f"PyPTO ZeCO mismatch (P={P} L={L} C={C} D={dv}): max diff = {err}"
+
+
+@pytest.mark.parametrize("L,C,dk,dv", GUARDED_SIZES, ids=lambda v: str(v))
+def test_pypto_zeco_rejects_dv_below_C(test_config, device_ids, L, C, dk, dv):
+    """A shape that the hardware computes incorrectly must be refused, not silently run.
+
+    No device needed — the guard fires in build() before anything is dispatched.
+    """
+    impl = PyPtoZeCo()
+    with pytest.raises(AssertionError, match="silently WRONG"):
+        impl.build(1, L, C, dk, dv, device_ids=device_ids[:1] or [0],
+                   platform=test_config.platform)
 
 
 if __name__ == "__main__":
