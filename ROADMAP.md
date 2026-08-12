@@ -28,7 +28,16 @@ operator — both were toolchain defects, and both fixes are now upstream.
    shapes rather than returning wrong data.
 2. **`dk != dv` is wrong at `P >= 2`** — found 2026-08-12, see task 2. Not guarded yet.
 
-Re-validated on HW 2026-08-12 (`test_pypto_gla.py`, full matrix, a2a3):
+Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57 / simpler
+`3165cc89`):
+
+| suite | result |
+|---|---|
+| forward — `test_pypto_gla`, `test_simpler_gla`, `test_pypto`, `test_simpler` | **21 passed, 1 failed** |
+| backward — `test_simpler_gla_backward`, `test_gla_backward`, `test_zeco_autograd`, `test_*_backward` | **41 passed, 0 failed** |
+| AllScan race guard `test_pypto_allscan_back_to_back[4]` | **passed** (F1 still fixed on 0.57) |
+
+The single forward failure is the pre-existing `[2-128-64-32-64]`, unchanged by the update:
 
 | L, C, dk, dv | P=1 | P=2 |
 |---|---|---|
@@ -37,21 +46,36 @@ Re-validated on HW 2026-08-12 (`test_pypto_gla.py`, full matrix, a2a3):
 | **128, 64, 32, 64** | ✅ | ❌ **max diff 186.05** |
 | 256, 64, 64, 64 | ✅ | ✅ |
 
-simpler forward re-validated green in the same session.
-
 ## Environment
+
+Updated 2026-08-12 (was pypto `f621eca4` / ptoas 0.54 / simpler `9922afdb`).
 
 | | |
 |---|---|
-| pypto | `f621eca4` (main), **104 commits behind** `origin/main` |
-| ptoas | **0.54** (`/opt/ptoas-bin`) |
-| pto-isa | pin `83d01313` (`/opt/pto-isa`), **+1 local patch** — the DIR_BOTH V2C ring offset, since merged upstream as `69a81f3b` |
-| simpler runtime | `9922afdb` |
+| pypto | `71020585` (main) |
+| ptoas | **0.57** — venv at `/opt/ptoas-venv`, exposed as `/opt/ptoas-bin/bin/ptoas` |
+| pto-isa | pin `83d01313` (`/opt/pto-isa`), **+1 local patch** — the DIR_BOTH V2C ring offset |
+| simpler runtime | `3165cc89` (pypto submodule `runtime/`) |
 
-Both carried patches are now redundant with upstream and go away on the next pin bump
-(task 1). Run notes: `LD_PRELOAD=<cann>/lib64/libhccl.so` or HCCL hangs at rootinfo;
-`PYTHONPATH` must *prepend* `pto-zeco` (`set_env.sh` resets it); delete stale
-`/tmp/barrier_pto_multi_comm_*`; keep multi-card sets inside one HCCS group (0-3 | 4-7).
+pypto main still pins pto-isa at `83d01313`, which predates `69a81f3b`, so **the DIR_BOTH
+patch has to stay carried** — it is not dropped by moving pypto forward. The pypto-side F2
+patch *was* dropped: it is upstream as #2271. The pto-isa pin is set by
+`runtime/pto_isa.pin` in the simpler submodule, not by pypto directly, so it only moves when
+the runtime bumps it.
+
+**ptoas layout gotcha (new at 0.57).** 0.57 installs as a Python venv, and the container's
+`PATH` puts `/opt/ptoas-bin/bin` *ahead of* `/usr/local/python3.12.13/bin`. Installing the
+venv directly at `/opt/ptoas-bin` therefore shadows the system `python3`/`pip` — which
+silently installed pypto **into the ptoas venv** on the first attempt. The venv now lives at
+`/opt/ptoas-venv` and `/opt/ptoas-bin/bin` holds a single symlink to `ptoas`, so nothing can
+shadow the interpreter. Keep it that way; `PTOAS_ROOT=/opt/ptoas-bin` only needs
+`$PTOAS_ROOT/ptoas` or `$PTOAS_ROOT/bin/ptoas` to be executable. Also note the release's
+bundle tarball requires CPython **3.11** and we run 3.12 — use the **cp312 wheel**.
+
+Run notes: `LD_PRELOAD=<cann>/lib64/libhccl.so` or HCCL hangs at rootinfo; `PYTHONPATH` must
+*prepend* `pto-zeco` (`set_env.sh` resets it); delete stale `/tmp/barrier_pto_multi_comm_*`;
+keep multi-card sets inside one HCCS group (0-3 | 4-7). Backup of the previous environment,
+with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
 
 ---
 
@@ -119,16 +143,21 @@ Both carried patches are now redundant with upstream and go away on the next pin
 
 Six tasks, in dependency order. Everything else is parked below.
 
-### 1. Refresh the toolchain pin and drop the carried patches
-Once pto-isa **!1457** merges, bump `/opt/pto-isa` past it and past `69a81f3b`, and bump
-pypto past `d26e0f6c` (#2271). That retires **both** local patches — verified redundant:
-our `orchestration_analysis.cpp` is byte-identical to upstream main. Then remove the
-`dv >= C` guard in `PyPtoZeCo.build` and restore `(128, 64, 32, 32)` to `SIZES` as a
-correctness case (`ZECO_ALLOW_TALL=1` already validates the fix ahead of the merge).
+### 1. Move pto-isa off `83d01313` and drop the last carried patch
+**Partly done 2026-08-12:** pypto is on main and the pypto-side F2 patch is gone (upstream as
+#2271). What remains is pto-isa, which pypto still pins at `83d01313` — predating both
+`69a81f3b` (so we carry the DIR_BOTH patch) and !1457.
 
-The old pin ceiling is **gone**: the CPU-SIM `TASSIGN` arity break that blocked bumping past
+The pin comes from `runtime/pto_isa.pin` in the simpler submodule, so it moves when the
+runtime bumps it; we cannot advance it unilaterally without diverging from what the runtime
+enforces (`HEAD == pin`). Once !1457 merges and the runtime pin moves past both commits:
+drop the DIR_BOTH patch, remove the `dv >= C` guard in `PyPtoZeCo.build`, and restore
+`(128, 64, 32, 32)` to `SIZES` as a correctness case (`ZECO_ALLOW_TALL=1` validates the fix
+ahead of that).
+
+The old pin *ceiling* is gone: the CPU-SIM `TASSIGN` arity break that blocked bumping past
 `1cb027c8` is fixed upstream (`439faf48`, `831ef9d2`). Re-verify the sim `P=1, L=128, C=D=32`
-hang before trusting the new pin — that hang, not the arity break, was the real reason the
+hang before trusting any new pin — that hang, not the arity break, was the real reason the
 last bump was reverted, and it was never bisected.
 
 ### 2. pypto `dk != dv` is wrong at `P >= 2` — correctness gate
