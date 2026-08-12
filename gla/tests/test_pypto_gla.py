@@ -64,20 +64,28 @@ def test_pypto_zeco(test_config, device_ids, P):
 SIZES = [
     (128, 32, 32, 32),    # the pre-F3.1 ceiling — regression guard
     (128, 32, 64, 64),    # D=64 was already reachable (only C drives the [C,C] tiles)
-    (128, 64, 32, 64),    # dk < C: fine, and the case proving the trigger is dv, not dk
+    (128, 32, 64, 32),    # dk != dv, both >= C — keeps asymmetric coverage in the suite
     (256, 64, 64, 64),    # C=64, D=64: the mainstream GLA config, N=4 chunks
 ]
 
-# dv < C is silently wrong on a2a3 HARDWARE (correct on a2a3sim) — not an operator bug but a
-# pto-isa one: a cross-core TPipe strides the consumer's local ring by the popped tile's own
-# size instead of SLOT_SIZE, so a matmul's two operands alias in L1 whenever N < M
-# (allscan/issues/pto-isa-fifo-local-slot-alias/, ROADMAP F3.1c; upstream issue #521).
-# `build()` now refuses these shapes rather than returning corrupt results, so the case is
-# kept here to assert that the guard fires. Turn it back into a correctness case once the
-# upstream fix merges and PTO_ISA_ROOT is re-pinned past it.
+# A head dim below C is silently wrong on a2a3 HARDWARE (correct on a2a3sim) — not an operator
+# bug but a pto-isa one: a cross-core TPipe strides the consumer's local ring by the popped
+# tile's own size instead of SLOT_SIZE, so a matmul's two operands alias in L1 whenever N < M
+# (allscan/issues/pto-isa-fifo-local-slot-alias/, ROADMAP F3.1c + task 2; upstream issue #521).
+# `build()` refuses these shapes rather than returning corrupt results, so they are kept here
+# to assert that the guard fires. Turn them back into correctness cases once the upstream fix
+# merges and the pto-isa pin moves past it.
+#
+# The two sides behave very differently, measured at 20 dispatches each:
+#   dv < C  deterministic — 20/20 dispatches wrong.
+#   dk < C  intermittent  — ~1/20, and some dk < C shapes stayed quiet across 20. At that rate
+#           a clean run of 20 misses it 36% of the time, so quiet is NOT proof of safety and
+#           the guard covers all of dk < C.
 GUARDED_SIZES = [
-    (128, 64, 32, 32),    # C=64, dv=32
-    (128, 32, 16, 16),    # C=32, dv=16 — same defect at half the size
+    (128, 64, 32, 32),    # dv < C: C=64, dv=32
+    (128, 32, 16, 16),    # dv < C: C=32, dv=16 — same defect at half the size
+    (128, 64, 32, 64),    # dk < C: was a correctness case until task 2 showed it corrupts
+    (128, 32, 16, 32),    # dk < C at C=32 — the second shape that reproduced
 ]
 
 
@@ -93,7 +101,7 @@ def test_pypto_zeco_sizes(test_config, device_ids, P, L, C, dk, dv):
 
 
 @pytest.mark.parametrize("L,C,dk,dv", GUARDED_SIZES, ids=lambda v: str(v))
-def test_pypto_zeco_rejects_dv_below_C(test_config, device_ids, L, C, dk, dv):
+def test_pypto_zeco_rejects_head_dim_below_C(test_config, device_ids, L, C, dk, dv):
     """A shape that the hardware computes incorrectly must be refused, not silently run.
 
     No device needed — the guard fires in build() before anything is dispatched.

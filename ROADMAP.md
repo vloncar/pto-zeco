@@ -13,7 +13,7 @@ size, and in steady-state cost.
 
 | Piece | torch | torch-dist | simpler | pypto |
 |---|---|---|---|---|
-| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ⚠️ HW `C,D ≤ 64` **and `dk >= C`** — see task 2 |
+| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C,D ≤ 64`, `min(dk,dv) >= C` (guarded) |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
 | **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ❌ — **B4, the only gap** |
 
@@ -26,9 +26,9 @@ operator — both were toolchain defects, and both fixes are now upstream.
 1. **`dv >= C`.** Below that a `pl.matmul` silently returns corrupt results — a pto-isa FIFO
    defect (filed, fix in review; see the upstream ledger). `PyPtoZeCo.build` refuses those
    shapes rather than returning wrong data.
-2. **`dk >= C` too.** The same defect reaches the `dk` side via `b = tril[C,C] @ la[C,dk]`, so
-   `dk < C` is corrupt as well — **intermittently**, which is why it went unnoticed. Not
-   guarded yet; task 2 has the evidence and the open question (the exact predicate).
+2. **`dk >= C` too.** The same defect reaches the `dk` side via `b = tril[C,C] @ la[C,dk]`,
+   intermittently (~1 in 20 dispatches, vs every dispatch for `dv < C`). Both are now guarded
+   as `min(dk, dv) >= C` — see task 2.
 
 Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57 / simpler
 `3165cc89`):
@@ -159,38 +159,46 @@ The old pin *ceiling* is gone: the CPU-SIM `TASSIGN` arity break that blocked bu
 hang before trusting any new pin — that hang, not the arity break, was the real reason the
 last bump was reverted, and it was never bisected.
 
-### 2. The `dk`-side failure is F3.1c again — the `dv >= C` guard is incomplete
-Investigated 2026-08-12. `L=128, C=64, dk=32, dv=64` produces **total corruption** (~1.5e2–2.2e2
-against an output of similar magnitude; correct dispatches are exactly 2.29e-05).
+### 2. `dk`-side corruption — DONE 2026-08-12, guard extended to `min(dk,dv) >= C`
+The failure at `C=64, dk=32, dv=64` is **the same defect as F3.1c**, reached through the `dk`
+side. Paired A/B alternating the stock and F3.1c-fixed `TPush.hpp` in one job on one card:
+**12/84 dispatches wrong on stock, 0/84 with the fix.**
 
-**It is very likely the same defect as F3.1c.** Paired A/B alternating the stock and F3.1c-fixed
-`TPush.hpp`, in one job on one card, identical probe modes each round:
+Mechanism: `b = tril[C,C] @ la[C,dk]` is `[M=C, K=C, N=dk]`, so `N < M` exactly when `dk < C`
+— F3.1c's predicate on the `dk` side rather than the `dv` side.
 
-| header | dispatches wrong |
-|---|---|
-| stock (`ConsM*ConsN` stride) | **12 / 84** |
-| F3.1c fix (`RingFiFo::SLOT_SIZE` stride) | **0 / 84** |
+Measured at 20 dispatches per shape, fresh inputs each, one process per config:
 
-The mechanism fits: `b = tril[C,C] @ la[C,dk]` is `[M=C, K=C, N=dk]`, so `N < M` exactly when
-**`dk < C`** — F3.1c's predicate on the `dk` side instead of the `dv` side. So the guard needs
-`dk >= C` as well as `dv >= C`. The old note claiming the `b` tile "is consumed on-chip and
-never stored, so `dk` does not matter" came from the superseded TSTORE framing and does not
-survive the real cause.
+| shape | relation | wrong |
+|---|---|---|
+| `C=64,dv=32` / `C=32,dv=16` | `dv < C` | **20/20 — deterministic** |
+| `C=64,dk=32` / `C=32,dk=16` | `dk < C` | **1/20 — intermittent** |
+| `C=64,dk=16`, `C=32,dk=16,dv=64` | `dk < C` | 0/20 |
+| everything with `dk,dv >= C` | — | 0/20 |
 
-Two earlier claims are **withdrawn**: it is not `P >= 2`-only (P=1 and P=4 fail too), and it is
-not `dk != dv` (both discriminators came back clean).
+**The two sides are not symmetric in severity**: `dv < C` corrupts every dispatch, `dk < C`
+about 1 in 20. That rarity is why it survived a year of testing, and it is also why the guard
+does **not** carve out the quiet `dk < C` shapes: at a 5% rate a clean run of 20 still misses
+the failure 36% of the time, so "quiet at N=20" is not evidence of safety.
 
-**Still open — the exact predicate.** Failure rates vary from 0/6 to 10/10 between processes
-with no variable yet identified, so a 3-repeat "OK" misses a 1-in-6 failure 57% of the time.
-The axis-matrix "stable OK" rows therefore do **not** establish that those shapes are clean;
-`C=64, dk=16` in particular needs retesting. Re-run the matrix at **>=20 dispatches per
-config**, then extend the guard to whatever it shows.
+`PyPtoZeCo.build` now requires **`min(dk, dv) >= C`**, naming the offending dimension and
+stating whether that side is deterministic or intermittent. `GUARDED_SIZES` gained the two
+`dk < C` shapes; `SIZES` swapped the now-guarded `(128, 64, 32, 64)` for `(128, 32, 64, 32)`,
+which keeps a `dk != dv` case in the suite. **`test_pypto_gla.py` is green: 14 passed, 1
+skipped, 0 failed.**
 
-Method notes worth keeping (probes in `../devtools/t2_*`): patch `/opt/pto-isa` directly rather
-than overriding `PTOAS_ROOT` (an override A/B gave byte-identical halves and could not be
-trusted); **prove the header is live** by injecting `#error` and requiring the sentinel in the
-compiler output; and never run a second HW job while one mutates `/opt/pto-isa` — one matrix
-run was lost to compiling against another job's sentinel.
+Withdrawn along the way: it is not `P >= 2`-only (P=1 and P=4 fail too) and not `dk != dv`
+(both discriminators are clean). The F3.1c write-up's "which is why `dk` never mattered" was
+false and is corrected.
+
+Remaining: tell !1457 that its fix also covers this shape class — **draft for review, not yet
+sent**. The guard comes out when the fix merges and the pin moves (task 1).
+
+Method notes (probes in `../devtools/t2_*`): patch `/opt/pto-isa` directly rather than
+overriding `PTOAS_ROOT`, which gave byte-identical halves; **prove the header is live** by
+injecting `#error` and requiring the sentinel in the compiler output — a null A/B is
+meaningless without it; never run a second HW job while one mutates `/opt/pto-isa`; and on an
+intermittent failure, never conclude from a single run in either direction.
 
 ### 3. Forward-at-scale sweep
 `N ∈ {2,4,8,16,32}` × `P ∈ {1,2,4}` × shapes, both device backends, against `expected_gla`.

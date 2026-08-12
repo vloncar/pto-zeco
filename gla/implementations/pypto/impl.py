@@ -72,24 +72,34 @@ class PyPtoZeCo(ZeCoImpl):
         ``K=1`` is the ring pipeline depth.
         """
         assert L % C == 0, f"L={L} not divisible by C={C}"
-        # dv < C is silently WRONG on a2a3 hardware (correct on a2a3sim), so refuse to build
-        # rather than return corrupt results. Root cause is NOT in this operator, and not in
-        # matmul either: a cross-core TPipe strides the consumer's local ring by the popped
-        # tile's own size instead of the ring's SLOT_SIZE, so two differently-sized tiles held
-        # at once alias in L1. For [M,K] @ [K,N] the operands overlap iff K*N < M*K, i.e.
-        # N < M — which is every [C, dv] tile in the output path exactly when dv < C. dk is
-        # unaffected: `b = tril[C,C] @ la[C,dk]` is tall when dk < C but is consumed on-chip
-        # and never stored, and dk < C measures correct.
+        # A head dim below C is silently WRONG on a2a3 hardware (correct on a2a3sim), so refuse
+        # to build rather than return corrupt results. Root cause is NOT in this operator, and
+        # not in matmul either: a cross-core TPipe strides the consumer's local ring by the
+        # popped tile's own size instead of the ring's SLOT_SIZE, so two differently-sized
+        # tiles held at once alias in L1. For [M,K] @ [K,N] the operands overlap iff
+        # K*N < M*K, i.e. N < M. Both head dims can hit that:
+        #   dv < C — every [C, dv] tile in the output path. DETERMINISTIC: 20/20 dispatches
+        #            wrong at (C=64,dv=32) and (C=32,dv=16).
+        #   dk < C — via `b = tril[C,C] @ la[C,dk]`. RARE: ~1/20 dispatches, and only some
+        #            shapes reproduced within 20 (C=64,dk=32 and C=32,dk=16 did; C=64,dk=16
+        #            did not). At a 5% rate a clean run of 20 still misses it 36% of the time,
+        #            so the quiet shapes are NOT certified safe and the guard covers all of
+        #            dk < C rather than carving out sub-cases the data cannot support.
+        # An earlier version of this comment claimed dk was unaffected because the `b` tile is
+        # consumed on-chip and never stored. That reasoning came from a superseded framing of
+        # the bug (a TSTORE defect) and is wrong under the real FIFO-aliasing cause.
         # Root cause + reproducer: allscan/issues/pto-isa-fifo-local-slot-alias/ (ROADMAP
-        # F3.1c). Fix filed upstream as pto-isa issue #521 / MR !1457; drop this guard once
-        # that merges and PTO_ISA_ROOT is re-pinned past it.
+        # F3.1c, and task 2 for the dk side). Fix filed upstream as pto-isa issue #521 /
+        # MR !1457; drop this guard once that merges and the pto-isa pin moves past it.
         # ZECO_ALLOW_TALL=1 bypasses the guard, to validate a candidate pto-isa fix against
         # the shapes it is supposed to repair. Never set it for real work on a stock stack.
-        assert dv >= C or os.environ.get("ZECO_ALLOW_TALL") == "1", (
-            f"dv={dv} < C={C} produces silently WRONG results on a2a3 hardware "
-            f"(pto-isa FIFO local-slot aliasing, issue #521; see "
+        assert min(dk, dv) >= C or os.environ.get("ZECO_ALLOW_TALL") == "1", (
+            f"{'dv' if dv < C else 'dk'}={min(dk, dv)} < C={C} produces silently WRONG "
+            f"results on a2a3 hardware (pto-isa FIFO local-slot aliasing, issue #521; see "
             f"allscan/issues/pto-isa-fifo-local-slot-alias/). "
-            f"Use dv >= C, or a smaller chunk size C <= {dv}. "
+            f"{'dv < C is deterministic; ' if dv < C else 'dk < C is intermittent (~1 in 20 '
+             'dispatches), so a passing run does not mean the shape is safe; '}"
+            f"Use dk, dv >= C, or a smaller chunk size C <= {min(dk, dv)}. "
             f"Set ZECO_ALLOW_TALL=1 only to test a pto-isa fix."
         )
         self.P, self.L, self.C, self.dk, self.dv = P, L, C, dk, dv
