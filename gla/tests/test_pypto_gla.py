@@ -16,6 +16,7 @@ forward (including ``stage2`` as a distributed chip kernel) is verified on a2a3 
 at P=1/2/4 after the upstream sim-scheduler and HW dist-chip fixes.
 """
 
+import os
 import sys
 
 import pytest
@@ -32,16 +33,33 @@ def _golden(Q, K, V, A):
     ).reshape(P, L, dv)
 
 
-def _run_case(platform, device_ids, P, L, C, dk, dv):
-    """Build + run one config, returning the max abs error against the golden."""
-    Q, K, V, A = make_gla_inputs(P, L, dk, dv)
+# `make_gla_inputs` seeds torch itself and defaults to seed=42, so a plain call gives every
+# run the SAME input point. That matters here: the pto-isa FIFO aliasing this operator has
+# tripped over is data- and timing-dependent, and reproduced as rarely as 1 dispatch in 20 —
+# so a single dispatch on a single input is weak evidence of correctness. Each size case
+# therefore dispatches REPEATS times against distinct seeds, and reports the seed that failed
+# so it can be replayed. Kept small by default to bound CI time; raise it when hunting.
+REPEATS = int(os.environ.get("ZECO_TEST_REPEATS", "3"))
+
+
+def _run_case(platform, device_ids, P, L, C, dk, dv, seed=42, repeats=1):
+    """Build once, dispatch `repeats` times on distinct seeds.
+
+    Returns (worst_err, worst_seed) so a failure names the input that produced it.
+    """
     impl = PyPtoZeCo()
     impl.build(P, L, C, dk, dv, device_ids=device_ids[:P], platform=platform)
+    worst, worst_seed = 0.0, seed
     try:
-        O = impl.forward(Q, K, V, A)
+        for i in range(repeats):
+            s = seed + i
+            Q, K, V, A = make_gla_inputs(P, L, dk, dv, seed=s)
+            err = (impl.forward(Q, K, V, A) - _golden(Q, K, V, A)).abs().max().item()
+            if err > worst:
+                worst, worst_seed = err, s
     finally:
         impl.close()
-    return (O - _golden(Q, K, V, A)).abs().max().item()
+    return worst, worst_seed
 
 
 @pytest.mark.forked
@@ -53,8 +71,8 @@ def test_pypto_zeco(test_config, device_ids, P):
     L, C, dk, dv = 32, 16, 16, 16   # N = L // C = 2 chunks
     # atol looser than the torch backends: the on-device chunk math divides by the
     # within-chunk cumulative decay, so FP32 rounding is larger than the reference's.
-    err = _run_case(test_config.platform, device_ids, P, L, C, dk, dv)
-    assert err < 1e-2, f"PyPTO ZeCO mismatch (P={P}): max diff = {err}"
+    err, seed = _run_case(test_config.platform, device_ids, P, L, C, dk, dv, repeats=REPEATS)
+    assert err < 1e-2, f"PyPTO ZeCO mismatch (P={P}, seed={seed}): max diff = {err}"
 
 
 # F3.1 sizes. The chunk kernels hold the whole per-chunk working set in the 184 KB vector
@@ -96,8 +114,11 @@ def test_pypto_zeco_sizes(test_config, device_ids, P, L, C, dk, dv):
     """Correctness across the shapes F3.1 unlocked (P=1 local, P=2 with the real ring)."""
     if len(device_ids) < P:
         pytest.skip(f"need {P} devices, got {device_ids}")
-    err = _run_case(test_config.platform, device_ids, P, L, C, dk, dv)
-    assert err < 1e-2, f"PyPTO ZeCO mismatch (P={P} L={L} C={C} D={dv}): max diff = {err}"
+    err, seed = _run_case(test_config.platform, device_ids, P, L, C, dk, dv, repeats=REPEATS)
+    assert err < 1e-2, (
+        f"PyPTO ZeCO mismatch (P={P} L={L} C={C} dk={dk} dv={dv} seed={seed}): "
+        f"max diff = {err}  [{REPEATS} dispatches; set ZECO_TEST_REPEATS to widen]"
+    )
 
 
 @pytest.mark.parametrize("L,C,dk,dv", GUARDED_SIZES, ids=lambda v: str(v))
