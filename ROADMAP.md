@@ -13,7 +13,7 @@ size, and in steady-state cost.
 
 | Piece | torch | torch-dist | simpler | pypto |
 |---|---|---|---|---|
-| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW P=1, `C,D ≤ 64`; ⚠️ **P=2 wrong at `dk != dv`** |
+| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ⚠️ HW `C,D ≤ 64` **and `dk >= C`** — see task 2 |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
 | **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ❌ — **B4, the only gap** |
 
@@ -26,7 +26,9 @@ operator — both were toolchain defects, and both fixes are now upstream.
 1. **`dv >= C`.** Below that a `pl.matmul` silently returns corrupt results — a pto-isa FIFO
    defect (filed, fix in review; see the upstream ledger). `PyPtoZeCo.build` refuses those
    shapes rather than returning wrong data.
-2. **`dk != dv` is wrong at `P >= 2`** — found 2026-08-12, see task 2. Not guarded yet.
+2. **`dk >= C` too.** The same defect reaches the `dk` side via `b = tril[C,C] @ la[C,dk]`, so
+   `dk < C` is corrupt as well — **intermittently**, which is why it went unnoticed. Not
+   guarded yet; task 2 has the evidence and the open question (the exact predicate).
 
 Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57 / simpler
 `3165cc89`):
@@ -37,14 +39,9 @@ Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57
 | backward — `test_simpler_gla_backward`, `test_gla_backward`, `test_zeco_autograd`, `test_*_backward` | **41 passed, 0 failed** |
 | AllScan race guard `test_pypto_allscan_back_to_back[4]` | **passed** (F1 still fixed on 0.57) |
 
-The single forward failure is the pre-existing `[2-128-64-32-64]`, unchanged by the update:
-
-| L, C, dk, dv | P=1 | P=2 |
-|---|---|---|
-| 128, 32, 32, 32 | ✅ | ✅ |
-| 128, 32, 64, 64 | ✅ | ✅ |
-| **128, 64, 32, 64** | ✅ | ❌ **max diff 186.05** |
-| 256, 64, 64, 64 | ✅ | ✅ |
+The single forward failure is `[2-128-64-32-64]`, unchanged by the update and now understood
+as the `dk < C` case of task 2. Do **not** read a per-P pattern into a single pytest run: the
+failure is intermittent, and dedicated repeats show P=1, P=2 and P=4 all affected.
 
 ## Environment
 
@@ -101,8 +98,10 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
 - **F3.1c — `dv < C` silently wrong.** Root-caused to pto-isa striding the consumer's local
   L1 FIFO ring by the popped tile's own size while the GM ring beside it uses a fixed
   `SLOT_SIZE`, so two differently-sized tiles held at once alias in L1. For `[M,K] @ [K,N]`
-  they overlap iff `N < M` — `K` cancels, which is why `dk` never mattered. One-line fix:
-  bare-matmul probe 8/18 → **18/18**, GLA 3/7 → **7/7**. Filed upstream.
+  they overlap iff `N < M` — `K` cancels. One-line fix: bare-matmul probe 8/18 → **18/18**,
+  GLA 3/7 → **7/7**. Filed upstream. (The original write-up added "which is why `dk` never
+  mattered" — **false**, see task 2: `dk < C` hits the same predicate through
+  `b = tril[C,C] @ la[C,dk]`, it just does so intermittently.)
 - **F3.2 / F3.3 — simpler at any tile size** `{16,32,64,128}`, square and rectangular `C≠D`,
   via runtime-scalar → compile-time template dispatch. Found and fixed two real bugs en
   route, one of them a pto-isa pipe-tagging gap (`TCOLEXPAND` needs `PIPE_ALL`).
@@ -160,28 +159,38 @@ The old pin *ceiling* is gone: the CPU-SIM `TASSIGN` arity break that blocked bu
 hang before trusting any new pin — that hang, not the arity break, was the real reason the
 last bump was reverted, and it was never bisected.
 
-### 2. pypto `dk != dv` is wrong at `P >= 2` — correctness gate
-Found 2026-08-12 while re-validating this roadmap. `L=128, C=64, dk=32, dv=64` passes at
-**P=1** and fails at **P=2**; the other three swept shapes pass at both. Two properties make
-this its own bug rather than a variant of F3.1c:
+### 2. The `dk`-side failure is F3.1c again — the `dv >= C` guard is incomplete
+Investigated 2026-08-12. `L=128, C=64, dk=32, dv=64` produces **total corruption** (~1.5e2–2.2e2
+against an output of similar magnitude; correct dispatches are exactly 2.29e-05).
 
-- the failing shape is the **only one with `dk != dv`**, and it only breaks on the P>=2 path,
-  i.e. the one that runs the real boundary ring;
-- the error **magnitude varies between runs** (1.40, then 186.05 on the same shape) — race-like,
-  where F3.1c was deterministic corruption.
+**It is very likely the same defect as F3.1c.** Paired A/B alternating the stock and F3.1c-fixed
+`TPush.hpp`, in one job on one card, identical probe modes each round:
 
-**Hypothesis, not yet tested:** the boundary carries the `[dk, dv]` state across ranks, so
-something on the exchange path is assuming a square state tile. P=1 never exercises it, which
-is exactly why this survived — and F7.1 noted at the time that "pypto kernels not yet swept"
-for `dk != dv`. That note was the outstanding risk; this is it coming due.
+| header | dispatches wrong |
+|---|---|
+| stock (`ConsM*ConsN` stride) | **12 / 84** |
+| F3.1c fix (`RingFiFo::SLOT_SIZE` stride) | **0 / 84** |
 
-Steps: reproduce standalone (a P=2 `dk != dv` case, no pytest); check the boundary buffer
-sizing/strides for a `dk == dv` assumption; A/B against the F3.1c-fixed pto-isa to rule it in
-or out. **Note:** `PTO_ISA_ROOT` is honoured by `device_runner.py` (early return, no pin
-check), but an A/B attempt on 2026-08-12 produced byte-identical output for both halves
-including wall time — verify the override actually takes effect before trusting such a run.
+The mechanism fits: `b = tril[C,C] @ la[C,dk]` is `[M=C, K=C, N=dk]`, so `N < M` exactly when
+**`dk < C`** — F3.1c's predicate on the `dk` side instead of the `dv` side. So the guard needs
+`dk >= C` as well as `dv >= C`. The old note claiming the `b` tile "is consumed on-chip and
+never stored, so `dk` does not matter" came from the superseded TSTORE framing and does not
+survive the real cause.
 
-Add a guard once characterized, as F3.1c got, so the operator cannot return corrupt results.
+Two earlier claims are **withdrawn**: it is not `P >= 2`-only (P=1 and P=4 fail too), and it is
+not `dk != dv` (both discriminators came back clean).
+
+**Still open — the exact predicate.** Failure rates vary from 0/6 to 10/10 between processes
+with no variable yet identified, so a 3-repeat "OK" misses a 1-in-6 failure 57% of the time.
+The axis-matrix "stable OK" rows therefore do **not** establish that those shapes are clean;
+`C=64, dk=16` in particular needs retesting. Re-run the matrix at **>=20 dispatches per
+config**, then extend the guard to whatever it shows.
+
+Method notes worth keeping (probes in `../devtools/t2_*`): patch `/opt/pto-isa` directly rather
+than overriding `PTOAS_ROOT` (an override A/B gave byte-identical halves and could not be
+trusted); **prove the header is live** by injecting `#error` and requiring the sentinel in the
+compiler output; and never run a second HW job while one mutates `/opt/pto-isa` — one matrix
+run was lost to compiling against another job's sentinel.
 
 ### 3. Forward-at-scale sweep
 `N ∈ {2,4,8,16,32}` × `P ∈ {1,2,4}` × shapes, both device backends, against `expected_gla`.
