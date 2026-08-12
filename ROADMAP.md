@@ -200,12 +200,35 @@ injecting `#error` and requiring the sentinel in the compiler output — a null 
 meaningless without it; never run a second HW job while one mutates `/opt/pto-isa`; and on an
 intermittent failure, never conclude from a single run in either direction.
 
-### 3. Forward-at-scale sweep
-`N ∈ {2,4,8,16,32}` × `P ∈ {1,2,4}` × shapes, both device backends, against `expected_gla`.
-F2 was fixed and spot-checked at 12/12, but the full sweep was never run — so "forward is
-correct at scale" is an inference, not a measurement. Task 2 is precisely what a sweep would
-have caught a month ago; run it before making any scale claim, and fold in `dk != dv` and
-`P=4` explicitly.
+### 3. Forward-at-scale sweep — DONE 2026-08-12
+F2 was fixed and spot-checked at 12/12, but the full sweep had never been run, so "correct at
+scale" was an inference. Now measured (`../devtools/f_scale_sweep.py`), N-axis at a fixed shape
+plus the shape corners, each config built once and dispatched against **distinct seeds**:
+
+| backend | repeats/config | result |
+|---|---|---|
+| pypto | 10 | **19/19 configs clean** — `N ∈ {2,4,8,16,32}` × `P ∈ {1,2,4}`, up to `L=1024` (128 chunks at P=4), plus all five reachable shape corners |
+| simpler | 3 | **13/13 configs clean** — same axes, plus `C=D=128` |
+
+Worst error anywhere: **1.07e-04** (simpler, `C=D=128`); pypto's worst was 9.16e-05. No
+config drifted with `N`, which is the property F2's fix was supposed to restore.
+
+**Read the clean result with its power in mind.** At R repeats a defect corrupting a fraction
+`p` of dispatches is missed with probability `(1-p)^R`: pypto's R=10 misses a 5%-rate defect
+**60%** of the time, simpler's R=3 misses it **86%**. The sweep prints this itself. It is
+strong evidence against a *systematic* N- or P-scaling error and weak evidence against another
+rare intermittent one — which is the honest reading given task 2's defect reproduced at ~1/20.
+simpler's R=3 is a cost decision: its per-call worker cycling makes a dispatch ~30 s against
+pypto's ~1 s.
+
+Test-suite gap closed at the same time: `make_gla_inputs` seeds torch itself (default 42), so
+every run had been replaying **one** input point per shape. `_run_case` now dispatches
+`ZECO_TEST_REPEATS` times (default 3) against distinct seeds and names the failing seed.
+
+Two configs errored rather than failed — `LocalMailboxEndpoint child failed ... native
+finalize`, both immediately after a slow P=2 config, and both **correct when re-run in
+isolation**. That is a simpler-runtime teardown race between consecutive build/close cycles,
+not a correctness result. Worth watching; it would also hit the bench harness.
 
 ### 4. B4 — pypto fused distributed backward
 The last unimplemented backend: chunk-gradient InCore kernels plus the existing reverse-ring
