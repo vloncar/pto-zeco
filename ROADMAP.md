@@ -13,7 +13,7 @@ size, and in steady-state cost.
 
 | Piece | torch | torch-dist | simpler | pypto |
 |---|---|---|---|---|
-| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C,D ≤ 64`, `min(dk,dv) >= C` (guarded) |
+| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C,D ≤ 64`, any `dk`/`dv` |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
 | **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ❌ — **B4, the only gap** |
 
@@ -21,14 +21,10 @@ Both correctness gates that dominated this roadmap for months are **closed**: th
 producer race and the `N = L//C > 2` loop-carry corruption. Neither was ever a bug in this
 operator — both were toolchain defects, and both fixes are now upstream.
 
-**Two live constraints on pypto:**
-
-1. **`dv >= C`.** Below that a `pl.matmul` silently returns corrupt results — a pto-isa FIFO
-   defect (filed, fix in review; see the upstream ledger). `PyPtoZeCo.build` refuses those
-   shapes rather than returning wrong data.
-2. **`dk >= C` too.** The same defect reaches the `dk` side via `b = tril[C,C] @ la[C,dk]`,
-   intermittently (~1 in 20 dispatches, vs every dispatch for `dv < C`). Both are now guarded
-   as `min(dk, dv) >= C` — see task 2.
+**One live dependency:** the pto-isa FIFO local-slot fix (MR !1457, merged) is **carried
+locally** because our pin predates it — see task 1. Without that patch, `dv < C` corrupts every
+dispatch and `dk < C` about 1 in 20, silently. With it, all head-dim ratios are correct and the
+shape guard is gone.
 
 Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57 / simpler
 `3165cc89`):
@@ -142,22 +138,34 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
 
 Six tasks, in dependency order. Everything else is parked below.
 
-### 1. Move pto-isa off `83d01313` and drop the last carried patch
-**Partly done 2026-08-12:** pypto is on main and the pypto-side F2 patch is gone (upstream as
-#2271). What remains is pto-isa, which pypto still pins at `83d01313` — predating both
-`69a81f3b` (so we carry the DIR_BOTH patch) and !1457.
+### 1. Carry the merged pto-isa fixes; guard removed — DONE 2026-08-13
+pypto is on main and its F2 patch is gone (upstream as #2271). pto-isa is the remaining
+carried piece, and it stays carried for a structural reason: **the pin is not ours to move.**
+`runtime/pto_isa.pin` in the simpler submodule sets it, the runtime enforces `HEAD == pin`,
+and pypto main still pins `83d01313` — which predates both fixes we need.
 
-The pin comes from `runtime/pto_isa.pin` in the simpler submodule, so it moves when the
-runtime bumps it; we cannot advance it unilaterally without diverging from what the runtime
-enforces (`HEAD == pin`). Once !1457 merges and the runtime pin moves past both commits:
-drop the DIR_BOTH patch, remove the `dv >= C` guard in `PyPtoZeCo.build`, and restore
-`(128, 64, 32, 32)` to `SIZES` as a correctness case (`ZECO_ALLOW_TALL=1` validates the fix
-ahead of that).
+Both are now **merged upstream** and carried locally against that pin
+(`allscan/issues/pto-isa-fifo-local-slot-alias/carried-on-pin-83d01313.patch`):
 
-The old pin *ceiling* is gone: the CPU-SIM `TASSIGN` arity break that blocked bumping past
-`1cb027c8` is fixed upstream (`439faf48`, `831ef9d2`). Re-verify the sim `P=1, L=128, C=D=32`
-hang before trusting any new pin — that hang, not the arity break, was the real reason the
-last bump was reverted, and it was never bisected.
+| fix | upstream | why we carry it |
+|---|---|---|
+| DIR_BOTH V2C ring offset | `69a81f3b` (MR !1438, issue #516) | pin predates it |
+| consumer local-slot stride | MR **!1457** (issue #521) | pin predates it |
+
+With the second one applied, the `min(dk, dv) >= C` guard in `PyPtoZeCo.build` is **removed**
+and the four shapes it refused are correctness cases again. Validated at 40 dispatches each:
+
+| shape | before | after |
+|---|---|---|
+| `C=64,dv=32` / `C=32,dv=16` (`dv < C`) | 20/20 wrong | **0/40** |
+| `C=64,dk=32` / `C=32,dk=16` (`dk < C`) | ~1/20 wrong | **0/40** |
+
+`SIZES` regained all four, so **the suite is now the regression test for the carried patch** —
+if it is ever lost, those cases go red rather than silently corrupting. The `dk < C` pair needs
+`ZECO_TEST_REPEATS` raised to be a meaningful check: at ~1/20, the default 3 repeats would miss
+a regression 86% of the time.
+
+Drop the patch and this note when the runtime bumps `pto_isa.pin` past both commits.
 
 ### 2. `dk`-side corruption — DONE 2026-08-12, guard extended to `min(dk,dv) >= C`
 The failure at `C=64, dk=32, dv=64` is **the same defect as F3.1c**, reached through the `dk`
@@ -285,7 +293,7 @@ Deliberately not doing, with the reason:
 | F2 — a2a3 DIR_BOTH rings alias the same GM slots | pto-isa issue **#516** / MR **!1438** | **merged / closed** |
 | F2 — size the GM pipe workspace for both rings | pypto PR **#2271** | **merged** (`d26e0f6c`) |
 | F1 — producer drain before `TNOTIFY` | pypto #2183, #2168 + ptoas 0.54 | **fixed upstream** |
-| F3.1c — consumer local FIFO ring aliases | pto-isa issue **#521** / MR **!1457** | **in review** — gates task 1 |
+| F3.1c — consumer local FIFO ring aliases | pto-isa issue **#521** / MR **!1457** | **merged** — carried locally until the pin moves |
 | CPU-SIM `TASSIGN` arity break | — | **fixed upstream** (`439faf48`); write-up retired |
 | simpler second-callable silent corruption | — | **gone** on runtime `9922afdb`; write-up retired |
 | `comm_alloc_domain_windows -1` | — | environment, not a code bug; retired |

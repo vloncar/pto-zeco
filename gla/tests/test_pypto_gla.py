@@ -39,6 +39,9 @@ def _golden(Q, K, V, A):
 # so a single dispatch on a single input is weak evidence of correctness. Each size case
 # therefore dispatches REPEATS times against distinct seeds, and reports the seed that failed
 # so it can be replayed. Kept small by default to bound CI time; raise it when hunting.
+# 3 by default to bound CI time. Note this is thin for the `dk < C` shapes above, which
+# corrupted only ~1 dispatch in 20 before the fix: 3 repeats would miss a regression there
+# ~86% of the time. Raise ZECO_TEST_REPEATS when validating the carried pto-isa patch.
 REPEATS = int(os.environ.get("ZECO_TEST_REPEATS", "3"))
 
 
@@ -82,30 +85,18 @@ def test_pypto_zeco(test_config, device_ids, P):
 SIZES = [
     (128, 32, 32, 32),    # the pre-F3.1 ceiling — regression guard
     (128, 32, 64, 64),    # D=64 was already reachable (only C drives the [C,C] tiles)
-    (128, 32, 64, 32),    # dk != dv, both >= C — keeps asymmetric coverage in the suite
+    (128, 32, 64, 32),    # dk != dv, both >= C
     (256, 64, 64, 64),    # C=64, D=64: the mainstream GLA config, N=4 chunks
+    # Both head dims below C. These were REFUSED by build() until 2026-08-13, because the
+    # pto-isa FIFO local-slot aliasing (issue #521) made them silently corrupt: dv < C on
+    # every dispatch, dk < C about 1 in 20. !1457 is merged and the fix is carried against
+    # our pin, so they are correctness cases again — and they are the regression test for
+    # that carried patch. If it is ever dropped, these are what should go red.
+    (128, 64, 32, 32),    # dv < C  (and dk < C) — was the original F3.1c failure
+    (128, 32, 16, 16),    # dv < C at half the size
+    (128, 64, 32, 64),    # dk < C only — the intermittent side, needs the repeats below
+    (128, 32, 16, 32),    # dk < C only, at C=32
 ]
-
-# A head dim below C is silently wrong on a2a3 HARDWARE (correct on a2a3sim) — not an operator
-# bug but a pto-isa one: a cross-core TPipe strides the consumer's local ring by the popped
-# tile's own size instead of SLOT_SIZE, so a matmul's two operands alias in L1 whenever N < M
-# (allscan/issues/pto-isa-fifo-local-slot-alias/, ROADMAP F3.1c + task 2; upstream issue #521).
-# `build()` refuses these shapes rather than returning corrupt results, so they are kept here
-# to assert that the guard fires. Turn them back into correctness cases once the upstream fix
-# merges and the pto-isa pin moves past it.
-#
-# The two sides behave very differently, measured at 20 dispatches each:
-#   dv < C  deterministic — 20/20 dispatches wrong.
-#   dk < C  intermittent  — ~1/20, and some dk < C shapes stayed quiet across 20. At that rate
-#           a clean run of 20 misses it 36% of the time, so quiet is NOT proof of safety and
-#           the guard covers all of dk < C.
-GUARDED_SIZES = [
-    (128, 64, 32, 32),    # dv < C: C=64, dv=32
-    (128, 32, 16, 16),    # dv < C: C=32, dv=16 — same defect at half the size
-    (128, 64, 32, 64),    # dk < C: was a correctness case until task 2 showed it corrupts
-    (128, 32, 16, 32),    # dk < C at C=32 — the second shape that reproduced
-]
-
 
 @pytest.mark.forked
 @pytest.mark.parametrize("L,C,dk,dv", SIZES, ids=lambda v: str(v))
@@ -119,18 +110,6 @@ def test_pypto_zeco_sizes(test_config, device_ids, P, L, C, dk, dv):
         f"PyPTO ZeCO mismatch (P={P} L={L} C={C} dk={dk} dv={dv} seed={seed}): "
         f"max diff = {err}  [{REPEATS} dispatches; set ZECO_TEST_REPEATS to widen]"
     )
-
-
-@pytest.mark.parametrize("L,C,dk,dv", GUARDED_SIZES, ids=lambda v: str(v))
-def test_pypto_zeco_rejects_head_dim_below_C(test_config, device_ids, L, C, dk, dv):
-    """A shape that the hardware computes incorrectly must be refused, not silently run.
-
-    No device needed — the guard fires in build() before anything is dispatched.
-    """
-    impl = PyPtoZeCo()
-    with pytest.raises(AssertionError, match="silently WRONG"):
-        impl.build(1, L, C, dk, dv, device_ids=device_ids[:1] or [0],
-                   platform=test_config.platform)
 
 
 if __name__ == "__main__":
