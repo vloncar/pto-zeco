@@ -85,6 +85,14 @@ class PyPtoZeCo(ZeCoImpl):
     #: build() prepares the worker once, so measure() times only steady-state dispatch.
     amortized_timing = True
 
+    #: The backward is amortized on the same terms: the first ``backward`` swaps the live
+    #: worker to the backward program (paying one prepare, and one close of the forward's),
+    #: and ``measure_backward`` warms that swap before sampling. So repeated backward calls
+    #: time only the dispatch. Note it is the *direction switch* that is expensive here, not
+    #: the direction itself — alternating forward/backward per iteration would pay it every
+    #: time, which is why the benchmark measures one direction at a time.
+    amortized_timing_backward = True
+
     def __init__(self) -> None:
         self._compiled = None
         self._bcompiled = None

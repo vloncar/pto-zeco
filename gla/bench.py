@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ZeCO / GLA forward-pass benchmark suite.
+"""ZeCO / GLA benchmark suite — forward and backward.
 
 Compares every registered ZeCO implementation (see ``gla/implementations/``):
 
@@ -7,13 +7,25 @@ Compares every registered ZeCO implementation (see ``gla/implementations/``):
   simpler  — hand-written PTO-ISA kernels + real AllScan (per-kernel worker cycles)
   pypto    — one fully-fused distributed @pl.program (single prepare/rt/close)
 
-Every backend is timed **identically**: ``build()`` once, then ``forward(Q,K,V,A)``
-end-to-end for warmup + timed iterations. No implementation gets a special amortized
-path (``ZeCoImpl`` has no ``measure()`` hook), so the wall-clock is the honest
-as-implemented forward latency — *including* each backend's per-call worker setup
-(pypto: one ``DistributedWorker`` prepare/close; simpler: ``3P+1`` sequential
-per-kernel worker init/close cycles + a separate AllScan worker). ``build_s`` (the
-one-time compile) is reported separately.
+Every backend is timed the same way: ``build()`` once, then repeated end-to-end calls
+of the selected direction. Timing goes through ``measure`` / ``measure_backward``, so a
+backend whose per-call cost is dominated by fixed orchestration setup can amortize it
+(prepare at ``build``, time only the dispatch) — the ``SS`` column says, **per
+direction**, whether that happened, and ``build_s`` / ``cold_ms`` keep the one-time and
+first-call costs visible separately.
+
+**Reading the backward rows (B5.4).** The backends place the backward's work
+differently: simpler runs the snapshot shifts and the reverse chunk recurrence as
+host-side torch glue between device dispatches, while pypto's backward is one fused
+device program. These numbers are therefore end-to-end per-call wall clock, which counts
+that host work — the only basis on which the two are comparable. **Do not derive a
+compute-vs-comm or kernel-vs-kernel split from them** while F6.6 (work-placement parity)
+is open; a device-only figure flatters whichever backend offloads more to the host.
+
+Also note pypto's ``P>1`` backward currently needs a locally carried pypto codegen patch
+(comm-dispatch ordering, upstream issue #2397 / PR #2398). On stock pypto every ``P>1``
+backward config deadlocks, so any backward number here is measured on a patched
+toolchain until that merges.
 
 Usage:
     # Real Ascend hardware (preload HCCL):
@@ -103,13 +115,20 @@ if sys.path[:1] != [str(_THIS_DIR)]:
     sys.path.insert(0, str(_THIS_DIR))
 
 from common.harness import parse_devices, percentile, print_table  # noqa: E402
-from gla.common import expected_gla, flatten_seq, make_gla_inputs  # noqa: E402
+from gla.common import (  # noqa: E402
+    expected_gla,
+    expected_gla_backward,
+    flatten_seq,
+    make_gla_inputs,
+)
 from gla.implementations import REGISTRY  # noqa: E402
 
 
-# (key, header, width, fmt) — GLA forward timing table.
+# (key, header, width, fmt) — GLA timing table. ``Dir`` distinguishes forward from backward
+# rows so a --direction both sweep prints one comparable table.
 GLA_COLS = [
     ("impl", "Impl", 7, "s"),
+    ("dir", "Dir", 4, "s"),
     ("P", "P", 2, "d"),
     ("L", "L", 5, "d"),
     ("C", "C", 4, "d"),
@@ -125,50 +144,92 @@ GLA_COLS = [
 ]
 
 
-def bench_one(impl, P, L, C, dk, dv, device_ids, platform, n_warmup, n_iters, verify):
-    """Run one (impl, config) and return a result dict with forward-latency stats.
+def bench_one(impl, P, L, C, dk, dv, device_ids, platform, n_warmup, n_iters, verify,
+              direction="forward"):
+    """Run one (impl, config, direction) and return a result dict with latency stats.
 
-    Timing is **steady-state**: it uses ``impl.measure`` (not a raw ``forward`` loop),
-    so a backend that pays a fixed per-call orchestration setup (pypto's
+    Timing is **steady-state where the backend supports it**: it goes through
+    ``impl.measure`` / ``impl.measure_backward`` rather than a raw call loop, so a
+    backend that pays a fixed per-call orchestration setup (pypto's
     ``DistributedWorker`` prepare/close) can amortize it — prepare once at ``build``,
     time only the repeated dispatch. ``build_s`` (one-time compile + prepare) and
-    ``cold_ms`` (first forward) are reported separately so the honest split between
-    one-time cost, first-call cost, and steady-state operator latency is visible.
-    ``SS`` marks whether the backend reports amortized (steady-state) numbers.
+    ``cold_ms`` (first call of this direction) are reported separately so the honest
+    split between one-time cost, first-call cost and steady-state operator latency
+    stays visible. ``SS`` marks whether *this direction* is amortized — it is read per
+    direction, because a backend can be amortized forward and not backward.
+
+    **On comparing backward numbers across backends (B5.4/F6.6).** The two backends put
+    the backward's work in different places: simpler runs the snapshot shifts and the
+    reverse chunk recurrence as host-side torch glue between device dispatches, while
+    pypto's backward is one fused device program. The timings below are therefore
+    deliberately **end-to-end per-call wall clock**, which counts that host work. Do not
+    turn them into a compute-vs-comm or kernel-vs-kernel split — F6.6 is still open, and
+    a device-only figure would flatter whichever backend offloads more to the host.
     """
+    backward = direction == "backward"
     t0 = time.perf_counter()
     impl.build(P, L, C, dk, dv, device_ids[:P], platform)
     build_s = time.perf_counter() - t0
 
     Q, K, V, A = make_gla_inputs(P, L, dk, dv)
+    # make_gla_inputs seeds torch itself, so dO is deterministic for a given (P, L, dv).
+    dO = torch.randn(P, L, dv) if backward else None
 
     correct: Optional[bool] = None
     max_diff = float("nan")
     if verify:
-        O = impl.forward(Q, K, V, A)
-        exp = expected_gla(flatten_seq(Q), flatten_seq(K), flatten_seq(V), flatten_seq(A)).reshape(P, L, dv)
-        max_diff = (O - exp).abs().max().item()
-        # on-device chunk math divides by within-chunk cumulative decay → looser than ref
-        correct = bool(torch.allclose(O, exp, atol=1e-2))
+        if backward:
+            got = impl.backward(Q, K, V, A, dO)
+            exp = expected_gla_backward(flatten_seq(Q), flatten_seq(K), flatten_seq(V),
+                                        flatten_seq(A), flatten_seq(dO))
+            # Worst relative error over all four gradients, scaled by each one's own
+            # magnitude: dQ/dK/dV/dA differ by orders of magnitude, so a single absolute
+            # tolerance would be vacuous on the small ones and unreachable on the large.
+            rels = []
+            for g, e in zip(got, exp):
+                e_r = e.reshape(g.shape)
+                denom = e_r.abs().max().item()
+                rels.append((g - e_r).abs().max().item() / max(denom, 1e-12))
+            max_diff = max(rels)
+            correct = bool(max_diff < 1e-2)
+        else:
+            O = impl.forward(Q, K, V, A)
+            exp = expected_gla(flatten_seq(Q), flatten_seq(K), flatten_seq(V),
+                               flatten_seq(A)).reshape(P, L, dv)
+            max_diff = (O - exp).abs().max().item()
+            # on-device chunk math divides by within-chunk cumulative decay → looser than ref
+            correct = bool(torch.allclose(O, exp, atol=1e-2))
+
+    def call():
+        if backward:
+            impl.backward(Q, K, V, A, dO)
+        else:
+            impl.forward(Q, K, V, A)
 
     # cold start (first timed call). For an amortized backend prepare is already done in
     # build(), so this is close to steady-state; otherwise it carries per-call setup.
+    # For pypto's backward this also absorbs the one-time forward->backward worker swap.
     t0 = time.perf_counter()
-    impl.forward(Q, K, V, A)
+    call()
     cold_ms = (time.perf_counter() - t0) * 1e3
 
     for _ in range(max(0, n_warmup)):
-        impl.forward(Q, K, V, A)
+        call()
 
-    # steady-state samples (prepare-once backends time only the dispatch)
-    lat_ms = impl.measure(Q, K, V, A, n_iters)
+    if backward:
+        lat_ms = impl.measure_backward(Q, K, V, A, dO, n_iters)
+        steady = getattr(impl, "amortized_timing_backward", False)
+    else:
+        lat_ms = impl.measure(Q, K, V, A, n_iters)
+        steady = getattr(impl, "amortized_timing", False)
 
     return {
-        "impl": impl.name, "P": P, "L": L, "C": C, "D": dk,
+        "impl": impl.name, "dir": "bwd" if backward else "fwd",
+        "P": P, "L": L, "C": C, "D": dk,
         "build_s": build_s, "cold_ms": cold_ms,
         "mean_ms": statistics.mean(lat_ms), "min_ms": min(lat_ms),
         "p50_ms": percentile(lat_ms, 50), "p95_ms": percentile(lat_ms, 95),
-        "steady": "Y" if getattr(impl, "amortized_timing", False) else "N",
+        "steady": "Y" if steady else "N",
         "correct": correct, "max_diff": max_diff, "raw_ms": lat_ms,
     }
 
@@ -199,6 +260,12 @@ def main() -> None:
     parser.add_argument("--platform", default="a2a3", help="Target platform. Default: a2a3")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iters after cold call. Default: 3")
     parser.add_argument("--iters", type=int, default=10, help="Timed iters per config. Default: 10")
+    parser.add_argument("--direction", default="forward",
+                        choices=("forward", "backward", "both"),
+                        help="Which pass to benchmark. Default: forward. Note 'both' times each "
+                             "direction in its own block, NOT alternating per iteration: pypto "
+                             "holds one prepared worker at a time, so alternating would pay a "
+                             "forward<->backward worker swap every call.")
     parser.add_argument("--no-verify", action="store_true", help="Skip correctness check")
     parser.add_argument("--no-clean", action="store_true",
                         help="Do not delete stale /tmp/barrier_pto_multi_comm_* between configs")
@@ -212,6 +279,7 @@ def main() -> None:
     print(f"Devices : {device_ids}  ({len(device_ids)} available)")
     print(f"Platform: {args.platform}")
     print(f"Warmup  : {args.warmup}   Iters: {args.iters}   Verify: {not args.no_verify}")
+    print(f"Direction: {args.direction}")
     check_preload(args.platform)
 
     if args.impl:
@@ -236,43 +304,49 @@ def main() -> None:
     # so one bad config can't cascade -1 failures across the rest of the sweep.
     suspect: set[int] = set()
 
+    directions = ("forward", "backward") if args.direction == "both" else (args.direction,)
+
     all_rows: list[dict] = []
+    # Direction is the OUTER loop over configs so each (impl, direction) block runs its
+    # configs back to back. pypto holds one prepared worker at a time, so interleaving the
+    # two directions would pay a forward<->backward swap on every call.
     for impl_obj in impls:
-        print(f"\n=== {impl_obj.name} ===")
-        for (P, L, C, D) in configs:
-            used = device_ids[:P]
-            wedged = suspect.intersection(used)
-            if wedged:
-                print(f"  P={P} L={L} C={C} D={D} ... SKIP (devices {sorted(wedged)} "
-                      f"wedged by an earlier 507018; reset them to re-enable)")
-                continue
-            # Clean stale rendezvous before each config so a prior config's killed/leaked
-            # comm domain can't hang this one at rootinfo (F5 operational hardening).
-            if not args.no_clean:
-                clean_rendezvous()
-            print(f"  P={P} L={L} C={C} D={D} ... ", end="", flush=True)
-            try:
-                row = bench_one(impl_obj, P, L, C, D, D, device_ids, args.platform,
-                                args.warmup, args.iters, not args.no_verify)
-                ok = "?" if row["correct"] is None else ("Y" if row["correct"] else "N")
-                print(f"mean={row['mean_ms']:.2f}ms cold={row['cold_ms']:.2f}ms "
-                      f"build={row['build_s']:.2f}s {ok}")
-                all_rows.append(row)
-            except Exception as exc:
-                print(f"FAILED: {exc}")
-                if is_drain_timeout(exc):
-                    suspect.update(used)
-                    print(f"    -> 507018 drain-timeout: marking devices {used} suspect "
-                          f"(skipping later configs that reuse them).")
-                    snap = npu_smi_snapshot()
-                    if snap:
-                        print("    npu-smi at failure:\n      " + snap.replace("\n", "\n      "))
-            finally:
-                # Always release the worker AND clear any rendezvous it leaked, so a
-                # failed config (e.g. device 507018) can't poison the next one.
-                impl_obj.close()
+        for direction in directions:
+            print(f"\n=== {impl_obj.name} [{direction}] ===")
+            for (P, L, C, D) in configs:
+                used = device_ids[:P]
+                wedged = suspect.intersection(used)
+                if wedged:
+                    print(f"  P={P} L={L} C={C} D={D} ... SKIP (devices {sorted(wedged)} "
+                          f"wedged by an earlier 507018; reset them to re-enable)")
+                    continue
+                # Clean stale rendezvous before each config so a prior config's killed/leaked
+                # comm domain can't hang this one at rootinfo (F5 operational hardening).
                 if not args.no_clean:
                     clean_rendezvous()
+                print(f"  P={P} L={L} C={C} D={D} ... ", end="", flush=True)
+                try:
+                    row = bench_one(impl_obj, P, L, C, D, D, device_ids, args.platform,
+                                    args.warmup, args.iters, not args.no_verify, direction)
+                    ok = "?" if row["correct"] is None else ("Y" if row["correct"] else "N")
+                    print(f"mean={row['mean_ms']:.2f}ms cold={row['cold_ms']:.2f}ms "
+                          f"build={row['build_s']:.2f}s {ok}")
+                    all_rows.append(row)
+                except Exception as exc:
+                    print(f"FAILED: {exc}")
+                    if is_drain_timeout(exc):
+                        suspect.update(used)
+                        print(f"    -> 507018 drain-timeout: marking devices {used} suspect "
+                              f"(skipping later configs that reuse them).")
+                        snap = npu_smi_snapshot()
+                        if snap:
+                            print("    npu-smi at failure:\n      " + snap.replace("\n", "\n      "))
+                finally:
+                    # Always release the worker AND clear any rendezvous it leaked, so a
+                    # failed config (e.g. device 507018) can't poison the next one.
+                    impl_obj.close()
+                    if not args.no_clean:
+                        clean_rendezvous()
 
     print_table(all_rows, cols=GLA_COLS)
 

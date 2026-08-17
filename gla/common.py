@@ -565,6 +565,47 @@ class ZeCoImpl(ABC):
             samples.append((time.perf_counter() - t0) * 1e3)
         return samples
 
+    #: The backward's analogue of :attr:`amortized_timing`. Kept separate because a
+    #: backend can be amortized in one direction and not the other: pypto prepares a
+    #: reusable worker for whichever direction is live, while simpler's persistent
+    #: fast path currently covers only the forward's kernels.
+    amortized_timing_backward: bool = False
+
+    def measure_backward(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        A: torch.Tensor,
+        dO: torch.Tensor,
+        n_iters: int,
+    ) -> list[float]:
+        """Return ``n_iters`` per-backward latency samples in milliseconds.
+
+        Default implementation times :meth:`backward` once per sample, so the numbers
+        carry the full per-call cost **including any host-side glue the backend does
+        between device dispatches**. That is deliberate: the backward's host/device
+        work split differs sharply between backends (simpler runs the reverse chunk
+        recurrence and the snapshot shifts on the host; pypto does all of it on
+        device), so a device-only figure would not be comparable. Report end-to-end
+        per-call latency and let :attr:`amortized_timing_backward` say whether
+        one-time setup was excluded.
+
+        Args:
+            Q, K, V, A: Forward inputs, shapes ``[P, L, dk/dv]`` (rank-major).
+            dO: Upstream gradient of the outputs, shape ``[P, L, dv]``.
+            n_iters: Number of latency samples to collect.
+
+        Returns:
+            A list of ``n_iters`` per-backward latencies in milliseconds.
+        """
+        samples: list[float] = []
+        for _ in range(n_iters):
+            t0 = time.perf_counter()
+            self.backward(Q, K, V, A, dO)
+            samples.append((time.perf_counter() - t0) * 1e3)
+        return samples
+
     def close(self) -> None:
         """Release resources (override if needed)."""
 
