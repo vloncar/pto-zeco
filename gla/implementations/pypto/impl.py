@@ -148,8 +148,17 @@ class PyPtoZeCo(ZeCoImpl):
         dist_cfg = DistributedConfig(device_ids=self.device_ids, num_sub_workers=0)
         self._compiled = ir.compile(build_fused_forward_program(L, C, dk, dv, 1, P),
                                     platform=platform, distributed_config=dist_cfg)
-        self._bcompiled = ir.compile(build_fused_backward_program(L, C, dk, dv, 1, P),
-                                     platform=platform, distributed_config=dist_cfg)
+        # The BACKWARD is compiled lazily, on first use (see _ensure_backward_compiled).
+        # It used to be compiled here, unconditionally, which coupled the two directions in
+        # two unwanted ways: a forward-only run paid the backward's compile time, and — worse
+        # — the backward's tighter shape ceiling *capped the forward*. `grad_o` is the widest
+        # kernel in either direction, so at C=32/dk=dv=64 the backward overflows the vector
+        # buffer by ~1 KB (189440 vs 188416) and `ir.compile` raises. With an eager compile
+        # that killed the whole config, so a shape the forward reaches comfortably could not
+        # be benchmarked or run at all. Only the *buffers* below must be eager (they have to
+        # exist before prepare() forks the chip children); compiling does not.
+        self._bcompiled = None
+        self._bcompile_args = (L, C, dk, dv, P, platform, dist_cfg)
 
         # Prepare-once: for the distributed path, allocate the shared IO buffers BEFORE
         # prepare() forks the chip workers, and reuse them in place. (P=1 that compiles
@@ -206,8 +215,23 @@ class PyPtoZeCo(ZeCoImpl):
         if self._rt is not None:
             self._rt.close()
             self._rt = None
+        if backward:
+            self._ensure_backward_compiled()
         self._rt = (self._bcompiled if backward else self._compiled).prepare()
         self._rt_backward = backward
+
+    def _ensure_backward_compiled(self):
+        """Compile the fused backward on first use; a no-op afterwards.
+
+        Kept out of :meth:`build` so a forward-only user neither pays its compile time nor
+        inherits its narrower shape ceiling — see the note in :meth:`build`.
+        """
+        if self._bcompiled is not None:
+            return
+        from pypto import ir
+        L, C, dk, dv, P, platform, dist_cfg = self._bcompile_args
+        self._bcompiled = ir.compile(build_fused_backward_program(L, C, dk, dv, 1, P),
+                                     platform=platform, distributed_config=dist_cfg)
 
     def _dispatch(self):
         """Run one fused-forward dispatch on the prepared worker (inputs already staged)."""

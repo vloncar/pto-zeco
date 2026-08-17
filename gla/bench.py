@@ -84,6 +84,18 @@ def check_preload(platform: str) -> None:
               file=sys.stderr)
 
 
+def is_shape_ceiling(exc: BaseException) -> bool:
+    """True if ``exc`` is a compile-time "this shape does not fit" rejection.
+
+    pypto raises it from ``ir.compile`` when the live tiles overflow the platform's vector
+    buffer. It is a property of the (C, D) shape, not a defect, so the benchmark reports it
+    as a skip: the backward's ``grad_o`` is the widest kernel in either direction, so a
+    shape the forward runs comfortably can be out of range for the backward.
+    """
+    msg = str(exc)
+    return "exceeds platform limit" in msg or "Vec buffer usage" in msg
+
+
 def is_drain_timeout(exc: BaseException) -> bool:
     """True if ``exc`` looks like the ``507018`` AICore drain-timeout.
 
@@ -333,6 +345,14 @@ def main() -> None:
                           f"build={row['build_s']:.2f}s {ok}")
                     all_rows.append(row)
                 except Exception as exc:
+                    if is_shape_ceiling(exc):
+                        # Not a defect: this shape does not fit the backend's vector
+                        # budget. Distinguished from FAILED so a config that is simply out
+                        # of range does not read as a broken backend. The backward's
+                        # `grad_o` is the widest kernel in either direction, so a shape the
+                        # forward reaches can be out of range for the backward.
+                        print(f"SKIP (shape exceeds vector budget): {str(exc)[:90]}")
+                        continue
                     print(f"FAILED: {exc}")
                     if is_drain_timeout(exc):
                         suspect.update(used)
