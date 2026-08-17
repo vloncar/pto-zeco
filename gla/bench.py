@@ -344,6 +344,11 @@ def main() -> None:
                     print(f"mean={row['mean_ms']:.2f}ms cold={row['cold_ms']:.2f}ms "
                           f"build={row['build_s']:.2f}s {ok}")
                     all_rows.append(row)
+                    # Flush after every row: a long sweep (simpler's non-amortized backward
+                    # pays 3P+1 worker init/close cycles per call) can outlive its timeout,
+                    # and writing only at the end would throw away every completed config.
+                    if args.json:
+                        Path(args.json).write_text(json.dumps(all_rows, indent=2))
                 except Exception as exc:
                     if is_shape_ceiling(exc):
                         # Not a defect: this shape does not fit the backend's vector
@@ -372,7 +377,7 @@ def main() -> None:
 
     if args.json:
         Path(args.json).write_text(json.dumps(all_rows, indent=2))
-        print(f"Results written to {args.json}")
+        print(f"Results written to {args.json} ({len(all_rows)} rows)")
 
 
 if __name__ == "__main__":
