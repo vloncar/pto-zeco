@@ -15,9 +15,9 @@ size, and in steady-state cost.
 |---|---|---|---|---|
 | **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C,D ≤ 64`, any `dk`/`dv` |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
-| **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2** — `C ≤ 32`, `D ≤ 64` (P=4 untested: needs 4 comm-capable cards) |
+| **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2/4** — `C ≤ 32`, `D ≤ 64` |
 
-**B4 is correct on HW at P=1 and P=2 (2026-08-14).** The pypto backward is one fully-fused
+**B4 is correct on HW at P=1, P=2 and P=4.** The pypto backward is one fully-fused
 distributed program, the same shape as the forward. The `P>1` hang that blocked it for weeks
 was a **pypto codegen bug, not an operator bug** — the operator needed no change — and is
 root-caused and fixed below.
@@ -60,10 +60,16 @@ Both correctness gates that dominated this roadmap for months are **closed**: th
 producer race and the `N = L//C > 2` loop-carry corruption. Neither was ever a bug in this
 operator — both were toolchain defects, and both fixes are now upstream.
 
-**One live dependency:** the pto-isa FIFO local-slot fix (MR !1457, merged) is **carried
-locally** because our pin predates it — see task 1. Without that patch, `dv < C` corrupts every
-dispatch and `dk < C` about 1 in 20, silently. With it, all head-dim ratios are correct and the
-shape guard is gone.
+**Two carried patches — a rebuild from stock silently loses either one:**
+
+1. **pto-isa FIFO local-slot fix** (MR !1457, merged upstream; our pin predates it — see task 1).
+   Without it `dv < C` corrupts every dispatch and `dk < C` about 1 in 20, *silently*. With it
+   all head-dim ratios are correct and the shape guard is gone.
+2. **pypto comm-dispatch ordering fix** (not yet upstream — see task 4 and
+   `../allscan/issues/pypto-comm-dispatch-ordering/`). Without it every `P>1` B4 config
+   deadlocks. It spans a C++ codegen change **and** `python/pypto/runtime/distributed_runner.py`,
+   so reverting only the `.so` leaves a mismatched pair that raises `TypeError`; revert or
+   re-apply both halves together.
 
 Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57 / simpler
 `3165cc89`):
@@ -86,7 +92,7 @@ Updated 2026-08-12 (was pypto `f621eca4` / ptoas 0.54 / simpler `9922afdb`).
 |---|---|
 | pypto | `71020585` (main) |
 | ptoas | **0.57** — venv at `/opt/ptoas-venv`, exposed as `/opt/ptoas-bin/bin/ptoas` |
-| pto-isa | pin `83d01313` (`/opt/pto-isa`), **+1 local patch** — the DIR_BOTH V2C ring offset |
+| pto-isa | pin `83d01313` (`/opt/pto-isa`), **+2 local patches** — the DIR_BOTH V2C ring offset (`69a81f3b`) and the consumer local-slot stride (MR !1457) |
 | simpler runtime | `3165cc89` (pypto submodule `runtime/`) |
 
 pypto main still pins pto-isa at `83d01313`, which predates `69a81f3b`, so **the DIR_BOTH
@@ -277,7 +283,7 @@ finalize`, both immediately after a slow P=2 config, and both **correct when re-
 isolation**. That is a simpler-runtime teardown race between consecutive build/close cycles,
 not a correctness result. Worth watching; it would also hit the bench harness.
 
-### 4. B4 — pypto fused distributed backward — **P=1 + P=2 DONE on HW** (2026-08-14)
+### 4. B4 — pypto fused distributed backward — **DONE on HW, P=1/2/4** (2026-08-17)
 
 **Unblocked 2026-08-14.** `gla/tests/test_pypto_gla_backward.py::test_pypto_zeco_backward`
 is **2 passed, 1 skipped** (P=1, P=2; P=4 skips on a 2-card grant) — `err < 1e-3` over 3 seeds.
