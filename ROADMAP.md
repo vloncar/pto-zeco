@@ -65,7 +65,8 @@ operator — both were toolchain defects, and both fixes are now upstream.
 1. **pto-isa FIFO local-slot fix** (MR !1457, merged upstream; our pin predates it — see task 1).
    Without it `dv < C` corrupts every dispatch and `dk < C` about 1 in 20, *silently*. With it
    all head-dim ratios are correct and the shape guard is gone.
-2. **pypto comm-dispatch ordering fix** (not yet upstream — see task 4 and
+2. **pypto comm-dispatch ordering fix** — filed upstream 2026-08-17 as **pypto issue #2397 /
+   PR #2398**, carried locally until it merges (see task 4 and
    `../allscan/issues/pypto-comm-dispatch-ordering/`). Without it every `P>1` B4 config
    deadlocks. It spans a C++ codegen change **and** `python/pypto/runtime/distributed_runner.py`,
    so reverting only the `.so` leaves a mismatched pair that raises `TypeError`; revert or
@@ -290,7 +291,8 @@ is **2 passed, 1 skipped** (P=1, P=2; P=4 skips on a 2-card grant) — `err < 1e
 The operator was never wrong: the blocker was a pypto distributed-codegen bug (comm dispatches
 carry no dependency edge, so a fan-in-free `wait` dispatch is scheduled ahead of its own rank's
 send and owns the sole worker forever). Fixed by a per-rank comm ordering token; issue,
-reproducer and patch in `../allscan/issues/pypto-comm-dispatch-ordering/`. **The fix is carried
+reproducer and patch in `../allscan/issues/pypto-comm-dispatch-ordering/`; filed upstream as
+**pypto issue #2397 / PR #2398** (2026-08-17). **The fix is carried
 locally in `/opt/pypto` and is NOT upstream yet** — a stock pypto rebuild reintroduces the
 deadlock. Remaining: P=4, which needs four comm-capable cards.
 
