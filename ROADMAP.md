@@ -15,7 +15,46 @@ size, and in steady-state cost.
 |---|---|---|---|---|
 | **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C,D ≤ 64`, any `dk`/`dv` |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
-| **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ❌ — **B4, the only gap** |
+| **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2** — `C ≤ 32`, `D ≤ 64` (P=4 untested: needs 4 comm-capable cards) |
+
+**B4 is correct on HW at P=1 and P=2 (2026-08-14).** The pypto backward is one fully-fused
+distributed program, the same shape as the forward. The `P>1` hang that blocked it for weeks
+was a **pypto codegen bug, not an operator bug** — the operator needed no change — and is
+root-caused and fixed below.
+
+**Correction (2026-08-14): the "silently discarded cross-rank write" this section previously
+claimed does not exist.** That conclusion came from a family of probes that replaced
+`pld.system.wait` with a plain load so runs would complete instead of hanging — which deleted
+the only construct providing cross-rank ordering, leaving the receiver free to read before the
+sender's write landed. A self-controlled re-read test (same program, receiver reads the same
+window three times with compute chains between) settles it: **read1 6/36, read2 36/36,
+read3 36/36, never-arrived 0/36.** Payload and signal always arrive, always together. The
+sender, the peer address translation, the store path and delivery itself are all *proven
+correct*; the probes were measuring their own missing synchronisation. Those probes are
+removed (archived in `../.archive/b4-waitless-probes-invalid-2026-08-14.tar.gz`).
+
+**ROOT CAUSE FOUND AND FIXED (2026-08-14) — it is a pypto codegen bug, not signal accounting.**
+A chip dispatch becomes one `submit_next_level` DAG node whose dependencies come *only from
+tensor tags*. A comm window carries no tag edge, so dispatches that interact solely through
+`remote_store`/`notify`/`wait` are independent to the scheduler and **the program order written
+in `host_orch` is discarded**. The scheduler routes a task to its per-worker FIFO as soon as it
+is READY, and a dispatch whose only job is to wait usually has *no producer at all* — so it is
+dispatched ahead of that rank's own send. One task per worker, so the spin-wait owns the core
+and the send never runs. Deterministic, not a race; `waiting=0` in the stall dump is the tell.
+
+In B4 exactly: rank 0's `chip_bwd_terminal` (the reverse-ring wait) takes only `zerov`,
+`dStot[r]`, `dgam[r]` and the two windows — no local producer — so it is dispatched ahead of
+`chip_orch_first`, the forward send rank 1 is parked on. That also explains why *both* bisect
+arms passed: stubbing either ring deletes one of the two blocking waits.
+
+Fix: give each comm domain a per-rank ordering token, threaded through every comm dispatch as
+`INOUT`, so a rank's comm dispatches form a WAW chain in program order. It costs no parallelism
+(a worker runs one task at a time anyway) and is host-side only. Issue + reproducer + patch in
+`../allscan/issues/pypto-comm-dispatch-ordering/`. See task 4.
+
+It is also *narrower* than the forward in reachable shapes (`C ≤ 32` against the forward's
+`C ≤ 64`): its widest kernel holds about twice the working set. That is a measured ceiling,
+not an estimate, and task 5's job to lift.
 
 Both correctness gates that dominated this roadmap for months are **closed**: the cross-rank
 producer race and the `N = L//C > 2` loop-carry corruption. Neither was ever a bug in this
@@ -238,11 +277,147 @@ finalize`, both immediately after a slow P=2 config, and both **correct when re-
 isolation**. That is a simpler-runtime teardown race between consecutive build/close cycles,
 not a correctness result. Worth watching; it would also hit the bench harness.
 
-### 4. B4 — pypto fused distributed backward
-The last unimplemented backend: chunk-gradient InCore kernels plus the existing reverse-ring
-`program_backward`, mirroring the forward fusion. Its dependencies (F2, F3) are now met, and
-B3 supplies a validated op-for-op blueprint (`gla.common.gla_chunk_backward`) that the
-simpler kernels already implement. Build on the hardened forward kernels.
+### 4. B4 — pypto fused distributed backward — **P=1 + P=2 DONE on HW** (2026-08-14)
+
+**Unblocked 2026-08-14.** `gla/tests/test_pypto_gla_backward.py::test_pypto_zeco_backward`
+is **2 passed, 1 skipped** (P=1, P=2; P=4 skips on a 2-card grant) — `err < 1e-3` over 3 seeds.
+The operator was never wrong: the blocker was a pypto distributed-codegen bug (comm dispatches
+carry no dependency edge, so a fan-in-free `wait` dispatch is scheduled ahead of its own rank's
+send and owns the sole worker forever). Fixed by a per-rank comm ordering token; issue,
+reproducer and patch in `../allscan/issues/pypto-comm-dispatch-ordering/`. **The fix is carried
+locally in `/opt/pypto` and is NOT upstream yet** — a stock pypto rebuild reintroduces the
+deadlock. Remaining: P=4, which needs four comm-capable cards.
+
+`gla/implementations/pypto/fused_backward_program.py`: the whole SP backward as ONE
+distributed program, five phases per rank with no host round-trip — **recompute → forward
+ring → grad_o → reverse ring → grad_h**. Phase 1 recomputes the forward chunk scan and
+snapshots `S_prev[n]` / `c_prev[n]` (the backward is stateless by contract, so activations
+are regenerated, not carried).
+
+**The reverse ring is simpler fused than standalone.** `d[p] = g_out[p] + gamma[p+1]*d[p+1]`
+with `g_out[p] = dS_recv[p+1]`, so the message `p+1` sends — `dS_recv[p+1] + gamma[p+1]*d[p+1]`
+— **is** `d[p]`: the receiver adds nothing, and no host-side `g_out` shuffle is needed. And
+`out_prev[p] == S_recv[p]`, already device-local from phase 2, so `dgamma` reduces locally.
+Both inputs `allscan/…/program_backward.py` takes from the host disappear.
+
+**Three DSL restructurings**, all forced by shapes and validated at torch level first
+(`../devtools/b4_math_check.py`, 11/11 across `P∈{1,2,3,4}` × `dk≠dv`):
+
+| problem | what the kernels do instead |
+|---|---|
+| `gamma` is `[dk,1]`, so `k*(gamma/b)` is a *column* broadcast over `[C,dk]` — inexpressible | push gamma onto the `[dk,dv]` state once: `dV_h = (k/b) @ (gamma*dSloc)`, `dK_h = (v @ (gamma*dSloc)^T)/b`. One `row_expand_mul` replaces three column broadcasts per chunk |
+| `db[C-1] += dgamma` is a single-row update | apply it as a whole-tile `col_expand_add` **after** the reverse cumsum — row `C-1` is `>= t` for every `t`, so it adds the same constant to every row |
+| no scan primitive | the reverse cumsum is `triu @ dg_cs`, a matmul |
+
+The gate gradient is carried in the **log domain** (`dg_cs = db*b`), so `db` never exists and
+the `b` factors cancel.
+
+#### What is verified
+
+| | |
+|---|---|
+| math decomposition vs `expected_gla_backward` (torch, `b4_math_check.py`) | **11/11**, `P∈{1,2,3,4}`, `dk≠dv` |
+| the 5 DSL ops the forward never used (`b4_op_probe.py`, sim + HW) | **pass** |
+| all three kernels vs their torch emulation, **with non-zero** `S_recv`/`dS_total`/`dgamma` (`b4_kernel_probe.py`, sim) | **13/13 outputs**, ≤2.6e-07 |
+| P=1 end-to-end on a2a3 — 6 shapes + back-to-back dispatch guard | **7 passed / 0 failed**, worst rel err 2.4e-07 |
+| `loss.backward()` through `ZeCoModule` on the pypto kernels (sim) | **pass** |
+
+#### What is blocked: every P>1 config fails on device
+
+`test_pypto_zeco_backward[2]` and `[4]` fail with a device-side stall
+(`ACL_ERROR_RT_AICPU_EXCEPTION`, then `sched_error_code=100 SCHEDULER_TIMEOUT,
+sub_class=S1:running-stalled`): a ring wait never returns.
+
+**The cause is not known.** An earlier version of this section asserted that a cross-rank
+`remote_store` + `notify` was silently discarded. **That was wrong, and it was wrong because
+the instrument was wrong.** Every probe behind it (`b4_readsig_probe.py`, the L0–L6 shrink
+ladder, `b4_smallest_repro.py`, and the winbuf / ctxread / dispatchpos / min variants) was
+built by replacing `pld.system.wait` with a plain load of the signal word, so a failing run
+would complete instead of hang. But `wait` is the *only* construct that orders the two ranks:
+without it, rank 1 simply reads before rank 0's send has landed. The compute dispatches those
+probes inserted "to give the send a wide margin" were a timing assumption, never a guarantee.
+
+The disproof is self-controlled, so the layout sensitivity that made every cross-program
+comparison untrustworthy cancels exactly. Ladder rung L0 verbatim, with the receiver reading
+the same window **three** times, compute chains between:
+
+| read | payload | signal |
+|---|---|---|
+| read 1 (where L0 read) | 6/36 | 6/36 |
+| read 2 | **36/36** | **36/36** |
+| read 3 | **36/36** | **36/36** |
+
+`arrived-late 30/36, never-arrived 0/36`. **Nothing is ever lost.** Payload and signal always
+arrive and always together — the "they vanish together" observation was a correct correlation
+with an incorrect explanation: neither had arrived *yet*.
+
+This retro-explains the whole false trail: the layout sensitivity (a two-rank timing race, so
+any dispatch added or removed shifts relative timing), the non-monotonic shrink ladder,
+"send as its rank's first dispatch delivers 12/12" (sending earlier beats the read), and
+allscan passing at `P=4` (it has real waits).
+
+**Proven correct, by measurement:** the send kernel, the `CommRemoteOffset` peer address
+translation, the peer store path, and cross-rank delivery. Also ruled out earlier and still
+ruled out: the compute kernels; the `host_orch` wiring; worker/comm lifecycle; submission
+order / ring direction; "two comm windows per program"
+(`tests/st/distributed/test_l3_ep_dispatch_combine.py` allocates eight and passes); window
+buffer alignment; a stale `CommContext` read; and the cards.
+
+Two framework defects were investigated during this search and **both are dead ends**:
+
+* the peer `pto.tstore` → `pto.cmo.cacheinvalid` pair has no barrier between an async MTE3
+  DMA and a scalar-pipe `dcci`. Adding one changes nothing (L0, interleaved S/F/F/S blocks:
+  **STOCK 30/30 vs FIXED 29/30** instantiations lost). It is also **already fixed upstream** —
+  pypto PR #2168 relanded `InsertCommFence` and ptoas 0.54 lowers
+  `pto.fence.barrier_all <gm>` to a combined `pipe_barrier(PIPE_ALL); dsb(DSB_DDR)`, so
+  `dcci → barrier → dsb` is the *intended* order (see `allscan/issues/UPSTREAM-ISSUES.md` #3
+  and the archived `pypto-remote-store-notify-drain/` folder, closed 12/32 → 0/128);
+* that same `dcci` covers one 64-byte line of a multi-line payload. Not load-bearing: the
+  closed repro above pushed 128×128 f32 = **1024 cache lines** through it and measured 0/32
+  wrong. MTE3 GM writes reach DDR without it — the sender's own local store gets no `dcci` at
+  all and is correct in every run.
+
+**Where to look next.** Delivery is reliable, so the wait is not waiting on data that never
+came — it is waiting on a count that never completes. Instrument the *real* fused backward
+with its waits in place and compare, per rank and per ring, the notifies actually sent against
+the value each `pld.system.wait` expects; a slot-indexing error or interference between the
+forward and reverse rings' signals shows up immediately as a count that stalls one short or
+overshoots. `../devtools/b4_ring_diag.py` and `../devtools/b4_bisect.py` already operate on the
+real program and are the right starting points; `b4_stub_program.py` / `b4_stub_fwd.py` stub
+one phase at a time.
+
+**Method note, paid for twice in one day.** Before trusting any distributed measurement, audit
+what the program actually *guarantees* — a probe that deletes the synchronisation primitive
+cannot demonstrate a delivery bug. And before investigating any comm-path defect, grep
+`allscan/issues/UPSTREAM-ISSUES.md` and the `.archive/issues-resolved-*.tar.gz` tarballs:
+several are already filed, fixed, or explicitly dropped as stale-build artifacts.
+
+Nothing is filed or pushed, and as of 2026-08-14 there is **nothing to file**: no framework
+defect survived measurement, and the reproducer that appeared to demonstrate one was invalid.
+
+#### Measured shape ceiling
+
+A Vec overflow is a *compile* failure, so `../devtools/b4_shape_probe.py` maps this with no
+NPU at all:
+
+| shape | Vec bytes vs 188416 limit |
+|---|---|
+| `C=16`, `D ≤ 64` · `C=32`, `D ≤ 32` · `C=32` with one dim 64 | fits |
+| `C=32, dk=dv=64` | 189440 — **over by 1 KB (0.5%)** |
+| `C=64, D=32…64` | 209k–247k |
+| `C=D=128` | 985k |
+
+`grad_o` is the widest kernel in either direction. Moving `dc_prev` from `grad_o` into
+`grad_h` was tried and **reverted**: it moved the peak to `grad_h`, reached *exactly the same
+shape set*, and pushed the near-miss from 1 KB to 17 KB. So `C=32/D=32` is the largest shape
+both directions reach, which is where a forward-vs-backward comparison has to be run.
+
+Two DSL restrictions found and written up in the probes: `pl.tile.full([shape], dtype, value)`
+is **not** callable from the DSL (the parser binds it to the scalar overload), and a tuple
+assignment inside an InCore kernel (`a, b = X, Y`) does not compile — one name per line. A
+third is upstream-relevant: an Orchestration function whose result is **unpacked** at host
+level must declare a `pl.Tuple[...]` return type, or distributed codegen fails with an
+internal error (`TupleGetItemExpr unpacking found no Out parameter`) rather than a diagnostic.
 
 ### 5. F3.1b — real tile blocking for pypto
 `C=D=64` is at 96% of the vector budget; every next step overflows 3–4×, and `C/D = 128` also

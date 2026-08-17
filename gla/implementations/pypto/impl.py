@@ -1,7 +1,8 @@
-"""PyPTO DSL ZeCO / GLA forward — benchmark/test adapter.
+"""PyPTO DSL ZeCO / GLA forward + backward — benchmark/test adapter.
 
 :class:`PyPtoZeCo` runs the **entire** ZeCO forward as ONE fully-fused distributed
-``@pl.program`` (:mod:`.fused_program`). Per rank ``r`` (device ``r``) the single host
+``@pl.program`` (:mod:`.fused_program`), and the entire backward as a second one
+(:mod:`.fused_backward_program`, B4). Per rank ``r`` (device ``r``) the single host
 orchestrator runs three phases, all as distributed InCore chip kernels — no ``@pl.jit``,
 no host round-trip:
 
@@ -26,6 +27,29 @@ usually still compiles to a distributed program (has ``prepare``); should a conf
 compile it non-distributed, :meth:`forward` falls back to the per-call
 :func:`run_fused_forward` path and :meth:`measure` to the default per-call timing.
 
+**One prepared program at a time.** :meth:`build` compiles both directions and allocates
+every IO buffer, then prepares the forward; :meth:`backward` closes that worker and prepares
+the backward's (and vice versa), so exactly one ``DistributedWorker`` — and exactly one HCCL
+comm domain — exists at any moment. Two arrangements that look more natural were tried on
+hardware at P=2 and **both fail**, in ways P=1 completely hides (a single rank needs no peer
+comm, so every P=1 case passed while every P>1 case failed):
+
+* two live workers — the second one's comm domain never comes up:
+  ``_ensure_comm_base failed on 2/2 chips ... control_comm_init failed ... comm_init failed``;
+* one worker hosting both programs via ``prepare(extra_compiled=[...])``, with or without
+  ``persistent=True`` — prepare and the forward dispatch both succeed, then the first backward
+  dispatch dies on device with ``ACL_ERROR_RT_AICPU_EXCEPTION`` /
+  ``sched_error_code=100 SCHEDULER_TIMEOUT, sub_class=S1:running-stalled``, i.e. a ring wait
+  that is never satisfied. Both generated orchestrators declare a comm domain named
+  ``comm_d0`` (codegen numbers them per program from 0), so the two programs' windows are
+  strong candidates for aliasing — but ``persistent=True``, which namespaces domains per
+  program, does not rescue it, so the mechanism is not fully established.
+
+The cost is one prepare/close (~8-9 s) per *direction switch*, not per call: a run that does
+forward-only or backward-only work pays it once, and repeated calls in one direction stay
+steady-state. Alternating forward/backward per step would pay it every step — worth fixing
+before B5.4 quotes a fused training-step latency.
+
 Runs on both a2a3sim and a2a3 hardware. Every distributed / HCCL run must set
 ``LD_PRELOAD=<cann>/lib64/libhccl.so`` or the rootinfo handshake hangs.
 """
@@ -43,6 +67,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from gla.common import ZeCoImpl  # noqa: E402
+from gla.implementations.pypto.fused_backward_program import (  # noqa: E402
+    build_fused_backward_program,
+)
 from gla.implementations.pypto.fused_program import (  # noqa: E402
     build_fused_forward_program,
     run_fused_forward,
@@ -50,7 +77,7 @@ from gla.implementations.pypto.fused_program import (  # noqa: E402
 
 
 class PyPtoZeCo(ZeCoImpl):
-    """PyPTO ZeCO forward: the entire forward as one fully-fused distributed program,
+    """PyPTO ZeCO forward + backward: each as one fully-fused distributed program,
     dispatched on a reusable ``DistributedWorker`` (prepare once / dispatch many)."""
 
     name = "pypto"
@@ -60,7 +87,9 @@ class PyPtoZeCo(ZeCoImpl):
 
     def __init__(self) -> None:
         self._compiled = None
+        self._bcompiled = None
         self._rt = None
+        self._rt_backward = False
 
     def build(self, P, L, C, dk, dv, device_ids, platform):
         """Compile the fully-fused ZeCO forward and prepare the reusable worker.
@@ -98,13 +127,21 @@ class PyPtoZeCo(ZeCoImpl):
         # now reduce with col_sum + row_expand_mul — see fused_program's F3.1 note.)
         self._tril = torch.tril(torch.ones(C, C, dtype=torch.float32)).share_memory_()
         self._zero = torch.zeros(dk, dv, dtype=torch.float32).share_memory_()
+        # Backward-only constants, cheap enough to always allocate: the upper-triangular
+        # ones matrix (the per-chunk REVERSE cumulative sum of the gate gradient is
+        # `triu @ dg_cs`), and the [dk,1] zero / one vectors that seed the decay carries.
+        self._triu = torch.triu(torch.ones(C, C, dtype=torch.float32)).share_memory_()
+        self._zerov = torch.zeros(dk, 1, dtype=torch.float32).share_memory_()
+        self._onev = torch.ones(dk, 1, dtype=torch.float32).share_memory_()
 
         from pypto import ir
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
-        program = build_fused_forward_program(L, C, dk, dv, 1, P)
         dist_cfg = DistributedConfig(device_ids=self.device_ids, num_sub_workers=0)
-        self._compiled = ir.compile(program, platform=platform, distributed_config=dist_cfg)
+        self._compiled = ir.compile(build_fused_forward_program(L, C, dk, dv, 1, P),
+                                    platform=platform, distributed_config=dist_cfg)
+        self._bcompiled = ir.compile(build_fused_backward_program(L, C, dk, dv, 1, P),
+                                     platform=platform, distributed_config=dist_cfg)
 
         # Prepare-once: for the distributed path, allocate the shared IO buffers BEFORE
         # prepare() forks the chip workers, and reuse them in place. (P=1 that compiles
@@ -117,6 +154,27 @@ class PyPtoZeCo(ZeCoImpl):
             self._h_A = torch.zeros((P, L, dk), dtype=torch.float32).share_memory_()
             self._h_g = torch.zeros((P, dk, 1), dtype=torch.float32).share_memory_()
             self._h_O = torch.zeros((P, L, dv), dtype=torch.float32).share_memory_()
+            self._b_dO = torch.zeros((P, L, dv), dtype=torch.float32).share_memory_()
+            self._b_dQ = torch.zeros((P, L, dk), dtype=torch.float32).share_memory_()
+            self._b_dK = torch.zeros((P, L, dk), dtype=torch.float32).share_memory_()
+            self._b_dV = torch.zeros((P, L, dv), dtype=torch.float32).share_memory_()
+            self._b_dA = torch.zeros((P, L, dk), dtype=torch.float32).share_memory_()
+            # ONE worker hosting BOTH programs. Preparing the backward on a SECOND
+            # DistributedWorker does not work: the two workers each try to stand up their
+            # own HCCL comm domain over the same devices and the second one dies with
+            # `_ensure_comm_base failed ... control_comm_init failed ... comm_init failed`.
+            # (P=1 survives it — a single rank needs no peer comm — which is exactly why
+            # the P=1 tests passed while every P>1 case failed.) `extra_compiled` is the
+            # supported way to share one worker lifecycle across HOST programs; the
+            # forward and backward then also share one comm domain. Both directions' IO
+            # buffers must exist before this call, since prepare() forks the chip workers
+            # and shared memory created afterwards is invisible to them.
+            # Every buffer for BOTH directions is allocated above, before any prepare():
+            # prepare() forks the chip workers and shared memory created afterwards is
+            # invisible to them (errno 107017, INVALID_HANDLE). Only one program is
+            # prepared at a time — see the module docstring for the two multi-program
+            # arrangements that fail on hardware.
+            self._rt_backward = False
             self._rt = self._compiled.prepare()
 
     def _stage_inputs(self, Q, K, V, A):
@@ -128,8 +186,24 @@ class PyPtoZeCo(ZeCoImpl):
         self._h_A.copy_(A)
         self._h_g.copy_(gammas)
 
+    def _select(self, backward: bool):
+        """Make the worker for the requested direction the live one.
+
+        A no-op when it already is, so repeated same-direction calls stay steady-state.
+        Switching closes the current worker first: the two programs cannot be prepared at
+        the same time (module docstring).
+        """
+        if self._rt is not None and self._rt_backward == backward:
+            return
+        if self._rt is not None:
+            self._rt.close()
+            self._rt = None
+        self._rt = (self._bcompiled if backward else self._compiled).prepare()
+        self._rt_backward = backward
+
     def _dispatch(self):
         """Run one fused-forward dispatch on the prepared worker (inputs already staged)."""
+        self._select(backward=False)
         self._h_O.zero_()
         self._rt(self._h_Q, self._h_K, self._h_V, self._h_A, self._h_g,
                  self._tril, self._zero, self._h_O)
@@ -150,6 +224,49 @@ class PyPtoZeCo(ZeCoImpl):
         )
         return O
 
+    # ------------------------------------------------------------------
+    # Backward (B4): the whole SP backward as a second fused program.
+    # ------------------------------------------------------------------
+
+    def backward(self, Q, K, V, A, dO):
+        """ZeCO backward; args/return as in :meth:`gla.common.ZeCoImpl.backward`.
+
+        Stateless by contract: the fused program recomputes the forward chunk scan on
+        device (phase 1) rather than depending on a prior :meth:`forward` call, so no
+        activations are held between the two.
+
+        Shares the forward's staged input buffers — the backward reads the same
+        ``Q,K,V,A,gammas`` — and adds only ``dO`` and the four gradient outputs.
+        """
+        assert self._compiled is not None, "call build() first"
+        if self._rt is None:
+            # The forward's rare non-distributed P=1 fallback has a single-kernel entry to
+            # call directly; the backward is three chained chip dispatches, so there is no
+            # equivalent and nothing to fall back to.
+            raise NotImplementedError(
+                "fused backward needs the distributed (prepare) path; this config compiled "
+                f"the forward without one (P={self.P})")
+        self._stage_inputs(Q, K, V, A)
+        self._b_dO.copy_(dO)
+        for t in (self._b_dQ, self._b_dK, self._b_dV, self._b_dA):
+            t.zero_()
+        self._select(backward=True)
+        self._rt(self._h_Q, self._h_K, self._h_V, self._h_A, self._b_dO, self._h_g,
+                 self._tril, self._triu, self._zero, self._zerov, self._onev,
+                 self._b_dQ, self._b_dK, self._b_dV, self._b_dA)
+        return (self._b_dQ.clone(), self._b_dK.clone(),
+                self._b_dV.clone(), self._b_dA.clone())
+
+    def measure_backward(self, Q, K, V, A, dO, n_iters):
+        """Steady-state per-backward latency (build/prepare already paid, as in :meth:`measure`)."""
+        self.backward(Q, K, V, A, dO)          # warm: first-dispatch costs outside the timing
+        samples: list[float] = []
+        for _ in range(n_iters):
+            t0 = time.perf_counter()
+            self.backward(Q, K, V, A, dO)
+            samples.append((time.perf_counter() - t0) * 1e3)
+        return samples
+
     def measure(self, Q, K, V, A, n_iters):
         """Steady-state per-forward latency: prepare is already done, so time only the
         repeated dispatch on the reusable worker. Falls back to the default per-call
@@ -165,6 +282,8 @@ class PyPtoZeCo(ZeCoImpl):
         return samples
 
     def close(self):
+        """Release whichever direction's worker is live (it holds forked chip children
+        that leak if not closed)."""
         if self._rt is not None:
             self._rt.close()
             self._rt = None

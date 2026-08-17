@@ -84,30 +84,25 @@ The chunk math lives in `gla/common.py` so every torch-level backend shares one
 implementation and agrees by construction.
 
 The **pypto** backend uses the same **chunk-recurrent `O(L·C)` form** (`N = L//C`
-chunks) as the torch/simpler backends, but is forced into a **hybrid** split by two
-pypto limitations:
+chunks) as the torch/simpler backends, and runs **each direction as ONE fully-fused
+distributed `@pl.program`** — no `@pl.jit`, no host round-trip:
 
-- **stage1** (local end-of-slice state, scan from `S = 0`) is **fused with the
-  AllScan ring** into one distributed `@pl.program` (`dist_program.py`), and
-- **stage2** (per-rank output `O[r]`, the chunk recurrence initialised from
-  `S_recv[r] = out[r-1]`) runs as a `@pl.jit` kernel (`program.py`) **after** the
-  distributed worker `close()`s.
+- **forward** (`fused_program.py`): `stage1` → AllScan ring → `stage2`.
+- **backward** (`fused_backward_program.py`, B4): forward recompute with per-chunk
+  snapshots → AllScan ring → `grad_o` → reverse ring → `grad_h`.
 
-The split is not by choice: a `@pl.jit` dispatch *before* `DistributedWorker.prepare()`
-segfaults, so the sole jit (stage2) must run last; and the wide-DAG stage2 kernel
-**hangs as a distributed chip kernel** (`507018`), so it cannot be fused into the
-distributed program and must stay on `@pl.jit`. A fully-fused single distributed
-pypto program (the "full" pypto ZeCO) is therefore **postponed** — see `issues/`.
-Runs on both `a2a3sim` and `a2a3` (the earlier sim-scheduler deadlock on the
-wide-DAG chunk kernels was fixed upstream in the CPU-sim cross-core pipe model).
+The forward was a `@pl.jit` hybrid for most of this project's life, because the
+wide-DAG `stage2` kernel hung as a distributed chip kernel (`507018`). That was not a
+kernel problem: it was a pto-isa defect where the two directions of a bidirectional
+cube↔vector `TPipe` indexed the same GM slots (F2, now merged upstream). With it
+fixed the split is gone in both directions.
 
 Backends implement the `ZeCoImpl` interface (`build` once, then
-`forward(Q, K, V, A)` many, `close`). **Status:** forward done and verified
-against the golden for the torch reference (in-process), torch.distributed,
-**pypto** (composes `stage1`/`stage2` `@pl.jit` kernels with the PyPTO AllScan),
-and **simpler** (hand-written PTO-ISA kernels + the real AllScan boundary —
-validated on a2a3 HW at P=1/2/4, exact to ~1e-6). The full backward is out of
-current scope.
+`forward(Q, K, V, A)` / `backward(Q, K, V, A, dO)` many, `close`). **Status:** forward
+and backward are done and verified against the analytic goldens for the torch reference
+(in-process), torch.distributed, **pypto** and **simpler**. pypto's backward is
+narrower in reachable shapes than its forward (`C ≤ 32` against `C ≤ 64`) — its widest
+kernel holds about twice the working set; see ROADMAP.md.
 
 ---
 
@@ -135,13 +130,14 @@ gla/
     __init__.py                 REGISTRY
     torch_ref.py                TorchZeCo (in-process, composes AllScan) + torch.distributed ref
     pypto/
-      program.py                stage2 @pl.jit chunk-recurrent GLA kernel (shape-baked)
-      dist_program.py           stage1 + AllScan-ring fused as one distributed @pl.program
-      impl.py                   PyPtoZeCo — hybrid: fused dist stage1+ring, then @pl.jit stage2
+      fused_program.py          forward: stage1 + AllScan-ring + stage2, ONE distributed @pl.program
+      fused_backward_program.py backward (B4): recompute + ring + grad_o + reverse-ring + grad_h
+      impl.py                   PyPtoZeCo — compiles both, prepares one at a time
     simpler/                    hand-written aic/aiv + orchestration kernels + impl.py (real AllScan boundary)
   tests/
     test_torch_gla.py           CPU: chunk==recurrent, in-process ZeCO, and gloo ring vs golden
-    test_pypto_gla.py           on-device: PyPtoZeCo vs golden (P=1 compute, P>=2 full SP path)
+    test_pypto_gla.py           on-device: PyPtoZeCo forward vs golden (P=1 compute, P>=2 full SP path)
+    test_pypto_gla_backward.py  on-device: PyPtoZeCo backward (dQ,dK,dV,dA) vs analytic golden
     test_simpler_gla.py         on-device/sim: SimplerZeCo vs golden (defaults to a2a3sim P=1)
 ```
 

@@ -174,10 +174,12 @@ def bench_one(impl, P, L, C, dk, dv, device_ids, platform, n_warmup, n_iters, ve
 
 
 # (P, L, C, D) — D == dk == dv (the simpler kernels require it). L % C == 0.
-# C is fixed at 32: the pypto fused kernels materialize full [C,C] tiles (no blocking),
-# so C=64 overflows the 184KB vec-buffer limit; C=32 is pypto's ceiling. D up to 64 fits
-# (only C drives the [C,C] tiles). We vary the sequence-parallel axes P and L (and the
-# state size D) at that fixed C so both backends run the identical workload.
+# C is fixed at 32 so both backends run the identical workload while P, L and D vary.
+# The pypto fused kernels materialize full [C,C] tiles (no blocking), so C is what bounds
+# them: F3.1 raised the FORWARD to C=64/D=64 (96% of the 184 KB vector buffer), but the
+# B4 backward is roughly twice as wide and tops out at C=32 with D<=64 — C=32/D=32 is the
+# largest shape BOTH directions reach, which is what a forward-plus-backward comparison
+# has to be run at. See ../devtools/b4_shape_probe.py for the measured per-shape bytes.
 DEFAULT_CONFIGS: list[tuple[int, int, int, int]] = [
     (2, 128, 32, 32),
     (4, 128, 32, 32),
