@@ -151,20 +151,22 @@ class _ComputeRunner:
     is session-cached, so only the (cheap) worker init/close repeats. Tensors are
     staged through shared memory (the chip child is a subprocess).
 
-    **This cycling is forced, not incidental** (re-measured 2026-07-22, F4.1). Two
-    runtime constraints combine:
-      * a device hosts one worker at a time (device-exclusive), and
-      * **an L3 chip child binds to the first callable it runs.** A second dispatch of
-        a *different* callable on the same worker does not raise — it silently returns
-        wrong data. Registering every callable up front (all pre-``init()``, which is
-        the supported ordering) does not help: the first dispatch is correct and the
-        next one is silently garbage. Registering post-``init()`` at least fails loudly
-        (``chip_process: run failed with code -1``).
-    Measured: a persistent multi-callable worker computes dQ/dK/dV correctly (~4e-7)
-    and dA at ``max_rel = 1.0`` — the reverse-cumsum is the 2nd ``gate_cumsum``
-    dispatch on an already-used worker. See
-    ``allscan/issues/simpler-second-callable-silent-corruption/``. Do not "optimise"
-    this into a persistent worker without re-checking that issue.
+    **This is the reference path, not the fast path.** It exists to give
+    :class:`_PersistentComputeRunner` something to be checked against
+    (:meth:`SimplerZeCo._gate_persistent`); benchmarks and any latency-sensitive caller
+    should hold a worker instead.
+
+    History, because it shaped this file: the cycling used to be *forced*. On simpler
+    ``a756969c`` (2026-07-22) an L3 chip child bound to the first callable it ran, and
+    a later dispatch of a different callable silently returned wrong data — measured as
+    dQ/dK/dV correct (~4e-7) but dA at ``max_rel = 1.0``, dA being the only output fed
+    by the backward's second ``gate_cumsum`` dispatch. That is **fixed** as of the
+    ``3165cc89`` pin: ``allscan/issues/simpler-l3-callable-redispatch/repro.py``
+    dispatches two callables with deliberately different goldens in the sequences
+    ``X X``, ``X Y``, ``X Y X`` and ``X Y X Y X Y`` on one held worker and gets
+    err = 0 on every one. The remaining constraint is real but much weaker: a device
+    hosts one worker at a time, so a held compute worker has to be dropped around the
+    boundary AllScan (:meth:`SimplerZeCo._release_devices`).
     """
 
     def __init__(self, device_id, platform):
@@ -239,11 +241,10 @@ class _PersistentComputeRunner(_ComputeRunner):
       boundary phase and :meth:`open` again after. Reopening is still far cheaper than
       the per-kernel cycling it replaces.
 
-    Multi-callable reuse was previously a silent-corruption trap
-    (``allscan/issues/simpler-second-callable-silent-corruption/``, runtime
-    ``a756969c``). It is re-checked end-to-end against ``expected_gla`` before this path
-    is used — see :meth:`SimplerZeCo._check_persistent`. Do not widen its use without
-    re-running that check.
+    Multi-callable reuse and re-dispatch are correct on the ``3165cc89`` pin, proven
+    directly against the runtime by ``allscan/issues/simpler-l3-callable-redispatch/``.
+    It is still checked end-to-end against the per-kernel path before either direction
+    is timed — see :meth:`SimplerZeCo._gate_persistent`, which raises on a mismatch.
     """
 
     def __init__(self, device_id, platform):
@@ -378,13 +379,17 @@ class SimplerZeCo(ZeCoImpl):
     # ------------------------------------------------------------------
 
     def _persistent_dispatches(self):
-        """``(name, sig, named_tensors)`` templates for every kernel the forward runs.
+        """``(name, sig, named_tensors)`` templates for every kernel EITHER direction runs.
 
         Shapes/dtypes/directions only — the values are placeholders. Must list every
-        dispatch the forward will make, because all buffers have to exist before the
-        worker's ``init()`` forks the chip child.
+        dispatch, because all buffers have to exist before the worker's ``init()``
+        forks the chip child.
+
+        The backward's reverse-cumsum needs no slot of its own: it is a second
+        ``gate_cumsum`` dispatch with the same shapes (``triu`` for ``tril``,
+        ``dg_cs`` for ``g``), so it reuses this slot with fresh inputs.
         """
-        L, dk, dv, N = self.L, self.dk, self.dv, self.N
+        L, C, dk, dv, N = self.L, self.C, self.dk, self.dv, self.N
         z = torch.zeros
         return [
             ("gate_cumsum", GATE_CUMSUM_SPEC["orchestration"]["signature"],
@@ -397,6 +402,15 @@ class SimplerZeCo(ZeCoImpl):
              [("q", z(L, dk)), ("k", z(L, dk)), ("v", z(L, dv)), ("g_cs", z(L, dk)),
               ("s_snap", z(N, dk, dv)), ("tril", self._tril), ("o", z(L, dv)),
               ("config", self._config)]),
+            ("grad_o", GRAD_O_SPEC["orchestration"]["signature"],
+             [("q", z(L, dk)), ("k", z(L, dk)), ("v", z(L, dv)), ("g_cs", z(L, dk)),
+              ("snap", z(N, dk, dv)), ("dO", z(L, dv)), ("tril", z(C, C)),
+              ("dQt", z(L, dk)), ("dKin", z(L, dk)), ("dVi", z(L, dv)),
+              ("dH", z(N, dk, dv)), ("config", self._config)]),
+            ("grad_h", GRAD_H_SPEC["orchestration"]["signature"],
+             [("k", z(L, dk)), ("v", z(L, dv)), ("g_cs", z(L, dk)),
+              ("dSloc", z(N, dk, dv)), ("dKstate", z(L, dk)), ("dVs", z(L, dv)),
+              ("config", self._config)]),
         ]
 
     def _use_persistent_runners(self):
@@ -408,86 +422,97 @@ class SimplerZeCo(ZeCoImpl):
         self._runners = runners
 
     def _use_plain_runners(self):
-        """Restore the per-kernel worker runners (the always-safe path)."""
+        """Restore the per-kernel worker runners (one fresh worker per dispatch)."""
         for r in getattr(self, "_runners", []):
             r.close()
         self._runners = [_ComputeRunner(d, self.platform) for d in self.device_ids]
 
-    def _forward_persistent(self, Q, K, V, A):
-        """:meth:`forward` on held workers.
+    def _release_devices(self):
+        """Free the devices for a boundary AllScan worker.
 
-        Identical to :meth:`forward` except the compute workers are closed around the
-        AllScan boundary — a device hosts one worker at a time, so the boundary's
-        distributed worker cannot coexist with them. Stage 2 reopens them.
+        A device hosts one worker at a time, so a held compute worker cannot coexist
+        with the boundary's distributed worker. Persistent runners drop theirs here
+        and reopen lazily on their next dispatch; for the per-kernel runners, which
+        hold nothing between dispatches, this is a no-op. Calling it unconditionally
+        around every boundary phase is what lets :meth:`forward` and :meth:`backward`
+        each be a single code path serving both runner shapes.
         """
-        P, L, C, dk, dv = self.P, self.L, self.C, self.dk, self.dv
-        s_snaps, g_css, S_totals = [], [], []
-        for p in range(P):
-            s_snap, g_cs, S_total = self._stage1(p, Q[p], K[p], V[p], A[p])
-            s_snaps.append(s_snap); g_css.append(g_cs); S_totals.append(S_total)
+        for r in self._runners:
+            r.close()
 
-        if P == 1:
-            S_recvs = [torch.zeros(dk, dv, dtype=torch.float32)]
-        else:
-            for r in self._runners:      # free the devices for the AllScan worker
-                r.close()
-            out = self._boundary(S_totals, A)
-            S_recvs = [torch.zeros(dk, dv, dtype=torch.float32) if p == 0 else out[p - 1]
-                       for p in range(P)]
+    def _gate_persistent(self, call, tensors_of):
+        """Verify the held-worker path against the per-kernel path, then leave it armed.
 
-        O = torch.zeros(P, L, dv, dtype=torch.float32)
-        for p in range(P):
-            s_shift = _shift_snaps(s_snaps[p], A[p], S_recvs[p], L, C, dk)
-            O[p] = self._stage2(p, Q[p], K[p], V[p], g_css[p], s_shift)
-        return O
+        ``call()`` runs one pass on whichever runners are installed; ``tensors_of``
+        maps its result to a tuple of tensors to compare. Runs the per-kernel path
+        first for a reference, then the persistent path, and raises if they disagree.
 
-    def measure(self, Q, K, V, A, n_iters):
-        """Steady-state per-forward latency, with a correctness gate on the fast path.
-
-        The persistent path reuses one multi-callable worker per device, which was a
-        silent-corruption trap on an older runtime
-        (``allscan/issues/simpler-second-callable-silent-corruption/``). So it is never
-        trusted blind: one persistent forward is checked against the per-kernel-worker
-        forward first, and any mismatch (or any error) falls back to the safe path with
-        ``amortized_timing`` left False, so the benchmark reports what it actually
-        measured.
+        A mismatch here means holding a worker across dispatches changed the answer —
+        historically a real runtime defect (an L3 chip child bound to the first
+        callable it ran, so any later dispatch silently returned wrong data). That is
+        fixed as of simpler ``3165cc89``: ``allscan/issues/simpler-l3-callable-redispatch/``
+        exercises re-dispatch and multi-callable reuse on HW against exact goldens and
+        gets bit-identical results. So a mismatch is now a bug to fix rather than a
+        condition to route around, and this raises instead of silently degrading —
+        a silent fallback made the benchmark report non-amortized numbers under an
+        ``SS=Y`` heading, which is worse than failing.
         """
-        import time
-        import warnings
-
         self._use_plain_runners()
-        baseline = self.forward(Q, K, V, A)
+        reference = tensors_of(call())
 
-        try:
-            self._use_persistent_runners()
-            got = self._forward_persistent(Q, K, V, A)
-            err = (got - baseline).abs().max().item()
-        except Exception as exc:  # noqa: BLE001 — degrade to the safe path
-            warnings.warn(f"simpler: persistent-worker path unusable ({type(exc).__name__}: "
-                          f"{str(exc)[:120]}); timing the per-kernel path instead", stacklevel=2)
-            self._use_plain_runners()
-            return super().measure(Q, K, V, A, n_iters)
+        self._use_persistent_runners()
+        got = tensors_of(call())
 
-        tol = 1e-3 * max(1.0, float(baseline.abs().max()))
-        if not (err < tol):
-            warnings.warn(f"simpler: persistent-worker forward disagrees with the per-kernel "
-                          f"forward (max_abs_err={err:.3e} > {tol:.1e}) — see "
-                          f"allscan/issues/simpler-second-callable-silent-corruption/; "
-                          f"timing the per-kernel path instead", stacklevel=2)
-            self._use_plain_runners()
-            return super().measure(Q, K, V, A, n_iters)
+        for i, (r, g) in enumerate(zip(reference, got)):
+            tol = 1e-3 * max(1.0, float(r.abs().max()))
+            err = (g - r).abs().max().item()
+            if not (err < tol):
+                raise RuntimeError(
+                    f"simpler: held-worker path disagrees with the per-kernel path on "
+                    f"output {i} (max_abs_err={err:.3e} > {tol:.1e}). Holding a worker "
+                    f"across dispatches must not change the result — see "
+                    f"allscan/issues/simpler-l3-callable-redispatch/.")
+
+    def _time_on_persistent(self, call, n_iters):
+        """``n_iters`` samples of ``call()`` on the held workers, in ms."""
+        import time
 
         lat_ms = []
         try:
             for _ in range(n_iters):
                 t0 = time.perf_counter()
-                self._forward_persistent(Q, K, V, A)
+                call()
                 lat_ms.append((time.perf_counter() - t0) * 1e3)
         finally:
-            for r in self._runners:
-                r.close()
+            self._release_devices()
+        return lat_ms
 
+    def measure(self, Q, K, V, A, n_iters):
+        """Steady-state per-forward latency on held workers (see :meth:`_gate_persistent`)."""
+        def call():
+            return self.forward(Q, K, V, A)
+
+        self._gate_persistent(call, lambda O: (O,))
+        lat_ms = self._time_on_persistent(call, n_iters)
         self.amortized_timing = True
+        return lat_ms
+
+    def measure_backward(self, Q, K, V, A, dO, n_iters):
+        """Steady-state per-backward latency on held workers.
+
+        Same shape as :meth:`measure`. The backward is the direction that most needs
+        this: it dispatches five kernels per rank against the forward's three, and one
+        of them (``gate_cumsum``, again for the reverse-cumsum) is a re-dispatch — so
+        on the per-kernel path it pays ``5P`` worker fork/init/close cycles per call
+        plus two HCCL distributed-worker builds, and that setup, not the compute,
+        dominated the earlier B5.4 numbers.
+        """
+        def call():
+            return self.backward(Q, K, V, A, dO)
+
+        self._gate_persistent(call, lambda g: tuple(g))
+        lat_ms = self._time_on_persistent(call, n_iters)
+        self.amortized_timing_backward = True
         return lat_ms
 
     def _stage2(self, p, Q, K, V, g_cs, s_shift):
@@ -558,6 +583,7 @@ class SimplerZeCo(ZeCoImpl):
         if P == 1:
             S_recvs = [torch.zeros(dk, dv, dtype=torch.float32)]
         else:
+            self._release_devices()
             out = self._boundary(S_totals, A)                 # real multi-device AllScan
             S_recvs = [torch.zeros(dk, dv, dtype=torch.float32) if p == 0 else out[p - 1]
                        for p in range(P)]
@@ -648,6 +674,7 @@ class SimplerZeCo(ZeCoImpl):
             outs = None
             S_recvs = [zkv]
         else:
+            self._release_devices()
             outs = self._boundary(S_totals, A)
             S_recvs = [zkv if p == 0 else outs[p - 1] for p in range(P)]
 
@@ -685,6 +712,7 @@ class SimplerZeCo(ZeCoImpl):
         else:
             g_out = torch.zeros(P, dk, dv, dtype=torch.float32)
             g_out[:P - 1] = dS_recv[1:]
+            self._release_devices()
             dS_b, dgamma_b = self._boundary_backward(g_out, A, outs)
             dS_totals = [dS_b[p] for p in range(P)]
             dgammas = [dgamma_b[p].squeeze(1) for p in range(P)]

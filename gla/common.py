@@ -566,9 +566,10 @@ class ZeCoImpl(ABC):
         return samples
 
     #: The backward's analogue of :attr:`amortized_timing`. Kept separate because a
-    #: backend can be amortized in one direction and not the other: pypto prepares a
-    #: reusable worker for whichever direction is live, while simpler's persistent
-    #: fast path currently covers only the forward's kernels.
+    #: backend can be amortized in one direction and not the other, and because it is
+    #: the flag a cross-backend comparison has to agree on: a row timed with setup
+    #: excluded is not comparable to one timed with setup included, so the benchmark
+    #: prints it per row rather than assuming both backends are in the same mode.
     amortized_timing_backward: bool = False
 
     def measure_backward(

@@ -152,7 +152,12 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   pypto builds its `DistributedWorker` once, taking forward from ~9 s to **11.5–55.7 ms**
   (~200–800×). F4.1 (a persistent multi-callable simpler worker) was investigated and was a
   **negative result on the old runtime** — silent corruption — but is now viable and shipped
-  as F6.2 on runtime `9922afdb`.
+  as F6.2 on runtime `9922afdb`. **Closed out 2026-08-17**: the residual constraint (a
+  callable *re-dispatched* after others have run, which the backward needs and the forward
+  does not) was probed directly against the runtime and is also correct — see
+  `allscan/issues/simpler-l3-callable-redispatch/`. Both directions now share one held-worker
+  path; the only surviving constraint is that a device hosts one worker at a time, so the
+  compute workers are dropped around the boundary AllScan (`_release_devices`).
 - **F5 — shared-box hardening.** Rendezvous auto-clean, `LD_PRELOAD` check, per-config
   device-health guard, failure isolation in `finally`.
 - **F6.1–F6.4 — the first honest forward numbers.** All 6 shared-config cases correct;
