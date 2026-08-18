@@ -449,7 +449,25 @@ parked). That is the same design F3.4 landed on for simpler, so one design serve
   which counted device dispatches only. Close it by porting the glue on-device (real parity,
   touches the same kernels as task 5 — sequence it after) or by explicitly redefining
   simpler's "compute" as device + host and never quoting the device-only number.
-- **B5.4** — the same treatment for the backward, once B4 lands.
+- **B5.4 — DONE 2026-08-18.** Both directions, both backends, all six configs, every row
+  steady-state (`SS=Y`) and correctness-verified. Raw: `../devtools/b54_results_merged.json`,
+  narrative: `../devtools/B54-RESULTS.md`.
+
+  simpler backward **57.5–66.9 s/call** (its first-ever backward numbers — the previous
+  attempt never reached them), pypto backward **92.9–227.9 ms**. But the cross-backend
+  ratio is not a kernel result and must not be quoted as one. simpler's forward is
+  **29.5–34.3 s across every config** — a 16% spread while `L`, `D` and `P` each vary 2× —
+  i.e. a fixed per-call cost that does not depend on the workload, and its backward/forward
+  ratio is a flat **1.86–2.07×** at both P=2 and P=4. Forward builds one boundary AllScan
+  worker per call, backward builds two. The number is a build counter; the GLA compute is
+  inside the noise. Holding the compute workers (F4.1 closure) removed the per-kernel
+  cycling but **did not move the headline**, because that was never the dominant term at
+  P>=2 — which is itself the finding.
+
+  pypto's own backward/forward ratio is **2.5× at P=2 but 1.0× at P=4**: by P=4 its forward
+  already costs what its backward costs, so it is orchestration-bound there too.
+
+  Still gated by F6.6 — no compute-vs-comm or kernel-vs-kernel split from these numbers.
 
 ---
 

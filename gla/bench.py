@@ -285,6 +285,11 @@ def main() -> None:
                         help="Impls to run (default: all non-torch). Choices: "
                              + ", ".join(cls.name for cls in REGISTRY))
     parser.add_argument("--json", metavar="FILE", help="Write raw results to JSON")
+    parser.add_argument("--configs", nargs="*", metavar="P,L,C,D",
+                        help="Run only these configs (e.g. 2,256,32,32 4,256,32,32) instead "
+                             "of the default list. A full sweep does not fit in the queue's "
+                             "3600 s cap, so a follow-up job needs to run the configs an "
+                             "earlier job did not reach, without redoing the ones it did.")
     args = parser.parse_args()
 
     device_ids = parse_devices(args.device)
@@ -303,9 +308,18 @@ def main() -> None:
     if not impls:
         sys.exit(f"No matching implementations. Available: {[cls.name for cls in REGISTRY]}")
 
-    configs = [(P, L, C, D) for (P, L, C, D) in DEFAULT_CONFIGS if P <= len(device_ids)]
+    if args.configs:
+        try:
+            requested = [tuple(int(x) for x in c.split(",")) for c in args.configs]
+        except ValueError:
+            sys.exit("--configs entries must be P,L,C,D integer tuples, e.g. 2,256,32,32")
+        if any(len(c) != 4 for c in requested):
+            sys.exit("--configs entries must have exactly four fields: P,L,C,D")
+    else:
+        requested = list(DEFAULT_CONFIGS)
+    configs = [(P, L, C, D) for (P, L, C, D) in requested if P <= len(device_ids)]
     if not configs:
-        sys.exit(f"Need at least 2 devices, got {len(device_ids)}")
+        sys.exit(f"No config fits {len(device_ids)} device(s); requested {requested}")
 
     if not args.no_clean:
         n = clean_rendezvous()
