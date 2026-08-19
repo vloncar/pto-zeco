@@ -442,13 +442,32 @@ parked). That is the same design F3.4 landed on for simpler, so one design serve
 
 ### 6. The final fair numbers — F6.5, F6.6, B5.4
 - **F6.5** — realistic sizes (`C,D` 64/128, `L` up to 1–4k). Needs task 5.
-- **F6.6** — work-placement parity. simpler runs `_S_total`, `_shift_snaps` and `_gammas` on
-  the **host**; pypto does all of it on device. Measured ~5.5 ms/call of host work against
-  7.8 ms of warm kernel time — comparable. **Until this is closed, do not publish any
-  compute-vs-comm or kernel-vs-kernel split**, including F6.4's "simpler compute = 6.0 ms",
-  which counted device dispatches only. Close it by porting the glue on-device (real parity,
-  touches the same kernels as task 5 — sequence it after) or by explicitly redefining
-  simpler's "compute" as device + host and never quoting the device-only number.
+- **F6.6 — work-placement parity. Steps 1-2 DONE 2026-08-19; results:
+  `../devtools/F66-STEP2-RESULTS.md`.** The goal is a fully on-device implementation of both
+  paths. Two corrections to the earlier statement of this item: `_gammas` is **not** a parity
+  gap (pypto computes `A.prod` host-side too, `pypto/impl.py:199`), and the list was missing
+  `torch.log(A)` and the whole backward glue.
+
+  **Measured.** pypto is already 98-99.9% on-device. simpler's off-device share is
+  **4-5% of the forward's compute and ~10% of the backward's** (host / (host + chip)), and
+  0.03-0.13% of its whole call. Timed on its own the glue is 0.5-1.2 ms/call forward,
+  3.6-12.7 ms backward — of which the three per-chunk Python loops are **78-87%** and the
+  `gate_h` loop alone is 53-58%.
+
+  **A dispatch costs ~33 ms (fwd) / ~39 ms (bwd) flat**, independent of `L` and `D` — the
+  round trip, not the kernel. **So a port that adds a dispatch is a net loss**: a standalone
+  `shift_snaps` kernel would cost ~33 ms x P to save 0.5-2.1 ms. Everything must fold into an
+  existing dispatch. `_S_total` is free — `chunk_h_orch.cpp` already computes it as the
+  carried state `S` and discards it; widen `s_snap` to `[N+1,dk,dv]` and point `S` at slot N.
+
+  **Also found:** the boundary collective is **26.6-27.1 s per phase, flat in P/L/D** —
+  83-91% of every call, and the backward's is exactly 2x, which proves B5.4's reading that
+  its ~2x ratio is a boundary-build counter. Compute-worker stand-up after a boundary release
+  is a further 2.1 s (P=2) / 4.2 s (P=4) per call.
+
+  Now that the effect is quantified, F6.4's "simpler compute = 6.0 ms" can be stated with its
+  correction rather than withheld: it counted device dispatches only, and the host share is
+  4-5% (fwd) / ~10% (bwd) on top.
 - **B5.4 — DONE 2026-08-18.** Both directions, both backends, all six configs, every row
   steady-state (`SS=Y`) and correctness-verified. Raw: `../devtools/b54_results_merged.json`,
   narrative: `../devtools/B54-RESULTS.md`.

@@ -300,16 +300,26 @@ class PyPtoZeCo(ZeCoImpl):
         return samples
 
     def measure(self, Q, K, V, A, n_iters):
-        """Steady-state per-forward latency: prepare is already done, so time only the
-        repeated dispatch on the reusable worker. Falls back to the default per-call
-        timing for a non-distributed P=1 config."""
+        """Steady-state per-forward latency: build/prepare is already paid, so time the
+        repeated :meth:`forward` on the reusable worker. Falls back to the default
+        per-call timing for a non-distributed P=1 config.
+
+        Times the WHOLE call — host-side gamma, input staging, dispatch and the output
+        copy — not the dispatch alone. It used to stage once *outside* the loop and time
+        :meth:`_dispatch` by itself, while :meth:`measure_backward` timed a full
+        ``backward()`` with staging *inside*. One backend, two stopwatch rules: the
+        forward came out optimistic against its own backward (inflating the
+        backward/forward ratio) and against simpler, which times a full call in both
+        directions. Work-placement parity is ROADMAP F6.6; this is the measurement half
+        of it, and it is a precondition for comparing the two backends at all.
+        """
         if self._rt is None:
             return super().measure(Q, K, V, A, n_iters)
-        self._stage_inputs(Q, K, V, A)
+        self.forward(Q, K, V, A)          # warm: first-dispatch costs outside the timing
         samples: list[float] = []
         for _ in range(n_iters):
             t0 = time.perf_counter()
-            self._dispatch()
+            self.forward(Q, K, V, A)
             samples.append((time.perf_counter() - t0) * 1e3)
         return samples
 
