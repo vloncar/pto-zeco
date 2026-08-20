@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -37,12 +36,21 @@ import torch
 
 # Make the package importable when invoked from the repo root or any cwd.
 _THIS_DIR = Path(__file__).parent.parent  # repo root (pto-zeco/)
-if str(_THIS_DIR) not in sys.path:
+# Repo root must precede the script dir (``allscan/``) that Python auto-adds at sys.path[0]:
+# a plain "not in sys.path" test is a no-op when PYTHONPATH already carries the repo root,
+# leaving allscan/ first, so ``import common`` resolves to allscan/common.py (a module, not
+# the common/ package) and fails with "'common' is not a package".
+if sys.path[:1] != [str(_THIS_DIR)]:
     sys.path.insert(0, str(_THIS_DIR))
 
 from allscan.common import AllscanImpl, expected_allscan, make_inputs  # noqa: E402
 from allscan.implementations import REGISTRY  # noqa: E402
-from common.harness import parse_devices, percentile, print_table  # noqa: E402
+from common.harness import (  # noqa: E402
+    latency_stats,
+    parse_devices,
+    print_reading_rule,
+    print_table,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +121,12 @@ def bench_one(
     # and report the marginal kernel/comm time (impl.amortized_timing == True).
     latencies_ms = impl.measure(S_locals, gammas, outputs, n_iters)
 
-    mean_ms = statistics.mean(latencies_ms)
+    stats = latency_stats(latencies_ms)
     output_bytes = P * dk * dv * 4  # FP32
-    bw_mbs = (output_bytes / (mean_ms * 1e-3)) / 1e6
+    # Bandwidth from the MEDIAN, not the mean: a bimodal latency sample makes the
+    # mean describe no call that happened, and the derived bandwidth inherits that
+    # (see common.harness.latency_stats).
+    bw_mbs = (output_bytes / (stats['p50_ms'] * 1e-3)) / 1e6
 
     return {
         "impl": impl.name,
@@ -125,10 +136,8 @@ def bench_one(
         "K": K,
         "build_s": build_s,
         "cold_ms": cold_ms,
-        "mean_ms": mean_ms,
-        "min_ms": min(latencies_ms),
-        "p50_ms": percentile(latencies_ms, 50),
-        "p95_ms": percentile(latencies_ms, 95),
+        **stats,
+        "flag": "!" if stats["dispersed"] else "",
         "bw_mbs": bw_mbs,
         "correct": correct,
         "max_diff": max_diff,
@@ -227,13 +236,15 @@ def main() -> None:
                     verify=not args.no_verify,
                 )
                 ok = ("Y" if row["correct"] else "N") if row["correct"] is not None else "?"
-                print(f"mean={row['mean_ms']:.3f}ms  cold={row['cold_ms']:.3f}ms  {ok}")
+                print(f"p50={row['p50_ms']:.3f}ms  cold={row['cold_ms']:.3f}ms  {ok}"
+                      + (f"  ! spread={row['spread']:.1f}x" if row["dispersed"] else ""))
                 all_rows.append(row)
             except Exception as exc:
                 print(f"FAILED: {exc}")
         impl_obj.close()
 
     print_table(all_rows)
+    print_reading_rule(all_rows)
 
     if args.json:
         out_path = Path(args.json)

@@ -14,6 +14,21 @@ backend whose per-call cost is dominated by fixed orchestration setup can amorti
 direction**, whether that happened, and ``build_s`` / ``cold_ms`` keep the one-time and
 first-call costs visible separately.
 
+**How to read a latency number here.** The headline is the **median** (``p50``), never the
+mean. pypto's per-call latency at ``P=2`` is bimodal — most calls ~20 ms with occasional
+~120 ms ones — and B5.4 reported means, so its ``P=2`` forward "45.89 ms" described no call
+that ever happened (the median was 21.15 ms) and every ratio derived from it was wrong. The
+``Spread`` column is ``max(p95/p50, p50/p05)``, deliberately two-sided because that defect
+appeared as a high tail in the forward rows and a low tail in the backward ones. A row
+marked ``!`` is dispersed: quote its range, not one number, and derive no ratio from it.
+``--iters`` below ten cannot characterise a distribution at all and prints a warning.
+
+The other half of the same discipline is that every backend must be timed at the **same
+boundaries**. ``measure`` and ``measure_backward`` both time a whole call, in every
+backend. pypto's ``measure`` used to stage its inputs outside the timing loop while its
+``measure_backward`` staged inside — one backend, two stopwatch rules, and the forward came
+out flattering (F6.6 step 1). If you add a backend, time the full call in both directions.
+
 **Reading the backward rows (B5.4).** The backends place the backward's work
 differently: simpler runs the snapshot shifts and the reverse chunk recurrence as
 host-side torch glue between device dispatches, while pypto's backward is one fused
@@ -45,7 +60,6 @@ import argparse
 import glob
 import json
 import os
-import statistics
 import subprocess
 import sys
 import time
@@ -126,7 +140,13 @@ _THIS_DIR = Path(__file__).parent.parent  # repo root (pto-zeco/)
 if sys.path[:1] != [str(_THIS_DIR)]:
     sys.path.insert(0, str(_THIS_DIR))
 
-from common.harness import parse_devices, percentile, print_table  # noqa: E402
+from common.harness import (  # noqa: E402
+    MIN_SAMPLES,
+    latency_stats,
+    parse_devices,
+    print_reading_rule,
+    print_table,
+)
 from gla.common import (  # noqa: E402
     expected_gla,
     expected_gla_backward,
@@ -147,10 +167,14 @@ GLA_COLS = [
     ("D", "D", 4, "d"),
     ("build_s", "Build(s)", 8, ".2f"),
     ("cold_ms", "Cold(ms)", 10, ".2f"),
-    ("mean_ms", "Mean(ms)", 10, ".2f"),
-    ("min_ms", "Min(ms)", 9, ".2f"),
-    ("p50_ms", "p50(ms)", 9, ".2f"),
+    # p50 is the headline and comes first on purpose: the mean of a bimodal sample
+    # describes no call that actually happened (see common.harness.latency_stats).
+    ("p50_ms", "p50(ms)", 10, ".2f"),
+    ("spread", "Spread", 8, ".2f"),
+    ("flag", "!", 3, "s"),
+    ("p05_ms", "p05(ms)", 9, ".2f"),
     ("p95_ms", "p95(ms)", 9, ".2f"),
+    ("mean_ms", "Mean(ms)", 10, ".2f"),
     ("steady", "SS", 4, "s"),
     ("correct", "OK", 4, "s"),
 ]
@@ -235,12 +259,15 @@ def bench_one(impl, P, L, C, dk, dv, device_ids, platform, n_warmup, n_iters, ve
         lat_ms = impl.measure(Q, K, V, A, n_iters)
         steady = getattr(impl, "amortized_timing", False)
 
+    stats = latency_stats(lat_ms)
     return {
         "impl": impl.name, "dir": "bwd" if backward else "fwd",
         "P": P, "L": L, "C": C, "D": dk,
         "build_s": build_s, "cold_ms": cold_ms,
-        "mean_ms": statistics.mean(lat_ms), "min_ms": min(lat_ms),
-        "p50_ms": percentile(lat_ms, 50), "p95_ms": percentile(lat_ms, 95),
+        **stats,
+        # Printed marker for a row whose median is not representative. It is derived from
+        # `dispersed` rather than replacing it so the JSON keeps the machine-readable flag.
+        "flag": "!" if stats["dispersed"] else "",
         "steady": "Y" if steady else "N",
         "correct": correct, "max_diff": max_diff, "raw_ms": lat_ms,
     }
@@ -296,6 +323,10 @@ def main() -> None:
     print(f"Devices : {device_ids}  ({len(device_ids)} available)")
     print(f"Platform: {args.platform}")
     print(f"Warmup  : {args.warmup}   Iters: {args.iters}   Verify: {not args.no_verify}")
+    if args.iters < MIN_SAMPLES:
+        print(f"WARNING : --iters {args.iters} < {MIN_SAMPLES}; too few samples to "
+              f"characterise a distribution. The p50 is reported anyway, but the spread "
+              f"check cannot be trusted and no ratio should be derived from this run.")
     print(f"Direction: {args.direction}")
     check_preload(args.platform)
 
@@ -355,8 +386,9 @@ def main() -> None:
                     row = bench_one(impl_obj, P, L, C, D, D, device_ids, args.platform,
                                     args.warmup, args.iters, not args.no_verify, direction)
                     ok = "?" if row["correct"] is None else ("Y" if row["correct"] else "N")
-                    print(f"mean={row['mean_ms']:.2f}ms cold={row['cold_ms']:.2f}ms "
-                          f"build={row['build_s']:.2f}s {ok}")
+                    print(f"p50={row['p50_ms']:.2f}ms cold={row['cold_ms']:.2f}ms "
+                          f"build={row['build_s']:.2f}s {ok}"
+                          + (f"  ! spread={row['spread']:.1f}x" if row["dispersed"] else ""))
                     all_rows.append(row)
                     # Flush after every row: a long sweep (simpler's non-amortized backward
                     # pays 3P+1 worker init/close cycles per call) can outlive its timeout,
@@ -388,6 +420,8 @@ def main() -> None:
                         clean_rendezvous()
 
     print_table(all_rows, cols=GLA_COLS)
+
+    print_reading_rule(all_rows)
 
     if args.json:
         Path(args.json).write_text(json.dumps(all_rows, indent=2))

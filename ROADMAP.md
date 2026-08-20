@@ -468,6 +468,19 @@ parked). That is the same design F3.4 landed on for simpler, so one design serve
   Now that the effect is quantified, F6.4's "simpler compute = 6.0 ms" can be stated with its
   correction rather than withheld: it counted device dispatches only, and the host share is
   4-5% (fwd) / ~10% (bwd) on top.
+
+- **Measurement discipline — DONE 2026-08-19.** Both defects found above are now structural
+  rather than remembered. `common.harness.latency_stats` makes the **median** the headline,
+  keeps `mean_ms` only as a non-headline field, and computes a **two-sided** dispersion ratio
+  `max(p95/p50, p50/p05)` — two-sided because pypto's defect showed as a high tail in the
+  forward rows and a low tail in the backward ones. Rows at or above 2.0 print a `!` and are
+  named under the table together with the rule, so it travels with any table someone pastes
+  into a write-up. Threshold calibrated on the B5.4 samples: simpler 1.00-1.09, the six bad
+  pypto rows 2.29-6.59, nearest clean pypto row 1.29. Both AllScan benches now derive
+  **bandwidth from the median** too (it was the mean). `--iters` under 10 warns. Covered by
+  `common/tests/test_latency_stats.py`, whose central cases are the real recorded samples and
+  which was mutation-checked: making the spread one-sided, or reporting the mean as the
+  headline, each fails the test that exists for it.
 - **B5.4 — DONE 2026-08-18.** Both directions, both backends, all six configs, every row
   steady-state (`SS=Y`) and correctness-verified. Raw: `../devtools/b54_results_merged.json`,
   narrative: `../devtools/B54-RESULTS.md`.
