@@ -72,6 +72,17 @@ operator — both were toolchain defects, and both fixes are now upstream.
    so reverting only the `.so` leaves a mismatched pair that raises `TypeError`; revert or
    re-apply both halves together.
 
+   **Rebased onto current main 2026-08-20** (it was 38 commits behind). The rebase broke it
+   twice, in ways no textual conflict and no green local suite could show — see
+   `../allscan/issues/pypto-comm-ordering-rebase/ROOT-CAUSE.md`:
+   (a) `make_tensor_arg` gained a `worker` first parameter, leaving both token emissions one
+   argument short; (b) host-tensor handles are now memoized **by storage base**, so the token
+   — rows of one tensor sliced per rank — fused every rank into a single dependency node and
+   a barrier could not progress. Fix: one separate allocation per rank, in a list.
+   Confirmed by a control run (unmodified main `OK`, branch before the fix wrong, branch
+   after `OK`) and by 12/12 examples + 10 098 unit tests + the distributed STs locally, all
+   in the isolated main environment.
+
 Re-validated on HW 2026-08-12, **on the updated stack** (pypto main / ptoas 0.57 / simpler
 `3165cc89`):
 
