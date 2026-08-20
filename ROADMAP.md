@@ -476,6 +476,12 @@ parked). That is the same design F3.4 landed on for simpler, so one design serve
   tests and pyright fail on **unmodified main** here for that reason alone. Any end-to-end
   validation against pypto main therefore has to happen in CI or behind an isolated build of
   both dependencies; a local run validates only against our older pin.
+  **Isolated build DONE 2026-08-20**: `source ../devtools/pypto_main_env.sh` puts the newer
+  pair beside ours (pto-isa `f51c92f6` in `/tmp/pto-isa-new`, simpler `1f27a157` in its own
+  venv) with nothing under `/opt` modified. The non-obvious step is dropping
+  `/opt/pypto/runtime/python` from `PYTHONPATH` — `set_env.sh` prepends it and a PYTHONPATH
+  entry outranks venv site-packages, so the old simpler shadows the new one. The 22 local
+  unit failures were version skew alone: 22 failed -> 201 passed on the same five files.
 
 - **Measurement discipline — DONE 2026-08-19.** Both defects found above are now structural
   rather than remembered. `common.harness.latency_stats` makes the **median** the headline,
