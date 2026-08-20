@@ -469,6 +469,14 @@ parked). That is the same design F3.4 landed on for simpler, so one design serve
   correction rather than withheld: it counted device dispatches only, and the host share is
   4-5% (fwd) / ~10% (bwd) on top.
 
+- **Environment note (2026-08-19): our pin can no longer run current pypto main.** pypto main
+  now pins simpler runtime `1f27a157`, which needs pto-isa `f51c92f6`; we are on simpler
+  `3165cc89` + pto-isa `83d01313` with two carried patches. Symptom is
+  `ImportError: cannot import name 'ChipTensor' from 'simpler.task_interface'` — 22 pypto unit
+  tests and pyright fail on **unmodified main** here for that reason alone. Any end-to-end
+  validation against pypto main therefore has to happen in CI or behind an isolated build of
+  both dependencies; a local run validates only against our older pin.
+
 - **Measurement discipline — DONE 2026-08-19.** Both defects found above are now structural
   rather than remembered. `common.harness.latency_stats` makes the **median** the headline,
   keeps `mean_ms` only as a non-headline field, and computes a **two-sided** dispersion ratio
