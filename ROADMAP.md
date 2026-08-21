@@ -245,6 +245,20 @@ multi-head. `L` is already unbounded — it is the chunk-loop trip count and no 
 Design and measurements: `../allscan/issues/pypto-tile-blocking/ARBITRARY-SIZES.md`.
 Probes: `../devtools/t5_{math_check,block_probe,snapshot_math,nocarry_probe,verdict,split_check}.py`.
 
+**Sequencing.** Not a chain. A1→A2 is a real order (A2 is much easier once the state is
+already blocked), and A3 is **independent of both** — it addresses a different wall, the L0
+operand buffers, and could be done first or in parallel. A4 is *conditional*: only if A3 fails
+to deliver `C=128`. A5–A7 are follow-on and need A1–A3 done.
+
+    A1 ──> A2 ──┐
+                ├──> A5, A6, A7
+    A3 ─────────┘
+     └──> A4  (only if A3 does not deliver C=128)
+
+A1 first because it is already proven on hardware and because it pays three ways: it unlocks
+`dk=dv=128`, it makes chunks independent, and it stops the state being a special case in every
+future sizing argument.
+
 ### A1 — Snapshot state, no carry *(next; proven on HW in probe form)*
 stage1 stores its per-chunk snapshot `S_n(0)` `[N,dk,dv]` and running decay `G_n` `[N,dk,1]`;
 stage2 drops its carry and rebuilds `S_n = G_n * boundary + S_n(0)` per chunk. The state then
@@ -273,14 +287,17 @@ gate terms and the state must stay fp32 — the decay is an exponential of a run
 range is wide — but `q`, `k`, `v` and the score matrix are candidates, which is what the
 reference implementations do. Also a straight performance win: half the operand traffic.
 
-### A4 — Chunk-row blocking *(only if A3 does not deliver `C=128`)*
+### A4 — Chunk-row blocking *(CONDITIONAL — lowest priority of A1–A4; skip entirely if A3 delivers `C=128`)*
 Flash-attention-style row blocking. Two things make it more than mechanical: the within-chunk
 decay is a cumulative product down rows, so it becomes a sequential scan carrying a `[1,BK]`
 running total instead of one matmul; and query row blocks must revisit earlier key row blocks,
 whose decay depends on their own running total (walking them in order carries it forward, so
 recomputing is cheap).
 
-**Deliberately last, and deliberately capped.** Chunk size is a tuning knob, not a model
+**Lowest priority of the four size-unlocking stages, and deliberately capped.** It was the
+headline item in the earlier plan; the 2026-08-21 measurements demoted it, because `C=128`
+fails on operand WIDTH, not working-set size — so tiling rows does not address the thing that
+actually stops it. A3 might, on its own. Chunk size is also a tuning knob, not a model
 dimension: within-chunk work grows linearly with it while state work shrinks, so past ~128 it is
 strictly worse. The useful range is 64–256. Bound it with a clear error rather than chasing
 arbitrary values.
