@@ -87,6 +87,12 @@ SIZES = [
     (128, 32, 64, 64),    # D=64 was already reachable (only C drives the [C,C] tiles)
     (128, 32, 64, 32),    # dk != dv, both >= C
     (256, 64, 64, 64),    # C=64, D=64: the mainstream GLA config, N=4 chunks
+    # Head dim 128 — unreachable until the chunk kernels blocked `dk` (task 5, 2026-08-21).
+    # It needs BOTH levers: 4 blocks over the head dim AND the cube<->vector ring cut to depth
+    # 1, which alone is 131072 B of the 188416 B budget. If either regresses this goes red
+    # with "no blocking plan fits" rather than a wrong answer.
+    (256, 64, 128, 64),   # dk=128
+    (192, 48, 48, 48),    # a multiple of 16 that is not a power of two
     # Both head dims below C. These were REFUSED by build() until 2026-08-13, because the
     # pto-isa FIFO local-slot aliasing (issue #521) made them silently corrupt: dv < C on
     # every dispatch, dk < C about 1 in 20. !1457 is merged and the fix is carried against

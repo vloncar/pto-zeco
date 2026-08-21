@@ -448,13 +448,42 @@ third is upstream-relevant: an Orchestration function whose result is **unpacked
 level must declare a `pl.Tuple[...]` return type, or distributed codegen fails with an
 internal error (`TupleGetItemExpr unpacking found no Out parameter`) rather than a diagnostic.
 
-### 5. F3.1b — real tile blocking for pypto
-`C=D=64` is at 96% of the vector budget; every next step overflows 3–4×, and `C/D = 128` also
-blows the 64 KB cube `Left`/`Right` buffers. The live set is dominated by 5 `[DK,DV]` state
-tiles and 5–6 `[C,DK]` row tiles, so **DV blocking alone is not enough — DK blocking is
-required**. Both `o_inter = qt @ S` and `scores = qt @ (K/b)^T` contract over `DK`, so partials
-must be summed **in the vector unit** — fp32 cube K-accumulation is broken on a2a3 (see
-parked). That is the same design F3.4 landed on for simpler, so one design serves both.
+### 5. F3.1b — real tile blocking for pypto — **dk=128 DONE on HW 2026-08-21; dv=128 blocked**
+`C=D=64` was at 96% of the vector budget; every next step overflowed 3–4×. The live set is
+dominated by 5 `[DK,DV]` state tiles and 5–6 `[C,DK]` row tiles. Both `o_inter = qt @ S` and
+`scores = qt @ (K/b)^T` contract over `DK`, so partials are summed **in the vector unit** —
+fp32 cube K-accumulation is broken on a2a3 (see parked). Same design as simpler's F3.4.
+
+**Shipped.** Both chunk kernels walk `dk` in `NB` blocks of `BK` (a nested `pl.range`; Q/K/A
+blocks are just narrower `pl.load`s, only the carried state is sliced with
+`pl.tile.slice`/`assemble`). `blocking_plans` + `compile_fused_forward` pick `(blocks, ring
+depth)` by trying cheapest-first and keeping the first that fits — no shape table, and a shape
+that already worked keeps its old choice.
+
+| | |
+|---|---|
+| regression, HW, P=1 + P=2 | **18 passed, 1 skipped** — every pre-existing shape still correct |
+| `C=64 dk=128 dv=64` | **PASS on HW at P=1 and P=2**, 4 blocks, err 7.6e-05 — previously impossible |
+| `C=48 dk=dv=48` | PASS — dims need only be a multiple of **16**, not powers of two |
+| `dv=128`, `C=128` | still refused, cleanly ("no blocking plan fits") |
+
+**The second lever, and it is the bigger one.** The cube↔vector pipe ring is reserved off the
+top of the same vector buffer as `(biggest crossing tile) x depth`, before any tile is placed —
+131072 B of 188416 at `C=64, dv=128`. It does not shrink with blocking. The knob is NOT on the
+enclosing `pl.at(...)` as the overflow message says (a declared InCore function has none, and
+adding one fails); `ExpandMixedKernel` reads it off a **function attribute**. The non-deprecated
+`pl.func_attr` accepts only a *literal*, so a shape-derived depth can only go through the
+deprecated `attrs={...}` form — worth raising upstream.
+
+**Why `dv=128` is blocked.** It needs the `[dk,dv]` state out of the vector buffer (65536 B of
+188416 on its own, and blocking `dk` cannot shrink it). Keeping it in a scratch tensor works on
+a2a3sim and is numerically identical — but on HW the pre-loop seeding copy is emitted into the
+**cube** half, which has no vector buffer, once the block loop is real:
+`copy_gm_to_ubuf_align_b32 does not support the given target feature`. `ir.compile` returns
+success (device kernels are built at prepare) and a2a3sim accepts it, so only a HW build catches
+it. Write-up + static detector: `../allscan/issues/pypto-cube-side-gm-copy/`,
+`../devtools/t5_split_check.py`. Design + measurements:
+`../allscan/issues/pypto-tile-blocking/DESIGN.md`.
 
 ### 6. The final fair numbers — F6.5, F6.6, B5.4
 - **F6.5** — realistic sizes (`C,D` 64/128, `L` up to 1–4k). Needs task 5.

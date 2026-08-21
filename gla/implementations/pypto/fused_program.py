@@ -67,6 +67,34 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 
+# A tile's rows and columns must each be a multiple of 16 -- the code generator rejects
+# anything else outright ("expects result boxed tile rows to be a multiple of innerRows (16),
+# but got 24"). That bounds how finely the head dim can be cut, and it is the only shape rule
+# beyond `L % C == 0`: 48, 80 and 96 are all fine, so this is NOT a powers-of-two backend.
+TILE_UNIT = 16
+
+
+def blocking_plans(dk: int) -> list[tuple[int, int]]:
+    """Candidate ``(blocks, ring_depth)`` settings for the chunk kernels, best first.
+
+    Two independent levers decide whether a shape fits the 188416 B vector buffer:
+
+    * **blocks** -- how many pieces the head dim ``dk`` is cut into. Only two matmuls
+      contract over it (``qt @ S`` and ``qt @ kb^T``), so a block's partial products are
+      summed in the VECTOR unit; fp32 accumulation inside the cube is broken on a2a3.
+    * **ring depth** -- the cube<->vector pipe ring is reserved off the top of the same
+      buffer as ``(biggest crossing tile) x depth``, *before* any tile is placed. At
+      ``C=64, dv=128`` the default depth costs 131072 B of 188416 -- more than every working
+      tile put together -- and it does not shrink with blocking, so it needs its own lever.
+
+    Ordered fewest-blocks-then-deepest-ring: both cost performance, so the first plan that
+    compiles is the cheapest one that fits. ``(1, 4)`` reproduces the pre-blocking settings,
+    so shapes that already worked keep their old choice.
+    """
+    blocks = [nb for nb in (1, 2, 4, 8, 16) if dk % nb == 0 and (dk // nb) % TILE_UNIT == 0]
+    return [(nb, slot) for nb in blocks for slot in (4, 2, 1)]
+
+
 def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
                       *, platform, device_ids):
     """Run a compiled fused-forward program, hiding the P==1 vs P>1 run-API split.
@@ -91,13 +119,66 @@ def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
             O.copy_(h_O)
         return O
     # P==1: non-distributed single-device program, entry = stage2 signature (rank-0 slices).
+    # stage2 keeps its running state in a scratch tensor rather than a carried tile, so the
+    # entry gained a trailing [dk, dv] argument; it is written but never read by the caller.
+    import torch as _torch
     from pypto.runtime.runner import RunConfig
-    compiled(Q[0], K[0], V[0], A[0], tril, zero, O[0],
+    s_ws = _torch.zeros(Q.shape[-1], V.shape[-1], dtype=Q.dtype)
+    compiled(Q[0], K[0], V[0], A[0], tril, zero, O[0], s_ws,
              config=RunConfig(platform=platform, device_id=device_ids[0]))
     return O
 
 
-def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
+def compile_fused_forward(L, C, dk, dv, K, P, *, platform, distributed_config=None,
+                          plans=None, log=None):
+    """Compile the fused forward, picking the cheapest blocking that fits the vector buffer.
+
+    Whether a shape fits is not something to hardcode a table for: it depends on the chunk
+    size, both head dims, the ring depth and the compiler's own packing, and it moves when any
+    of those change. So try :func:`blocking_plans` in order and keep the first that compiles.
+    Each attempt costs a couple of seconds and the shapes that already worked hit on the first
+    one, so the search is nearly free where it changes nothing.
+
+    Only a **vector-buffer overflow** advances to the next plan. Any other failure is a real
+    error and is re-raised immediately -- a search that swallows everything would turn a
+    genuine miscompile into a confusing "no plan fits".
+
+    Returns:
+        ``(compiled, (blocks, ring_depth))`` -- the plan is returned so callers can record
+        which one was used rather than guess.
+    """
+    from pypto import ir
+
+    plans = list(plans if plans is not None else blocking_plans(dk))
+    assert plans, f"no legal blocking for dk={dk} (block width must be a multiple of {TILE_UNIT})"
+    tried = []
+    for nb, slot in plans:
+        program = build_fused_forward_program(L, C, dk, dv, K, P, nb, slot)
+        kwargs = {"platform": platform}
+        if distributed_config is not None:
+            kwargs["distributed_config"] = distributed_config
+        try:
+            compiled = ir.compile(program, **kwargs)
+        except Exception as exc:  # noqa: BLE001 -- narrowed on the message just below
+            if "buffer usage" not in str(exc) or "exceeds platform limit" not in str(exc):
+                raise
+            tried.append((nb, slot, str(exc).split("exceeds")[0].strip()))
+            if log is not None:
+                log(f"blocking plan blocks={nb} ring_depth={slot} does not fit; trying the next")
+            continue
+        if log is not None and (nb, slot) != plans[0]:
+            log(f"blocking plan blocks={nb} ring_depth={slot} fits "
+                f"(after {len(tried)} that did not)")
+        return compiled, (nb, slot)
+    detail = "\n  ".join(f"blocks={nb} ring_depth={slot}: {why}" for nb, slot, why in tried)
+    raise ValueError(
+        f"no blocking plan fits C={C} dk={dk} dv={dv} on {platform}; tried:\n  {detail}\n"
+        "The chunk dim C is not blocked yet, so a large C overflows whatever the head dim does."
+    )
+
+
+def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
+                              nb: int = 1, slot: int = 4):
     """P == 1 native path: stage2 from a zero boundary (no ring; stage1 is dead).
 
     Compiles to a non-distributed single-device program (entry = the stage2 signature, since
@@ -107,10 +188,17 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     N = L // C
     P, DK, DV = 1, dk, dv
+    NB, BK, SLOT = nb, dk // nb, slot
 
     @pl.program
     class FusedForwardP1Program:
-        @pl.function(type=pl.FunctionType.InCore)
+        # ``attrs={"slot_num": ...}`` rather than ``pl.func_attr``: the ring depth is derived
+        # from the shape, and ``pl.func_attr`` accepts only a LITERAL -- a Python int from the
+        # enclosing scope reaches the pass as an ``ir::Expr`` and is rejected ("Invalid type
+        # for func attr key: slot_num, expected int"). The decorator form is evaluated as
+        # ordinary Python, so it takes a computed value. It carries a deprecation warning; see
+        # ``../../../allscan/issues/pypto-tile-blocking/DESIGN.md``.
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_stage2(
             self,
             Q: pl.Tensor[[L, DK], pl.FP32],
@@ -121,31 +209,54 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv."""
+            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv.
+
+            The head dim is walked in ``NB`` blocks of ``BK`` and the running state lives in the
+            scratch tensor ``Sws`` rather than a carried tile -- see :func:`blocking_plans` for
+            why both are needed. Q, K and A need no slicing: a block of them is just a narrower
+            ``pl.load``; only the state does.
+            """
             tril_t = pl.load(tril, [0, 0], [C, C])
             s_init = pl.load(Srecv, [0, 0], [DK, DV])
             out = O
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
-                q = pl.load(Q, [off, 0], [C, DK])
-                k = pl.load(Kmat, [off, 0], [C, DK])
                 v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                qt = pl.mul(q, b)
-                kb = pl.div(k, b)
-                kbt = pl.transpose(kb, 0, 1)
-                scores = pl.mul(pl.matmul(qt, kbt, out_dtype=pl.FP32), tril_t)
-                o_intra = pl.matmul(scores, v, out_dtype=pl.FP32)
-                s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul (raw iter_arg stays in vec)
-                o_inter = pl.matmul(qt, s_run_v, out_dtype=pl.FP32)
-                o_n = pl.add(o_inter, o_intra)
+                s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul/slice
+                # Zero seeds for the accumulators, without extra host constants.
+                sc0 = pl.mul(tril_t, 0.0)
+                oi0 = pl.mul(v, 0.0)
+                # A real nested pl.range, not a Python `for`: pypto parses this source, so a
+                # Python loop here is read as a device loop that reassigns names without
+                # pl.yield_ ("N iteration arguments but 0 return variables").
+                for j, (scores_acc, o_inter, s_acc) in pl.range(
+                    0, NB, init_values=(sc0, oi0, s_run_v)
+                ):
+                    dof = j * BK
+                    q_b = pl.load(Q, [off, dof], [C, BK])
+                    k_b = pl.load(Kmat, [off, dof], [C, BK])
+                    a_b = pl.load(A, [off, dof], [C, BK])
+                    la_b = pl.log(a_b)
+                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                    qt_b = pl.mul(q_b, b_b)
+                    kb_b = pl.div(k_b, b_b)
+                    kbt_b = pl.transpose(kb_b, 0, 1)
+                    # Read this block's rows out of the carried state; the blocks write
+                    # disjoint rows, so reading `s_run_v` while assembling into `s_acc` is safe.
+                    s_blk = pl.tile.slice(s_run_v, [BK, DV], [dof, 0])
+                    # Both matmuls contract over the head dim, so their partials are summed
+                    # here in the VECTOR unit -- fp32 cube accumulation is broken on a2a3.
+                    sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
+                    oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
+                    kv_b = pl.matmul(kbt_b, v, out_dtype=pl.FP32)
+                    s_blk_new = pl.tile.row_expand_mul(pl.add(s_blk, kv_b), gamma_b)
+                    s_acc_n = pl.tile.assemble(s_acc, s_blk_new, [dof, 0])
+                    scores_acc, o_inter, s_acc = pl.yield_(sc_n, oi_n, s_acc_n)
+                scores = pl.mul(scores_acc, tril_t)
+                o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
                 out = pl.store(o_n, [off, 0], out)
-                kv = pl.matmul(kbt, v, out_dtype=pl.FP32)
-                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
-                s_run = pl.yield_(s_new)
+                s_run = pl.yield_(s_acc)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -186,7 +297,8 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int):
     return FusedForwardP1Program
 
 
-def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int):
+def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int,
+                                nb: int = 1, slot: int = 4):
     """Build the fully-fused ``stage1 + ring + stage2`` distributed program.
 
     Args:
@@ -202,16 +314,17 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
     assert dk % K == 0, f"dk ({dk}) must be divisible by K ({K})"
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     if P == 1:
-        return _build_p1_forward_program(L, C, dk, dv, K)
+        return _build_p1_forward_program(L, C, dk, dv, K, nb, slot)
 
     BLOCK = dk // K
     N = L // C
     DK, DV = dk, dv
+    NB, BK, SLOT = nb, dk // nb, slot
 
     @pl.program
     class FusedForwardProgram:
         # ---- phase 1: chunk-recurrent GLA stage1 (local S_total, from S=0) ----
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_stage1(
             self,
             A: pl.Tensor[[L, DK], pl.FP32],
@@ -221,20 +334,31 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             zero: pl.Tensor[[DK, DV], pl.FP32],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ) -> pl.Tensor[[DK, DV], pl.FP32]:
+            """Local end-of-slice state, from S = 0. Blocked over the head dim like stage2.
+
+            Nothing here contracts over the head dim -- ``kb^T @ v`` has it as the OUTPUT row
+            dim -- so no accumulator is needed, and the state's own output tensor ``Stot``
+            doubles as the scratch it is built in.
+            """
             tril_t = pl.load(tril, [0, 0], [C, C])
             s_init = pl.load(zero, [0, 0], [DK, DV])
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
-                k = pl.load(Kmat, [off, 0], [C, DK])
                 v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                kb = pl.div(k, b)
-                kv = pl.matmul(pl.transpose(kb, 0, 1), v, out_dtype=pl.FP32)
-                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
-                s_fin = pl.yield_(s_new)
+                s_run_v = pl.mul(s_run, 1.0)
+                for j, (s_acc,) in pl.range(0, NB, init_values=(s_run_v,)):
+                    dof = j * BK
+                    k_b = pl.load(Kmat, [off, dof], [C, BK])
+                    a_b = pl.load(A, [off, dof], [C, BK])
+                    la_b = pl.log(a_b)
+                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                    kb_b = pl.div(k_b, b_b)
+                    s_blk = pl.tile.slice(s_run_v, [BK, DV], [dof, 0])
+                    kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
+                    s_blk_new = pl.tile.row_expand_mul(pl.add(s_blk, kv_b), gamma_b)
+                    s_acc = pl.yield_(pl.tile.assemble(s_acc, s_blk_new, [dof, 0]))
+                s_fin = pl.yield_(s_acc)
             # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
             # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
             # two directions of a bidirectional cube<->vector TPipe indexed the SAME GM slots
@@ -246,8 +370,9 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             #   pypto:   size the GM pipe workspace for BOTH rings, honour slot_num
             # With those, stock ring depth, the fused forward is 12/12 at C=16 and 12/12 at
             # C=32. See allscan/issues/pypto-incore-loop-cube-vector-race/ROOT-CAUSE.md.
-            # (The post-loop carry read below is fine and always was: swapping it for a
-            # per-iteration store left the old failures bit-identical.)
+            # (The post-loop carry read this replaced was fine and always was: swapping it for
+            # a per-iteration store left the old failures bit-identical. The state now lives in
+            # a per-iteration store left the old failures bit-identical.)
             return pl.store(s_fin, [0, 0], Stot)
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -263,7 +388,13 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             return self.gla_stage1(A, Kmat, Vmat, tril, zero, Stot)
 
         # ---- phase 3: chunk-recurrent GLA stage2 (output from boundary S_recv) ----
-        @pl.function(type=pl.FunctionType.InCore)
+        # ``attrs={"slot_num": ...}`` rather than ``pl.func_attr``: the ring depth is derived
+        # from the shape, and ``pl.func_attr`` accepts only a LITERAL -- a Python int from the
+        # enclosing scope reaches the pass as an ``ir::Expr`` and is rejected ("Invalid type
+        # for func attr key: slot_num, expected int"). The decorator form is evaluated as
+        # ordinary Python, so it takes a computed value. It carries a deprecation warning; see
+        # ``../../../allscan/issues/pypto-tile-blocking/DESIGN.md``.
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_stage2(
             self,
             Q: pl.Tensor[[L, DK], pl.FP32],
@@ -274,31 +405,54 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv."""
+            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv.
+
+            The head dim is walked in ``NB`` blocks of ``BK`` and the running state lives in the
+            scratch tensor ``Sws`` rather than a carried tile -- see :func:`blocking_plans` for
+            why both are needed. Q, K and A need no slicing: a block of them is just a narrower
+            ``pl.load``; only the state does.
+            """
             tril_t = pl.load(tril, [0, 0], [C, C])
             s_init = pl.load(Srecv, [0, 0], [DK, DV])
             out = O
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
-                q = pl.load(Q, [off, 0], [C, DK])
-                k = pl.load(Kmat, [off, 0], [C, DK])
                 v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                qt = pl.mul(q, b)
-                kb = pl.div(k, b)
-                kbt = pl.transpose(kb, 0, 1)
-                scores = pl.mul(pl.matmul(qt, kbt, out_dtype=pl.FP32), tril_t)
-                o_intra = pl.matmul(scores, v, out_dtype=pl.FP32)
-                s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul (raw iter_arg stays in vec)
-                o_inter = pl.matmul(qt, s_run_v, out_dtype=pl.FP32)
-                o_n = pl.add(o_inter, o_intra)
+                s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul/slice
+                # Zero seeds for the accumulators, without extra host constants.
+                sc0 = pl.mul(tril_t, 0.0)
+                oi0 = pl.mul(v, 0.0)
+                # A real nested pl.range, not a Python `for`: pypto parses this source, so a
+                # Python loop here is read as a device loop that reassigns names without
+                # pl.yield_ ("N iteration arguments but 0 return variables").
+                for j, (scores_acc, o_inter, s_acc) in pl.range(
+                    0, NB, init_values=(sc0, oi0, s_run_v)
+                ):
+                    dof = j * BK
+                    q_b = pl.load(Q, [off, dof], [C, BK])
+                    k_b = pl.load(Kmat, [off, dof], [C, BK])
+                    a_b = pl.load(A, [off, dof], [C, BK])
+                    la_b = pl.log(a_b)
+                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                    qt_b = pl.mul(q_b, b_b)
+                    kb_b = pl.div(k_b, b_b)
+                    kbt_b = pl.transpose(kb_b, 0, 1)
+                    # Read this block's rows out of the carried state; the blocks write
+                    # disjoint rows, so reading `s_run_v` while assembling into `s_acc` is safe.
+                    s_blk = pl.tile.slice(s_run_v, [BK, DV], [dof, 0])
+                    # Both matmuls contract over the head dim, so their partials are summed
+                    # here in the VECTOR unit -- fp32 cube accumulation is broken on a2a3.
+                    sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
+                    oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
+                    kv_b = pl.matmul(kbt_b, v, out_dtype=pl.FP32)
+                    s_blk_new = pl.tile.row_expand_mul(pl.add(s_blk, kv_b), gamma_b)
+                    s_acc_n = pl.tile.assemble(s_acc, s_blk_new, [dof, 0])
+                    scores_acc, o_inter, s_acc = pl.yield_(sc_n, oi_n, s_acc_n)
+                scores = pl.mul(scores_acc, tril_t)
+                o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
                 out = pl.store(o_n, [off, 0], out)
-                kv = pl.matmul(kbt, v, out_dtype=pl.FP32)
-                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
-                s_run = pl.yield_(s_new)
+                s_run = pl.yield_(s_acc)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
