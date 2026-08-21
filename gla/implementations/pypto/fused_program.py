@@ -207,6 +207,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv.
@@ -221,11 +222,15 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             out = O
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
-                v = pl.load(Vmat, [off, 0], [C, DV])
+                # EXPERIMENT: V is a pure matmul operand -- stage it in L1 (512 KB,
+                # entirely unused today) instead of the 184 KB vector buffer.
+                v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
                 s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul/slice
-                # Zero seeds for the accumulators, without extra host constants.
+                # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0` comes
+                # from a [C, DV] zero rather than from V, because V is now staged in L1 and
+                # touching it with a vector op would drag a copy back into the vector buffer.
                 sc0 = pl.mul(tril_t, 0.0)
-                oi0 = pl.mul(v, 0.0)
+                oi0 = pl.load(zc, [0, 0], [C, DV])
                 # A real nested pl.range, not a Python `for`: pypto parses this source, so a
                 # Python loop here is read as a device loop that reassigns names without
                 # pl.yield_ ("N iteration arguments but 0 return variables").
@@ -268,9 +273,10 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, O)
+            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, zc, O)
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
@@ -285,13 +291,14 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
             """P == 1: single rank, S_recv = 0 (no boundary). ``gammas`` is unused."""
+            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)
             for r in pl.range(P):
                 Q_r = Qmat[r]
                 K_r = Kmat[r]
                 V_r = Vmat[r]
                 A_r = A[r]
                 O_r = O[r]
-                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, zero, O_r, device=r)
+                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, zero, zc, O_r, device=r)
             return O
 
     return FusedForwardP1Program
@@ -344,7 +351,9 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             s_init = pl.load(zero, [0, 0], [DK, DV])
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
-                v = pl.load(Vmat, [off, 0], [C, DV])
+                # EXPERIMENT: V is a pure matmul operand -- stage it in L1 (512 KB,
+                # entirely unused today) instead of the 184 KB vector buffer.
+                v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
                 s_run_v = pl.mul(s_run, 1.0)
                 for j, (s_acc,) in pl.range(0, NB, init_values=(s_run_v,)):
                     dof = j * BK
@@ -403,6 +412,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv.
@@ -417,11 +427,15 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             out = O
             for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
                 off = n * C
-                v = pl.load(Vmat, [off, 0], [C, DV])
+                # EXPERIMENT: V is a pure matmul operand -- stage it in L1 (512 KB,
+                # entirely unused today) instead of the 184 KB vector buffer.
+                v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
                 s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul/slice
-                # Zero seeds for the accumulators, without extra host constants.
+                # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0` comes
+                # from a [C, DV] zero rather than from V, because V is now staged in L1 and
+                # touching it with a vector op would drag a copy back into the vector buffer.
                 sc0 = pl.mul(tril_t, 0.0)
-                oi0 = pl.mul(v, 0.0)
+                oi0 = pl.load(zc, [0, 0], [C, DV])
                 # A real nested pl.range, not a Python `for`: pypto parses this source, so a
                 # Python loop here is read as a device loop that reassigns names without
                 # pl.yield_ ("N iteration arguments but 0 return variables").
@@ -464,9 +478,10 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, O)
+            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, zc, O)
 
         # ---- phase 2: AllScan ring (first/middle/last), emitting S_recv ----
         @pl.function(type=pl.FunctionType.InCore)
@@ -580,6 +595,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             S_local = pl.create_tensor([P, dk, dv], dtype=pl.FP32)     # stage1 local S_total (ring input)
             S_out_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)   # ring inclusive-scan out[r] (sent)
             S_recv_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)  # received boundary out[r-1] per rank
+            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)  # seeds the O accumulator
 
             for r in pl.range(P):
                 # Slice this rank's inputs once, before the if/elif/else.
@@ -614,7 +630,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                     boundary = self.chip_orch_middle(
                         sl_r, gamma_r, S_recv_r, dst, signal, r + 1, device=r)
 
-                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, boundary, O_r, device=r)
+                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, boundary, zc, O_r, device=r)
             return O
 
     return FusedForwardProgram
