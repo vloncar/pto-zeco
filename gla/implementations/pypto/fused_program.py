@@ -72,6 +72,16 @@ which is what pto-kernels' KDA ``chunk_o`` relies on ("each reads its own s_snap
 and what any future within-slice parallelism would need. Cost: ``N * dk * dv`` extra stores
 per rank, and stage1 re-reads ``V`` once per head-dim block.
 
+**Value-dim blocking (A2).** What still scaled with ``dv`` after that was the ``[C, dv]``
+output accumulator and the ``[C, dv]`` right-hand operand of ``scores @ V`` -- the latter being
+a 64 KB L0 operand at ``dv = 256``, i.e. the whole buffer. Nothing contracts over ``dv``, so
+it splits cleanly, and both kernels walk it in ``NV`` blocks of ``BV``. The split is written as
+a loop *around the whole chunk body* rather than as a second pass, so at ``NV == 1`` the body
+is exactly what it was and a shape whose ``dv`` already fits pays nothing. At ``NV > 1`` the
+price is recomputing the within-chunk decay and the score matrix -- both depend only on ``dk``
+-- once per value block. Hence :func:`blocking_plans` varies the value split SLOWEST: it is the
+only lever measured to cost real work, so it is the last one reached for.
+
 **P=1 and P>1 MUST be built by separate factory functions** (not one class with an
 ``if P == 1:`` branch): conditionally-defined methods in a ``@pl.program`` class body are
 silently NOT registered — that drops the ring functions and collapses the whole program down
@@ -94,25 +104,57 @@ import pypto.language.distributed as pld
 TILE_UNIT = 16
 
 
-def blocking_plans(dk: int) -> list[tuple[int, int]]:
-    """Candidate ``(blocks, ring_depth)`` settings for the chunk kernels, best first.
+def _splits(d: int) -> list[int]:
+    """How many pieces dimension ``d`` can be cut into, coarsest first.
 
-    Two independent levers decide whether a shape fits the 188416 B vector buffer:
+    Derived rather than tabulated: the useful splits are the ones that leave a legal block, so
+    it doubles until the block would drop below ``TILE_UNIT``. A fixed table would quietly stop
+    short on a dimension bigger than it anticipated -- at ``d = 1024`` a table ending at 32
+    offers no block finer than 64.
+    """
+    out, n = [], 1
+    while n <= d:
+        if d % n == 0 and (d // n) % TILE_UNIT == 0:
+            out.append(n)
+        n *= 2
+    return out
 
-    * **blocks** -- how many pieces the head dim ``dk`` is cut into. Only two matmuls
+
+def blocking_plans(dk: int, dv: int, distributed: bool = False) -> list[tuple[int, ...]]:
+    """Candidate ``(head_blocks, value_blocks, ring_depth, ring_blocks)`` settings, cheapest
+    first.
+
+    Four independent levers decide whether a shape fits the 188416 B vector buffer:
+
+    * **head_blocks** -- how many pieces the head dim ``dk`` is cut into. Only two matmuls
       contract over it (``qt @ S`` and ``qt @ kb^T``), so a block's partial products are
       summed in the VECTOR unit; fp32 accumulation inside the cube is broken on a2a3.
+      Measured to cost no latency, so it is the first thing tried.
     * **ring depth** -- the cube<->vector pipe ring is reserved off the top of the same
       buffer as ``(biggest crossing tile) x depth``, *before* any tile is placed. At
       ``C=64, dv=128`` the default depth costs 131072 B of 188416 -- more than every working
       tile put together -- and it does not shrink with blocking, so it needs its own lever.
+    * **value_blocks** -- how many pieces ``dv`` is cut into. Nothing contracts over ``dv``,
+      so it is a clean outer split, but it is the one lever that costs real work: the
+      within-chunk decay and the score matrix depend only on ``dk``, and each extra value
+      block recomputes them. So it varies SLOWEST here -- every ``value_blocks=1`` setting is
+      tried before ``dv`` is split at all.
+    * **ring_blocks** -- how many pieces the boundary exchange is cut into. This one belongs to
+      a different kernel: the AllScan ring moves the ``[dk, dv]`` end-of-slice state between
+      ranks, and at one piece that is a 262144 B tile at ``dk = dv = 256`` -- more than the
+      whole buffer on its own. Once the chunk kernels stopped holding the state whole, the RING
+      became the binding constraint at ``P > 1``, and it was pinned at one piece. It only
+      exists for ``P > 1``, so ``distributed=False`` leaves it at 1 and does not search it.
 
-    Ordered fewest-blocks-then-deepest-ring: both cost performance, so the first plan that
-    compiles is the cheapest one that fits. ``(1, 4)`` reproduces the pre-blocking settings,
-    so shapes that already worked keep their old choice.
+    ``(1, 1, 4, 1)`` reproduces the pre-blocking settings, so shapes that already worked keep
+    their old choice.
     """
-    blocks = [nb for nb in (1, 2, 4, 8, 16) if dk % nb == 0 and (dk // nb) % TILE_UNIT == 0]
-    return [(nb, slot) for nb in blocks for slot in (4, 2, 1)]
+    ring = _splits(dk) if distributed else [1]
+    return [(nb, nv, slot, rb)
+            for nv in _splits(dv)
+            for rb in ring
+            for nb in _splits(dk)
+            for slot in (4, 2, 1)]
 
 
 def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
@@ -149,7 +191,7 @@ def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
         f"got {type(compiled).__name__}.")
 
 
-def compile_fused_forward(L, C, dk, dv, K, P, *, platform, distributed_config=None,
+def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
                           plans=None, log=None):
     """Compile the fused forward, picking the cheapest blocking that fits the vector buffer.
 
@@ -164,16 +206,26 @@ def compile_fused_forward(L, C, dk, dv, K, P, *, platform, distributed_config=No
     genuine miscompile into a confusing "no plan fits".
 
     Returns:
-        ``(compiled, (blocks, ring_depth))`` -- the plan is returned so callers can record
-        which one was used rather than guess.
+        ``(compiled, (head_blocks, value_blocks, ring_depth, ring_blocks))`` -- the plan is
+        returned so callers can record which one was used rather than guess.
     """
     from pypto import ir
 
-    plans = list(plans if plans is not None else blocking_plans(dk))
-    assert plans, f"no legal blocking for dk={dk} (block width must be a multiple of {TILE_UNIT})"
+    plans = list(plans if plans is not None else blocking_plans(dk, dv, distributed=P > 1))
+    assert plans, (f"no legal blocking for dk={dk} dv={dv} "
+                   f"(block widths must be a multiple of {TILE_UNIT})")
     tried = []
-    for nb, slot in plans:
-        program = build_fused_forward_program(L, C, dk, dv, K, P, nb, slot)
+    seen = {}
+
+    def attempt(nb, nv, slot, rb):
+        """Compile one plan. Returns the compiled program, or None if it does not fit.
+
+        Memoised: the group feasibility probe below deliberately compiles a plan the walk may
+        reach again, and each attempt costs seconds.
+        """
+        if (nb, nv, slot, rb) in seen:
+            return seen[(nb, nv, slot, rb)]
+        program = build_fused_forward_program(L, C, dk, dv, rb, P, nb, nv, slot)
         kwargs = {"platform": platform}
         if distributed_config is not None:
             kwargs["distributed_config"] = distributed_config
@@ -182,23 +234,71 @@ def compile_fused_forward(L, C, dk, dv, K, P, *, platform, distributed_config=No
         except Exception as exc:  # noqa: BLE001 -- narrowed on the message just below
             if "buffer usage" not in str(exc) or "exceeds platform limit" not in str(exc):
                 raise
-            tried.append((nb, slot, str(exc).split("exceeds")[0].strip()))
+            # A LEFT-operand overflow is not something any plan here can fix. The widest left
+            # matmul operand is the [C, C] triangular matrix, so this says the chunk size does
+            # not fit the 64 KB L0 buffer -- and neither lever below touches C. Say so once
+            # instead of grinding through every remaining plan to reach the same conclusion.
+            if "Left buffer usage" in str(exc):
+                raise ValueError(
+                    f"C={C} does not fit the L0 left-operand buffer at any blocking on "
+                    f"{platform}: the widest left operand is the [{C}, {C}] fp32 triangular "
+                    "matrix, and neither head-dim nor value-dim blocking changes it. Narrower "
+                    "(fp16/bf16) operands or blocking the chunk rows would -- neither is "
+                    "implemented; see ROADMAP Task A3 / A4."
+                ) from exc
+            tried.append((nb, nv, slot, rb, str(exc).split("exceeds")[0].strip()))
             if log is not None:
-                log(f"blocking plan blocks={nb} ring_depth={slot} does not fit; trying the next")
+                log(f"blocking plan head_blocks={nb} value_blocks={nv} ring_depth={slot} "
+                    f"ring_blocks={rb} does not fit")
+            seen[(nb, nv, slot, rb)] = None
+            return None
+        seen[(nb, nv, slot, rb)] = compiled
+        return compiled
+
+    def take(nb, nv, slot, rb, compiled):
+        if log is not None and (nb, nv, slot, rb) != plans[0]:
+            log(f"blocking plan head_blocks={nb} value_blocks={nv} ring_depth={slot} "
+                f"ring_blocks={rb} fits (after {len(tried)} that did not)")
+        return compiled, (nb, nv, slot, rb)
+
+    # Walk the plans one (value split, ring split) group at a time. The cheapest setting in a
+    # group is tried first, as before; only if THAT fails is the group tested as a whole, so a
+    # shape that fits immediately still costs exactly one compile.
+    #
+    # The group test works because the two levers left inside a group are monotone -- more head
+    # blocks make every per-block tile smaller, a shallower cross-core ring reserves less -- so
+    # the finest head blocking at the shallowest ring is the SMALLEST footprint that group can
+    # reach. If that does not fit, nothing else in the group does, and the group is skipped for
+    # one compile instead of up to eighteen. Each compile takes seconds and there are now four
+    # levers, so at dk=dv=1024 this is the difference between hundreds of attempts and ~25.
+    for nv, rb in dict.fromkeys((p[1], p[3]) for p in plans):
+        group = [p for p in plans if p[1] == nv and p[3] == rb]
+        head = group[0]
+        compiled = attempt(*head)
+        if compiled is not None:
+            return take(*head, compiled)
+        floor = (max(nb for nb, _, _, _ in group), nv, min(s for _, _, s, _ in group), rb)
+        if attempt(*floor) is None:
+            if log is not None:
+                log(f"value_blocks={nv} ring_blocks={rb} cannot fit at any head blocking or "
+                    f"cross-core ring depth; skipping {len(group) - 2} further settings")
             continue
-        if log is not None and (nb, slot) != plans[0]:
-            log(f"blocking plan blocks={nb} ring_depth={slot} fits "
-                f"(after {len(tried)} that did not)")
-        return compiled, (nb, slot)
-    detail = "\n  ".join(f"blocks={nb} ring_depth={slot}: {why}" for nb, slot, why in tried)
+        for nb, _nv, slot, _rb in group[1:]:
+            compiled = attempt(nb, nv, slot, rb)
+            if compiled is not None:
+                return take(nb, nv, slot, rb, compiled)
+    detail = "\n  ".join(
+        f"head_blocks={nb} value_blocks={nv} ring_depth={slot} ring_blocks={rb}: {why}"
+        for nb, nv, slot, rb, why in tried)
     raise ValueError(
         f"no blocking plan fits C={C} dk={dk} dv={dv} on {platform}; tried:\n  {detail}\n"
-        "The chunk dim C is not blocked yet, so a large C overflows whatever the head dim does."
+        "The chunk dim C is not blocked yet, so a large C overflows whatever the head and "
+        "value dims do."
     )
 
 
 def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
-                              nb: int = 1, slot: int = 4):
+                              nb: int = 1, nv: int = 1, slot: int = 4):
     """P == 1 native path: stage1 + stage2 from a zero boundary (no ring).
 
     stage1 used to be dead here -- its only consumer was the ring -- so P=1 was stage2 alone.
@@ -211,7 +311,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     N = L // C
     P, DK, DV = 1, dk, dv
-    NB, BK, SLOT = nb, dk // nb, slot
+    NB, BK, NV, BV, SLOT = nb, dk // nb, nv, dv // nv, slot
 
     @pl.program
     class FusedForwardP1Program:
@@ -253,40 +353,48 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             tot = Stot
             for j in pl.range(0, NB):
                 dof = j * BK
-                s0 = pl.load(zero, [dof, 0], [BK, DV])
                 # The decay seed: a ones column, DERIVED rather than allocated or loaded.
                 # Three routes are closed. `pl.create_tensor(..., init_value=1)` compiles and
-                # runs but silently
-                # delivers ZEROS from a HOST orchestrator (honoured in a chip orchestrator, and
-                # init_value=0 is honoured everywhere) -- that made rank 1 ignore its boundary
-                # entirely; `pl.tile.full([BK, 1], ...)` is rejected because an allocated tile
-                # needs a 32-byte-aligned row and one fp32 column is 4 bytes; and a [BK, 1]
-                # load out of a wider tensor is rejected as a layout change. Reducing an
-                # existing [C, BK] tile gives a legal [BK, 1], and 0.0 + 1.0 is exact.
-                # See issues/pypto-host-init-value-zeroed/.
+                # runs but silently delivers ZEROS from a HOST orchestrator (it is honoured in
+                # a chip orchestrator, and init_value=0 is honoured everywhere) -- that made
+                # rank 1 ignore its boundary entirely. `pl.tile.full([BK, 1], ...)` is
+                # rejected because an allocated tile needs a 32-byte-aligned row and one fp32
+                # column is 4 bytes. And a [BK, 1] load out of a wider tensor is rejected as a
+                # layout change. Reducing an existing [C, BK] tile gives a legal [BK, 1], and
+                # 0.0 + 1.0 is exact. See issues/pypto-host-init-value-zeroed/.
                 a_seed = pl.load(A, [0, dof], [C, BK])
                 g0 = pl.add(pl.tile.reshape(pl.tile.col_sum(pl.mul(a_seed, 0.0)), [BK, 1]), 1.0)
-                for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
-                    off = n * C
-                    soff = n * DK
-                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
-                    # rather than in the 184 KB vector buffer.
-                    v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                    # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
-                    snaps = pl.store(s_run, [soff + dof, 0], snaps)
-                    decays = pl.store(g_run, [soff + dof, 0], decays)
-                    k_b = pl.load(Kmat, [off, dof], [C, BK])
-                    a_b = pl.load(A, [off, dof], [C, BK])
-                    la_b = pl.log(a_b)
-                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
-                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
-                    kb_b = pl.div(k_b, b_b)
-                    kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
-                    # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference factors it.
-                    s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
-                    g_new = pl.mul(g_run, gamma_b)
-                    s_fin, g_fin = pl.yield_(s_new, g_new)
-                tot = pl.store(s_fin, [dof, 0], tot)
+                # The value dim is walked in NV blocks of BV. Nothing here couples one value
+                # block to another either, so it is a second clean outer split; the decay is
+                # recomputed per value block because it does not depend on `dv` at all, and
+                # the decay record is rewritten with the same numbers NV times, which is
+                # [BK, 1] of traffic and not worth a device conditional to avoid.
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    s0 = pl.load(zero, [dof, vof], [BK, BV])
+                    for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
+                        off = n * C
+                        soff = n * DK
+                        # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise
+                        # unused) rather than in the 184 KB vector buffer.
+                        v = pl.load(Vmat, [off, vof], [C, BV],
+                                    target_memory=pl.MemorySpace.Mat)
+                        # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
+                        snaps = pl.store(s_run, [soff + dof, vof], snaps)
+                        decays = pl.store(g_run, [soff + dof, 0], decays)
+                        k_b = pl.load(Kmat, [off, dof], [C, BK])
+                        a_b = pl.load(A, [off, dof], [C, BK])
+                        la_b = pl.log(a_b)
+                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                        kb_b = pl.div(k_b, b_b)
+                        kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
+                        # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference
+                        # factors it.
+                        s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
+                        g_new = pl.mul(g_run, gamma_b)
+                        s_fin, g_fin = pl.yield_(s_new, g_new)
+                    tot = pl.store(s_fin, [dof, vof], tot)
             # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
             # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
             # two directions of a bidirectional cube<->vector TPipe indexed the SAME GM slots
@@ -332,7 +440,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, DV], pl.FP32],
+            zc: pl.Tensor[[C, BV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             """O[n] = (Q_n*b_n)@S_n + ((Q_n*b_n)@(K_n/b_n)^T (*) tril)@V_n, S_n REBUILT not carried.
@@ -358,41 +466,51 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             for n in pl.range(0, N):
                 off = n * C
                 soff = n * DK
-                # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
-                # rather than in the 184 KB vector buffer.
-                v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0` comes
-                # from a [C, DV] zero rather than from V, because V is staged in L1 and
-                # touching it with a vector op would drag a copy back into the vector buffer.
-                sc0 = pl.mul(tril_t, 0.0)
-                oi0 = pl.load(zc, [0, 0], [C, DV])
-                # A real nested pl.range, not a Python `for`: pypto parses this source, so a
-                # Python loop here is read as a device loop that reassigns names without
-                # pl.yield_ ("N iteration arguments but 0 return variables").
-                for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
-                    dof = j * BK
-                    q_b = pl.load(Q, [off, dof], [C, BK])
-                    k_b = pl.load(Kmat, [off, dof], [C, BK])
-                    a_b = pl.load(A, [off, dof], [C, BK])
-                    la_b = pl.log(a_b)
-                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
-                    qt_b = pl.mul(q_b, b_b)
-                    kb_b = pl.div(k_b, b_b)
-                    kbt_b = pl.transpose(kb_b, 0, 1)
-                    # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
-                    # [BK, DV] is ever live, and it dies at the end of the block.
-                    s_snap = pl.load(Ssnap, [soff + dof, 0], [BK, DV])
-                    g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
-                    b_blk = pl.load(Srecv, [dof, 0], [BK, DV])
-                    s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
-                    # Both matmuls contract over the head dim, so their partials are summed
-                    # here in the VECTOR unit -- fp32 cube accumulation is broken on a2a3.
-                    sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
-                    oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
-                    scores_acc, o_inter = pl.yield_(sc_n, oi_n)
-                scores = pl.mul(scores_acc, tril_t)
-                o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
-                out = pl.store(o_n, [off, 0], out)
+                # The value dim is walked in NV blocks of BV, wrapped around the WHOLE chunk
+                # body rather than split off into a second pass. At NV == 1 this is a single
+                # trip and the body is exactly what it was before, so a shape whose `dv`
+                # already fits pays nothing at all. At NV > 1 the [C, BV] output accumulator
+                # is what shrinks, and the price is recomputing the within-chunk decay and the
+                # score matrix -- both of which depend only on `dk` -- once per value block.
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
+                    # rather than in the 184 KB vector buffer.
+                    v = pl.load(Vmat, [off, vof], [C, BV],
+                                target_memory=pl.MemorySpace.Mat)
+                    # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0`
+                    # comes from a [C, BV] zero rather than from V, because V is staged in L1
+                    # and touching it with a vector op would drag a copy back.
+                    sc0 = pl.mul(tril_t, 0.0)
+                    oi0 = pl.load(zc, [0, 0], [C, BV])
+                    # A real nested pl.range, not a Python `for`: pypto parses this source, so
+                    # a Python loop here is read as a device loop that reassigns names without
+                    # pl.yield_ ("N iteration arguments but 0 return variables").
+                    for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
+                        dof = j * BK
+                        q_b = pl.load(Q, [off, dof], [C, BK])
+                        k_b = pl.load(Kmat, [off, dof], [C, BK])
+                        a_b = pl.load(A, [off, dof], [C, BK])
+                        la_b = pl.log(a_b)
+                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        qt_b = pl.mul(q_b, b_b)
+                        kb_b = pl.div(k_b, b_b)
+                        kbt_b = pl.transpose(kb_b, 0, 1)
+                        # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
+                        # [BK, BV] is ever live, and it dies at the end of the block.
+                        s_snap = pl.load(Ssnap, [soff + dof, vof], [BK, BV])
+                        g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
+                        b_blk = pl.load(Srecv, [dof, vof], [BK, BV])
+                        s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
+                        # Both matmuls contract over the head dim, so their partials are
+                        # summed here in the VECTOR unit -- fp32 cube accumulation is broken
+                        # on a2a3.
+                        sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
+                        oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
+                        scores_acc, o_inter = pl.yield_(sc_n, oi_n)
+                    scores = pl.mul(scores_acc, tril_t)
+                    o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
+                    out = pl.store(o_n, [off, vof], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -406,7 +524,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, DV], pl.FP32],
+            zc: pl.Tensor[[C, BV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)
@@ -427,7 +545,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             S_local = pl.create_tensor([P, dk, dv], dtype=pl.FP32)       # end-of-slice state
             Ssnap_all = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)  # per-chunk S_n(0)
             Gsnap_all = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)   # per-chunk decay
-            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
+            zc = pl.create_tensor([C, BV], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
             for r in pl.range(P):
                 Q_r = Qmat[r]
                 K_r = Kmat[r]
@@ -449,7 +567,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
 
 
 def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int,
-                                nb: int = 1, slot: int = 4):
+                                nb: int = 1, nv: int = 1, slot: int = 4):
     """Build the fully-fused ``stage1 + ring + stage2`` distributed program.
 
     Args:
@@ -465,12 +583,12 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
     assert dk % K == 0, f"dk ({dk}) must be divisible by K ({K})"
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     if P == 1:
-        return _build_p1_forward_program(L, C, dk, dv, K, nb, slot)
+        return _build_p1_forward_program(L, C, dk, dv, K, nb, nv, slot)
 
     BLOCK = dk // K
     N = L // C
     DK, DV = dk, dv
-    NB, BK, SLOT = nb, dk // nb, slot
+    NB, BK, NV, BV, SLOT = nb, dk // nb, nv, dv // nv, slot
 
     @pl.program
     class FusedForwardProgram:
@@ -512,40 +630,48 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             tot = Stot
             for j in pl.range(0, NB):
                 dof = j * BK
-                s0 = pl.load(zero, [dof, 0], [BK, DV])
                 # The decay seed: a ones column, DERIVED rather than allocated or loaded.
                 # Three routes are closed. `pl.create_tensor(..., init_value=1)` compiles and
-                # runs but silently
-                # delivers ZEROS from a HOST orchestrator (honoured in a chip orchestrator, and
-                # init_value=0 is honoured everywhere) -- that made rank 1 ignore its boundary
-                # entirely; `pl.tile.full([BK, 1], ...)` is rejected because an allocated tile
-                # needs a 32-byte-aligned row and one fp32 column is 4 bytes; and a [BK, 1]
-                # load out of a wider tensor is rejected as a layout change. Reducing an
-                # existing [C, BK] tile gives a legal [BK, 1], and 0.0 + 1.0 is exact.
-                # See issues/pypto-host-init-value-zeroed/.
+                # runs but silently delivers ZEROS from a HOST orchestrator (it is honoured in
+                # a chip orchestrator, and init_value=0 is honoured everywhere) -- that made
+                # rank 1 ignore its boundary entirely. `pl.tile.full([BK, 1], ...)` is
+                # rejected because an allocated tile needs a 32-byte-aligned row and one fp32
+                # column is 4 bytes. And a [BK, 1] load out of a wider tensor is rejected as a
+                # layout change. Reducing an existing [C, BK] tile gives a legal [BK, 1], and
+                # 0.0 + 1.0 is exact. See issues/pypto-host-init-value-zeroed/.
                 a_seed = pl.load(A, [0, dof], [C, BK])
                 g0 = pl.add(pl.tile.reshape(pl.tile.col_sum(pl.mul(a_seed, 0.0)), [BK, 1]), 1.0)
-                for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
-                    off = n * C
-                    soff = n * DK
-                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
-                    # rather than in the 184 KB vector buffer.
-                    v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                    # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
-                    snaps = pl.store(s_run, [soff + dof, 0], snaps)
-                    decays = pl.store(g_run, [soff + dof, 0], decays)
-                    k_b = pl.load(Kmat, [off, dof], [C, BK])
-                    a_b = pl.load(A, [off, dof], [C, BK])
-                    la_b = pl.log(a_b)
-                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
-                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
-                    kb_b = pl.div(k_b, b_b)
-                    kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
-                    # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference factors it.
-                    s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
-                    g_new = pl.mul(g_run, gamma_b)
-                    s_fin, g_fin = pl.yield_(s_new, g_new)
-                tot = pl.store(s_fin, [dof, 0], tot)
+                # The value dim is walked in NV blocks of BV. Nothing here couples one value
+                # block to another either, so it is a second clean outer split; the decay is
+                # recomputed per value block because it does not depend on `dv` at all, and
+                # the decay record is rewritten with the same numbers NV times, which is
+                # [BK, 1] of traffic and not worth a device conditional to avoid.
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    s0 = pl.load(zero, [dof, vof], [BK, BV])
+                    for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
+                        off = n * C
+                        soff = n * DK
+                        # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise
+                        # unused) rather than in the 184 KB vector buffer.
+                        v = pl.load(Vmat, [off, vof], [C, BV],
+                                    target_memory=pl.MemorySpace.Mat)
+                        # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
+                        snaps = pl.store(s_run, [soff + dof, vof], snaps)
+                        decays = pl.store(g_run, [soff + dof, 0], decays)
+                        k_b = pl.load(Kmat, [off, dof], [C, BK])
+                        a_b = pl.load(A, [off, dof], [C, BK])
+                        la_b = pl.log(a_b)
+                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                        kb_b = pl.div(k_b, b_b)
+                        kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
+                        # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference
+                        # factors it.
+                        s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
+                        g_new = pl.mul(g_run, gamma_b)
+                        s_fin, g_fin = pl.yield_(s_new, g_new)
+                    tot = pl.store(s_fin, [dof, vof], tot)
             # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
             # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
             # two directions of a bidirectional cube<->vector TPipe indexed the SAME GM slots
@@ -591,7 +717,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, DV], pl.FP32],
+            zc: pl.Tensor[[C, BV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             """O[n] = (Q_n*b_n)@S_n + ((Q_n*b_n)@(K_n/b_n)^T (*) tril)@V_n, S_n REBUILT not carried.
@@ -617,41 +743,51 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             for n in pl.range(0, N):
                 off = n * C
                 soff = n * DK
-                # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
-                # rather than in the 184 KB vector buffer.
-                v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0` comes
-                # from a [C, DV] zero rather than from V, because V is staged in L1 and
-                # touching it with a vector op would drag a copy back into the vector buffer.
-                sc0 = pl.mul(tril_t, 0.0)
-                oi0 = pl.load(zc, [0, 0], [C, DV])
-                # A real nested pl.range, not a Python `for`: pypto parses this source, so a
-                # Python loop here is read as a device loop that reassigns names without
-                # pl.yield_ ("N iteration arguments but 0 return variables").
-                for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
-                    dof = j * BK
-                    q_b = pl.load(Q, [off, dof], [C, BK])
-                    k_b = pl.load(Kmat, [off, dof], [C, BK])
-                    a_b = pl.load(A, [off, dof], [C, BK])
-                    la_b = pl.log(a_b)
-                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
-                    qt_b = pl.mul(q_b, b_b)
-                    kb_b = pl.div(k_b, b_b)
-                    kbt_b = pl.transpose(kb_b, 0, 1)
-                    # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
-                    # [BK, DV] is ever live, and it dies at the end of the block.
-                    s_snap = pl.load(Ssnap, [soff + dof, 0], [BK, DV])
-                    g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
-                    b_blk = pl.load(Srecv, [dof, 0], [BK, DV])
-                    s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
-                    # Both matmuls contract over the head dim, so their partials are summed
-                    # here in the VECTOR unit -- fp32 cube accumulation is broken on a2a3.
-                    sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
-                    oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
-                    scores_acc, o_inter = pl.yield_(sc_n, oi_n)
-                scores = pl.mul(scores_acc, tril_t)
-                o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
-                out = pl.store(o_n, [off, 0], out)
+                # The value dim is walked in NV blocks of BV, wrapped around the WHOLE chunk
+                # body rather than split off into a second pass. At NV == 1 this is a single
+                # trip and the body is exactly what it was before, so a shape whose `dv`
+                # already fits pays nothing at all. At NV > 1 the [C, BV] output accumulator
+                # is what shrinks, and the price is recomputing the within-chunk decay and the
+                # score matrix -- both of which depend only on `dk` -- once per value block.
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
+                    # rather than in the 184 KB vector buffer.
+                    v = pl.load(Vmat, [off, vof], [C, BV],
+                                target_memory=pl.MemorySpace.Mat)
+                    # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0`
+                    # comes from a [C, BV] zero rather than from V, because V is staged in L1
+                    # and touching it with a vector op would drag a copy back.
+                    sc0 = pl.mul(tril_t, 0.0)
+                    oi0 = pl.load(zc, [0, 0], [C, BV])
+                    # A real nested pl.range, not a Python `for`: pypto parses this source, so
+                    # a Python loop here is read as a device loop that reassigns names without
+                    # pl.yield_ ("N iteration arguments but 0 return variables").
+                    for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
+                        dof = j * BK
+                        q_b = pl.load(Q, [off, dof], [C, BK])
+                        k_b = pl.load(Kmat, [off, dof], [C, BK])
+                        a_b = pl.load(A, [off, dof], [C, BK])
+                        la_b = pl.log(a_b)
+                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        qt_b = pl.mul(q_b, b_b)
+                        kb_b = pl.div(k_b, b_b)
+                        kbt_b = pl.transpose(kb_b, 0, 1)
+                        # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
+                        # [BK, BV] is ever live, and it dies at the end of the block.
+                        s_snap = pl.load(Ssnap, [soff + dof, vof], [BK, BV])
+                        g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
+                        b_blk = pl.load(Srecv, [dof, vof], [BK, BV])
+                        s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
+                        # Both matmuls contract over the head dim, so their partials are
+                        # summed here in the VECTOR unit -- fp32 cube accumulation is broken
+                        # on a2a3.
+                        sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
+                        oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
+                        scores_acc, o_inter = pl.yield_(sc_n, oi_n)
+                    scores = pl.mul(scores_acc, tril_t)
+                    o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
+                    out = pl.store(o_n, [off, vof], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -665,7 +801,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, DV], pl.FP32],
+            zc: pl.Tensor[[C, BV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)
@@ -784,7 +920,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             S_recv_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)  # received boundary out[r-1] per rank
             Ssnap_all = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)  # stage1 per-chunk S_n(0)
             Gsnap_all = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)   # stage1 per-chunk decay
-            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
+            zc = pl.create_tensor([C, BV], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
 
             for r in pl.range(P):
                 # Slice this rank's inputs once, before the if/elif/else.

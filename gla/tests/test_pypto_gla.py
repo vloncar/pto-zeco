@@ -102,6 +102,10 @@ SIZES = [
     # (A1, 2026-08-21) and holds only [BK,DV] at a time. If the snapshot path regresses this
     # goes red with "no blocking plan fits".
     (256, 64, 128, 128),  # dk = dv = 128
+    # dv=256 is the first shape that needs the VALUE dim blocked as well: at one value block
+    # the [C,dv] right-hand operand of `scores @ V` is 65536 B, the entire L0 buffer. The
+    # chosen plan here should be 2 value blocks; if value blocking regresses, this goes red.
+    (256, 64, 64, 256),   # dv=256 — forces the value split
     (192, 48, 48, 48),    # a multiple of 16 that is not a power of two
     # Both head dims below C. These were REFUSED by build() until 2026-08-13, because the
     # pto-isa FIFO local-slot aliasing (issue #521) made them silently corrupt: dv < C on

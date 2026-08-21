@@ -13,7 +13,7 @@ size, and in steady-state cost.
 
 | Piece | torch | torch-dist | simpler | pypto |
 |---|---|---|---|---|
-| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C ≤ 64`, head dims **128 × 128** |
+| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C ≤ 64`, head dims **to 1024** |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
 | **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2/4** — `C ≤ 32`, `D ≤ 64` (no blocking yet — Task A6) |
 
@@ -174,7 +174,25 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   init_value=<non-zero>)` silently delivers zeros when the tensor is created in a HOST
   orchestrator** (honoured in a chip orchestrator; `init_value=0` honoured everywhere) — no
   error, no warning. See `../allscan/issues/pypto-host-init-value-zeroed/`.
-  `C=128` remains open — see Task A.
+- **F3.1b (part) — value dim blocked, and the ring with it. Head dims reach 1024 on HW.**
+  What still scaled with `dv` was the `[C,dv]` output accumulator and the `[C,dv]` right-hand
+  operand of `scores @ V` — the latter a 64 KB L0 operand at `dv=256`, the whole buffer.
+  Nothing contracts over `dv`, so it splits cleanly; both chunk kernels walk it in `NV` blocks.
+  The split is a loop *around the whole chunk body*, not a second pass, so **at one value block
+  the body is exactly what it was** — measured: forcing 2 and 4 value blocks on shapes that do
+  not need them reproduces the unsplit answer to the digit. At more than one it recomputes the
+  within-chunk decay and score matrix (both depend only on `dk`) per value block, which is why
+  the plan search reaches for it last.
+  Blocking the chunk kernels then promoted the **AllScan ring** to the binding constraint at
+  `P > 1`: it moves the `[dk,dv]` end-of-slice state in `K` pieces and `K` was pinned at 1, so
+  `dk=dv=256` needed a single 262144 B tile. `K` is now searched like everything else.
+  Hardware (a2a3, worst of 2 seeds): `dk=dv=256` **1.68e-04** at P=1 and **1.83e-04** at P=2;
+  `dk=256 dv=64` 1.53e-04 with no value split at all; `dv=256` 5.34e-05; **`dv=1024`
+  8.39e-05**; **`dk=1024`** 4.88e-04. The search resolves `dk=dv=1024` in 18 s because each
+  (value split, ring split) group is rejected as a whole by one compile rather than eighteen.
+  `C=128` still does not fit and fails on the **left**-operand buffer — a `[128,128]` fp32 tile
+  is the entire 64 KB — which no blocking here can move. The search now says so and stops.
+  That is A3's wall.
 - **F3.1c — `dv < C` silently wrong.** Root-caused to pto-isa striding the consumer's local
   L1 FIFO ring by the popped tile's own size while the GM ring beside it uses a fixed
   `SLOT_SIZE`, so two differently-sized tiles held at once alias in L1. For `[M,K] @ [K,N]`
@@ -262,24 +280,16 @@ multi-head. `L` is already unbounded — it is the chunk-loop trip count and no 
 Design and measurements: `../allscan/issues/pypto-tile-blocking/ARBITRARY-SIZES.md`.
 Probes: `../devtools/t5_{math_check,block_probe,snapshot_math,nocarry_probe,verdict,split_check}.py`.
 
-**A1 is done** (2026-08-21) — snapshot state instead of a carry; see the F3.1b entries under
-Forward. The stage labels below keep their original numbers so earlier notes and commit
-messages still resolve.
+**A1 and A2 are done** (2026-08-21) — snapshot state instead of a carry, then value-dim
+blocking and a searched ring split; see the F3.1b entries under Forward. Both head dims now
+reach 1024 on hardware. The stage labels below keep their original numbers so earlier notes and
+commit messages still resolve.
 
-**Sequencing.** Not a chain. A3 is **independent** of A2 — it addresses a different wall, the
-L0 operand buffers, and can be done in parallel. A4 is *conditional*: only if A3 fails to
-deliver `C=128`. A5–A7 are follow-on and need A2 and A3 done.
+**Sequencing.** A3 is next and is the only thing between us and `C=128`. A4 is *conditional*:
+only if A3 fails to deliver it. A5–A7 are follow-on.
 
-    A2 ──┐
-         ├──> A5, A6, A7
-    A3 ──┘
+    A3 ──> A5, A6, A7
      └──> A4  (only if A3 does not deliver C=128)
-
-### A2 — Value-dim blocking
-After A1 the only tiles that still scale with `dv` are the `[C,dv]` output accumulator and its
-zero seed — 65536 B each at `dv=256`. Nothing contracts over `dv`, so it blocks cleanly with the
-value blocks outermost, each carrying its own state slice. `dk=dv=256` is currently over by
-**16448 B**, so this closes it with room.
 
 ### A3 — Narrower matmul operands
 The 64 KB `Left`/`Right` operand buffers are the wall for `C=128` and `dk=dv=512`: a `[128,128]`
@@ -307,7 +317,11 @@ dimension: within-chunk work grows linearly with it while state work shrinks, so
 strictly worse. The useful range is 64–256. Bound it with a clear error rather than chasing
 arbitrary values.
 
-### A5 — Block sizes from a cost model
+### A5 — Block sizes from a cost model *(partly relieved)*
+The search is no longer the bottleneck it was: rejecting a whole (value split, ring split) group
+with one compile brought `dk=dv=1024` from ~100 attempts to ~25, and `dk=dv=256` at `P=2` to 25
+seconds. What remains is that "first that fits" is a *feasibility* rule, not a *performance*
+one — it has no way to prefer a plan that fits comfortably over one that barely fits.
 `blocking_plans` + `compile_fused_forward` currently try candidate settings and keep the first
 that fits. That is the right shape for a kernel that *nearly* fits and the wrong shape for a
 properly tiled one. Once A1–A3 land, choose block sizes from occupancy / pipe depth / traffic

@@ -154,7 +154,7 @@ class PyPtoZeCo(ZeCoImpl):
         # shape that already worked keeps its old choice and a bigger head dim gets a finer
         # one instead of failing outright.
         self._compiled, self.blocking = compile_fused_forward(
-            L, C, dk, dv, 1, P, platform=platform, distributed_config=dist_cfg)
+            L, C, dk, dv, P, platform=platform, distributed_config=dist_cfg)
         # The BACKWARD is compiled lazily, on first use (see _ensure_backward_compiled).
         # It used to be compiled here, unconditionally, which coupled the two directions in
         # two unwanted ways: a forward-only run paid the backward's compile time, and — worse
