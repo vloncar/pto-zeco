@@ -3,18 +3,20 @@
 This is the "entire forward in PyPTO" — no ``@pl.jit`` hybrid, no host round-trip. Per
 rank ``r`` (device ``r``) the single ``host_orch`` runs three phases:
 
-1. **stage1** (InCore) — local end-of-slice state ``S_total`` (from ``S = 0``), fed to the
-   ring. Identical to :mod:`.dist_program`'s ``gla_stage1``.
+1. **stage1** (InCore) — walks the slice from ``S = 0`` and records three things: the
+   per-chunk snapshot ``S_n(0)``, the per-chunk running decay, and the end-of-slice state
+   ``S_total`` that feeds the ring.
 2. **AllScan ring** (InCore first/middle/last) — the exclusive-prefix boundary scan
    ``out[p] = S_local[p] + gamma[p]*out[p-1]``. Each rank receives ``out[p-1]`` into its
    window ``dst``; the middle/last steps **also store that received value into ``S_recv``**
    and return it, so stage2 reads the boundary state device-locally (synchronized by the
    ring's notify/wait — reading ``outputs[r-1]`` from GM would be an unsynchronized
    cross-device race).
-3. **stage2** (InCore) — ``O[r]`` from ``Q,K,V,A`` and ``S_recv[r]`` (zero for rank 0), the
-   chunk recurrence initialised from the boundary. This is the wide matmul-DAG kernel that
-   historically only survived ``@pl.jit``; running it as a distributed chip kernel here is
-   the point of the fusion.
+3. **stage2** (InCore) — ``O[r]`` from ``Q,K,V,A`` and ``S_recv[r]`` (zero for rank 0).
+   It does **not** re-walk the recurrence: the chunk recurrence is linear in its starting
+   state, so ``S_n(boundary) = G_n * boundary + S_n(0)`` rebuilds each chunk's state from
+   stage1's records. This is the wide matmul-DAG kernel that historically only survived
+   ``@pl.jit``; running it as a distributed chip kernel here is the point of the fusion.
 
 stage2 is dispatched **once, after the ``if/elif/else`` merge**, consuming the boundary phi
 (``zero`` for rank 0 vs the ring's returned ``out[r-1]`` for middle/last). That cross-branch phi
@@ -24,14 +26,16 @@ dispatch-inside-every-branch workaround. Fixed upstream by pypto PR #2183 (merge
 so the workaround is gone; see ``issues/pypto-crossbranch-phi-nameerror/``.
 
 **P == 1** is a native path (:func:`_build_p1_forward_program`): a single rank has no
-communication at all, so there is no ring and stage1 is dead (its ``S_total`` only feeds the
-ring). The P=1 program is therefore just stage2 from a zero boundary. Its ``host_orch`` keeps
-the uniform ``[P, ...]`` entry and stays a distributed program (same ``prepare``/``rt``/
-``close`` run path as P>1). This relies on the P=1 ``device=r`` unroll fix (pypto ``1a18fb26``:
-the single-trip ``for r in pl.range(1)`` folds ``r`` → 0 in the ``device=`` attr; before that
-fix codegen emitted an unbound ``r__idx_v0`` → NameError). Use :func:`run_fused_forward`, which
-also falls back to a non-distributed single-device run if a config compiles P=1 without a HOST
-orchestrator (entry then = stage2's own signature ``(Q, Kmat, Vmat, A, tril, Srecv, O)``).
+communication at all, so there is no ring, and stage2 runs from a zero boundary. stage1 is
+*not* dead — stage2 needs its per-chunk records — so P=1 now costs two dispatches rather than
+one. That is the price of a head dim that is a parameter rather than a fitted shape; see the
+snapshot note below. Its ``host_orch`` keeps the uniform ``[P, ...]`` entry and stays a
+distributed program (same ``prepare``/``rt``/``close`` run path as P>1). This relies on the
+P=1 ``device=r`` unroll fix (pypto ``1a18fb26``: the single-trip ``for r in pl.range(1)``
+folds ``r`` → 0 in the ``device=`` attr; before that fix codegen emitted an unbound
+``r__idx_v0`` → NameError). Two dispatches also mean the orchestrator can no longer be
+compiled away, which it could when stage1 was dead; :func:`run_fused_forward` therefore
+raises rather than guessing at an inlined entry signature.
 
 **Vec-buffer budget (F3.1).** Both chunk kernels keep the whole per-chunk working set live in
 the 184 KB vector buffer, so `C` used to cap at 32 (`C=64` needed 200704 B). Three tiles were
@@ -51,6 +55,22 @@ pure scaffolding and are gone:
   which also drops ``kbar``, so ``(K/b)^T`` is now shared with the ``scores`` matmul.
 
 Net: 5 fewer live tiles, 2 fewer matmuls and 1 fewer transpose per chunk.
+
+**Snapshot instead of carry (A1).** Blocking the head dim then hit a wall that blocking could
+not move: the ``[dk, dv]`` state was a *loop carry*, live across the whole kernel, and three
+copies of it at ``dk = dv = 128`` are 60% of the vector budget however finely the rest is cut.
+The recurrence is linear in its starting state, so the carry is removable::
+
+    S_n(boundary) = G_n * boundary + S_n(0)
+
+stage1 already walks the chunks from zero, so it records ``S_n(0)`` and ``G_n`` per chunk and
+stage2 rebuilds the state a ``[BK, DV]`` block at a time instead of carrying ``[dk, dv]``.
+Two further things fall out: stage1's own head-dim blocks are independent for the *whole*
+slice (nothing in it contracts over the head dim), so its block loop moves outside the chunk
+scan and its live carry becomes ``[BK, DV]`` too; and the chunks become mutually independent,
+which is what pto-kernels' KDA ``chunk_o`` relies on ("each reads its own s_snapshots entry")
+and what any future within-slice parallelism would need. Cost: ``N * dk * dv`` extra stores
+per rank, and stage1 re-reads ``V`` once per head-dim block.
 
 **P=1 and P>1 MUST be built by separate factory functions** (not one class with an
 ``if P == 1:`` branch): conditionally-defined methods in a ``@pl.program`` class body are
@@ -118,15 +138,15 @@ def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
         if h_O is not O:
             O.copy_(h_O)
         return O
-    # P==1: non-distributed single-device program, entry = stage2 signature (rank-0 slices).
-    # stage2 keeps its running state in a scratch tensor rather than a carried tile, so the
-    # entry gained a trailing [dk, dv] argument; it is written but never read by the caller.
-    import torch as _torch
-    from pypto.runtime.runner import RunConfig
-    s_ws = _torch.zeros(Q.shape[-1], V.shape[-1], dtype=Q.dtype)
-    compiled(Q[0], K[0], V[0], A[0], tril, zero, O[0], s_ws,
-             config=RunConfig(platform=platform, device_id=device_ids[0]))
-    return O
+    # P==1 used to be able to compile away its host orchestrator: with stage1 dead there was
+    # a single chip dispatch left, which pypto inlined into a plain single-device program whose
+    # entry was stage2's own signature. stage1 is live now, so there are always two dispatches
+    # and the orchestrator always survives. Fail loudly rather than guess at an entry signature
+    # that no longer has one obvious form.
+    raise RuntimeError(
+        "fused forward compiled without a host orchestrator; expected one because stage1 and "
+        "stage2 are two dispatches at every rank count. Entry signature is unknown -- "
+        f"got {type(compiled).__name__}.")
 
 
 def compile_fused_forward(L, C, dk, dv, K, P, *, platform, distributed_config=None,
@@ -179,12 +199,15 @@ def compile_fused_forward(L, C, dk, dv, K, P, *, platform, distributed_config=No
 
 def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
                               nb: int = 1, slot: int = 4):
-    """P == 1 native path: stage2 from a zero boundary (no ring; stage1 is dead).
+    """P == 1 native path: stage1 + stage2 from a zero boundary (no ring).
 
-    Compiles to a non-distributed single-device program (entry = the stage2 signature, since
-    pypto DCE's the dead stage1 and inlines the single chip dispatch). Kept as its own factory
-    so every method is a top-level ``@pl.program`` class member (conditional class-body defs
-    are silently dropped)."""
+    stage1 used to be dead here -- its only consumer was the ring -- so P=1 was stage2 alone.
+    Since stage2 rebuilds its state from stage1's per-chunk snapshot instead of carrying it,
+    stage1 is live at every rank count, and P=1 costs one extra dispatch. That is the price of
+    a head dim that is a parameter rather than something the shape has to be made to fit.
+
+    Kept as its own factory so every method is a top-level ``@pl.program`` class member
+    (conditional class-body defs are silently dropped)."""
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     N = L // C
     P, DK, DV = 1, dk, dv
@@ -192,6 +215,106 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
 
     @pl.program
     class FusedForwardP1Program:
+        # ---- phase 1: chunk scan from S = 0, recording per-chunk snapshot + decay ----
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
+        def gla_stage1(
+            self,
+            A: pl.Tensor[[L, DK], pl.FP32],
+            Kmat: pl.Tensor[[L, DK], pl.FP32],
+            Vmat: pl.Tensor[[L, DV], pl.FP32],
+            tril: pl.Tensor[[C, C], pl.FP32],
+            zero: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            Gsnap: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
+            Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
+        ) -> tuple[
+            pl.Tensor[[N * DK, DV], pl.FP32],
+            pl.Tensor[[N * DK, 1], pl.FP32],
+            pl.Tensor[[DK, DV], pl.FP32],
+        ]:
+            """Walk the slice from S = 0, recording what stage2 needs to skip the walk.
+
+            Three outputs: the per-chunk snapshot ``Ssnap[n] = S_n(0)``, the running decay
+            ``Gsnap[n] = prod_{m<n} gamma_m``, and the end-of-slice state ``Stot`` that feeds
+            the ring. The first two are what let stage2 drop its state carry entirely.
+
+            **Head-dim block OUTSIDE the chunk scan.** Nothing here contracts over the head
+            dim -- ``kb^T @ v`` has it as the OUTPUT row dim -- so block ``j``'s state depends
+            only on block ``j``, for the whole slice and not merely within a chunk. Hoisting
+            the block loop makes the live carry ``[BK, DV]`` instead of ``[DK, DV]``, which is
+            what stops stage1 becoming the new ceiling once stage2 stops carrying: three
+            copies of a ``[128, 128]`` state are 196608 B of a 188416 B buffer. The price is
+            re-reading ``V`` once per block; it is staged in L1, and it is what makes the head
+            dim a free parameter rather than a fitted one.
+            """
+            tril_t = pl.load(tril, [0, 0], [C, C])
+            snaps = Ssnap
+            decays = Gsnap
+            tot = Stot
+            for j in pl.range(0, NB):
+                dof = j * BK
+                s0 = pl.load(zero, [dof, 0], [BK, DV])
+                # The decay seed: a ones column, DERIVED rather than allocated or loaded.
+                # Three routes are closed. `pl.create_tensor(..., init_value=1)` compiles and
+                # runs but silently
+                # delivers ZEROS from a HOST orchestrator (honoured in a chip orchestrator, and
+                # init_value=0 is honoured everywhere) -- that made rank 1 ignore its boundary
+                # entirely; `pl.tile.full([BK, 1], ...)` is rejected because an allocated tile
+                # needs a 32-byte-aligned row and one fp32 column is 4 bytes; and a [BK, 1]
+                # load out of a wider tensor is rejected as a layout change. Reducing an
+                # existing [C, BK] tile gives a legal [BK, 1], and 0.0 + 1.0 is exact.
+                # See issues/pypto-host-init-value-zeroed/.
+                a_seed = pl.load(A, [0, dof], [C, BK])
+                g0 = pl.add(pl.tile.reshape(pl.tile.col_sum(pl.mul(a_seed, 0.0)), [BK, 1]), 1.0)
+                for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
+                    off = n * C
+                    soff = n * DK
+                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
+                    # rather than in the 184 KB vector buffer.
+                    v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
+                    # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
+                    snaps = pl.store(s_run, [soff + dof, 0], snaps)
+                    decays = pl.store(g_run, [soff + dof, 0], decays)
+                    k_b = pl.load(Kmat, [off, dof], [C, BK])
+                    a_b = pl.load(A, [off, dof], [C, BK])
+                    la_b = pl.log(a_b)
+                    b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                    kb_b = pl.div(k_b, b_b)
+                    kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
+                    # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference factors it.
+                    s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
+                    g_new = pl.mul(g_run, gamma_b)
+                    s_fin, g_fin = pl.yield_(s_new, g_new)
+                tot = pl.store(s_fin, [dof, 0], tot)
+            # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
+            # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
+            # two directions of a bidirectional cube<->vector TPipe indexed the SAME GM slots
+            # (the per-direction entryOffset the ISA reference specifies is never applied), so
+            # the cube's matmul results and the vector's operands overwrote each other. The
+            # loop-carried state was simply the visible victim. Fixed by two upstream-bound
+            # diffs (carried locally); see issues/pypto-incore-loop-cube-vector-race/.
+            return (snaps, decays, tot)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch_stage1(
+            self,
+            A: pl.Tensor[[L, DK], pl.FP32],
+            Kmat: pl.Tensor[[L, DK], pl.FP32],
+            Vmat: pl.Tensor[[L, DV], pl.FP32],
+            tril: pl.Tensor[[C, C], pl.FP32],
+            zero: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            Gsnap: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
+            Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
+        ) -> tuple[
+            pl.Tensor[[N * DK, DV], pl.FP32],
+            pl.Tensor[[N * DK, 1], pl.FP32],
+            pl.Tensor[[DK, DV], pl.FP32],
+        ]:
+            return self.gla_stage1(A, Kmat, Vmat, tril, zero, Ssnap, Gsnap, Stot)
+
+        # ---- phase 2: output from the rebuilt state (boundary is zero at P=1) ----
         # ``attrs={"slot_num": ...}`` rather than ``pl.func_attr``: the ring depth is derived
         # from the shape, and ``pl.func_attr`` accepts only a LITERAL -- a Python int from the
         # enclosing scope reaches the pass as an ``ir::Expr`` and is rejected ("Invalid type
@@ -207,61 +330,69 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
+            Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
             zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv.
+            """O[n] = (Q_n*b_n)@S_n + ((Q_n*b_n)@(K_n/b_n)^T (*) tril)@V_n, S_n REBUILT not carried.
 
-            The head dim is walked in ``NB`` blocks of ``BK`` and the running state lives in the
-            scratch tensor ``Sws`` rather than a carried tile -- see :func:`blocking_plans` for
-            why both are needed. Q, K and A need no slicing: a block of them is just a narrower
-            ``pl.load``; only the state does.
+            The chunk recurrence is linear in its starting state, so
+
+                S_n(boundary) = G_n * boundary + S_n(0)
+
+            with both right-hand terms already computed by stage1. Rebuilding beats carrying:
+            a carried state is live across the whole kernel at full ``[dk, dv]`` (three copies,
+            60% of the vector budget, untouched by any amount of head-dim blocking), whereas a
+            rebuilt one is read a block at a time at ``[BK, DV]`` and dies within the block.
+            That is the difference between a head dim that has to be made to fit and one that
+            is simply a parameter. It also makes the chunks mutually independent, which is what
+            pto-kernels' KDA chunk_o relies on ("each reads its own s_snapshots entry").
+
+            The head dim is walked in ``NB`` blocks of ``BK``. Q, K and A need no slicing: a
+            block of them is just a narrower ``pl.load``.
             """
             tril_t = pl.load(tril, [0, 0], [C, C])
-            s_init = pl.load(Srecv, [0, 0], [DK, DV])
             out = O
-            for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
+            # No init_values for the state anywhere below: there is no state carry left.
+            for n in pl.range(0, N):
                 off = n * C
-                # EXPERIMENT: V is a pure matmul operand -- stage it in L1 (512 KB,
-                # entirely unused today) instead of the 184 KB vector buffer.
+                soff = n * DK
+                # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
+                # rather than in the 184 KB vector buffer.
                 v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul/slice
                 # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0` comes
-                # from a [C, DV] zero rather than from V, because V is now staged in L1 and
+                # from a [C, DV] zero rather than from V, because V is staged in L1 and
                 # touching it with a vector op would drag a copy back into the vector buffer.
                 sc0 = pl.mul(tril_t, 0.0)
                 oi0 = pl.load(zc, [0, 0], [C, DV])
                 # A real nested pl.range, not a Python `for`: pypto parses this source, so a
                 # Python loop here is read as a device loop that reassigns names without
                 # pl.yield_ ("N iteration arguments but 0 return variables").
-                for j, (scores_acc, o_inter, s_acc) in pl.range(
-                    0, NB, init_values=(sc0, oi0, s_run_v)
-                ):
+                for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
                     dof = j * BK
                     q_b = pl.load(Q, [off, dof], [C, BK])
                     k_b = pl.load(Kmat, [off, dof], [C, BK])
                     a_b = pl.load(A, [off, dof], [C, BK])
                     la_b = pl.log(a_b)
                     b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
-                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
                     qt_b = pl.mul(q_b, b_b)
                     kb_b = pl.div(k_b, b_b)
                     kbt_b = pl.transpose(kb_b, 0, 1)
-                    # Read this block's rows out of the carried state; the blocks write
-                    # disjoint rows, so reading `s_run_v` while assembling into `s_acc` is safe.
-                    s_blk = pl.tile.slice(s_run_v, [BK, DV], [dof, 0])
+                    # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
+                    # [BK, DV] is ever live, and it dies at the end of the block.
+                    s_snap = pl.load(Ssnap, [soff + dof, 0], [BK, DV])
+                    g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
+                    b_blk = pl.load(Srecv, [dof, 0], [BK, DV])
+                    s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
                     # Both matmuls contract over the head dim, so their partials are summed
                     # here in the VECTOR unit -- fp32 cube accumulation is broken on a2a3.
                     sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
                     oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
-                    kv_b = pl.matmul(kbt_b, v, out_dtype=pl.FP32)
-                    s_blk_new = pl.tile.row_expand_mul(pl.add(s_blk, kv_b), gamma_b)
-                    s_acc_n = pl.tile.assemble(s_acc, s_blk_new, [dof, 0])
-                    scores_acc, o_inter, s_acc = pl.yield_(sc_n, oi_n, s_acc_n)
+                    scores_acc, o_inter = pl.yield_(sc_n, oi_n)
                 scores = pl.mul(scores_acc, tril_t)
                 o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
                 out = pl.store(o_n, [off, 0], out)
-                s_run = pl.yield_(s_acc)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -273,10 +404,12 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
+            Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
             zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, zc, O)
+            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
@@ -290,15 +423,26 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             zero: pl.Tensor[[dk, dv], pl.FP32],
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
-            """P == 1: single rank, S_recv = 0 (no boundary). ``gammas`` is unused."""
-            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)
+            """P == 1: single rank, boundary = 0. ``gammas`` is unused (no ring)."""
+            S_local = pl.create_tensor([P, dk, dv], dtype=pl.FP32)       # end-of-slice state
+            Ssnap_all = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)  # per-chunk S_n(0)
+            Gsnap_all = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)   # per-chunk decay
+            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
             for r in pl.range(P):
                 Q_r = Qmat[r]
                 K_r = Kmat[r]
                 V_r = Vmat[r]
                 A_r = A[r]
                 O_r = O[r]
-                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, zero, zc, O_r, device=r)
+                S_local_r = S_local[r]
+                snap_r = Ssnap_all[r]
+                gsnap_r = Gsnap_all[r]
+                st1 = self.chip_orch_stage1(
+                    A_r, K_r, V_r, tril, zero, snap_r, gsnap_r, S_local_r, device=r)
+                snaps_r = st1[0]
+                decays_r = st1[1]
+                self.chip_orch_stage2(
+                    Q_r, K_r, V_r, A_r, tril, zero, snaps_r, decays_r, zc, O_r, device=r)
             return O
 
     return FusedForwardP1Program
@@ -339,50 +483,77 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            Gsnap: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
-        ) -> pl.Tensor[[DK, DV], pl.FP32]:
-            """Local end-of-slice state, from S = 0. Blocked over the head dim like stage2.
+        ) -> tuple[
+            pl.Tensor[[N * DK, DV], pl.FP32],
+            pl.Tensor[[N * DK, 1], pl.FP32],
+            pl.Tensor[[DK, DV], pl.FP32],
+        ]:
+            """Walk the slice from S = 0, recording what stage2 needs to skip the walk.
 
-            Nothing here contracts over the head dim -- ``kb^T @ v`` has it as the OUTPUT row
-            dim -- so no accumulator is needed, and the state's own output tensor ``Stot``
-            doubles as the scratch it is built in.
+            Three outputs: the per-chunk snapshot ``Ssnap[n] = S_n(0)``, the running decay
+            ``Gsnap[n] = prod_{m<n} gamma_m``, and the end-of-slice state ``Stot`` that feeds
+            the ring. The first two are what let stage2 drop its state carry entirely.
+
+            **Head-dim block OUTSIDE the chunk scan.** Nothing here contracts over the head
+            dim -- ``kb^T @ v`` has it as the OUTPUT row dim -- so block ``j``'s state depends
+            only on block ``j``, for the whole slice and not merely within a chunk. Hoisting
+            the block loop makes the live carry ``[BK, DV]`` instead of ``[DK, DV]``, which is
+            what stops stage1 becoming the new ceiling once stage2 stops carrying: three
+            copies of a ``[128, 128]`` state are 196608 B of a 188416 B buffer. The price is
+            re-reading ``V`` once per block; it is staged in L1, and it is what makes the head
+            dim a free parameter rather than a fitted one.
             """
             tril_t = pl.load(tril, [0, 0], [C, C])
-            s_init = pl.load(zero, [0, 0], [DK, DV])
-            for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
-                off = n * C
-                # EXPERIMENT: V is a pure matmul operand -- stage it in L1 (512 KB,
-                # entirely unused today) instead of the 184 KB vector buffer.
-                v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                s_run_v = pl.mul(s_run, 1.0)
-                for j, (s_acc,) in pl.range(0, NB, init_values=(s_run_v,)):
-                    dof = j * BK
+            snaps = Ssnap
+            decays = Gsnap
+            tot = Stot
+            for j in pl.range(0, NB):
+                dof = j * BK
+                s0 = pl.load(zero, [dof, 0], [BK, DV])
+                # The decay seed: a ones column, DERIVED rather than allocated or loaded.
+                # Three routes are closed. `pl.create_tensor(..., init_value=1)` compiles and
+                # runs but silently
+                # delivers ZEROS from a HOST orchestrator (honoured in a chip orchestrator, and
+                # init_value=0 is honoured everywhere) -- that made rank 1 ignore its boundary
+                # entirely; `pl.tile.full([BK, 1], ...)` is rejected because an allocated tile
+                # needs a 32-byte-aligned row and one fp32 column is 4 bytes; and a [BK, 1]
+                # load out of a wider tensor is rejected as a layout change. Reducing an
+                # existing [C, BK] tile gives a legal [BK, 1], and 0.0 + 1.0 is exact.
+                # See issues/pypto-host-init-value-zeroed/.
+                a_seed = pl.load(A, [0, dof], [C, BK])
+                g0 = pl.add(pl.tile.reshape(pl.tile.col_sum(pl.mul(a_seed, 0.0)), [BK, 1]), 1.0)
+                for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
+                    off = n * C
+                    soff = n * DK
+                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
+                    # rather than in the 184 KB vector buffer.
+                    v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
+                    # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
+                    snaps = pl.store(s_run, [soff + dof, 0], snaps)
+                    decays = pl.store(g_run, [soff + dof, 0], decays)
                     k_b = pl.load(Kmat, [off, dof], [C, BK])
                     a_b = pl.load(A, [off, dof], [C, BK])
                     la_b = pl.log(a_b)
                     b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
                     gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
                     kb_b = pl.div(k_b, b_b)
-                    s_blk = pl.tile.slice(s_run_v, [BK, DV], [dof, 0])
                     kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
-                    s_blk_new = pl.tile.row_expand_mul(pl.add(s_blk, kv_b), gamma_b)
-                    s_acc = pl.yield_(pl.tile.assemble(s_acc, s_blk_new, [dof, 0]))
-                s_fin = pl.yield_(s_acc)
+                    # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference factors it.
+                    s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
+                    g_new = pl.mul(g_run, gamma_b)
+                    s_fin, g_fin = pl.yield_(s_new, g_new)
+                tot = pl.store(s_fin, [dof, 0], tot)
             # NOTE (F2, root-caused + FIXED 2026-07-31): this kernel used to be why the fused
             # forward was wrong for N>2, but nothing written here was ever at fault. On a2a3 the
             # two directions of a bidirectional cube<->vector TPipe indexed the SAME GM slots
             # (the per-direction entryOffset the ISA reference specifies is never applied), so
             # the cube's matmul results and the vector's operands overwrote each other. The
-            # loop-carried state was simply the visible victim.
-            # Fixed by two upstream-bound diffs (carried locally):
-            #   pto-isa: set the V2C entry offset in the TPipe ctor for DIR_BOTH
-            #   pypto:   size the GM pipe workspace for BOTH rings, honour slot_num
-            # With those, stock ring depth, the fused forward is 12/12 at C=16 and 12/12 at
-            # C=32. See allscan/issues/pypto-incore-loop-cube-vector-race/ROOT-CAUSE.md.
-            # (The post-loop carry read this replaced was fine and always was: swapping it for
-            # a per-iteration store left the old failures bit-identical. The state now lives in
-            # a per-iteration store left the old failures bit-identical.)
-            return pl.store(s_fin, [0, 0], Stot)
+            # loop-carried state was simply the visible victim. Fixed by two upstream-bound
+            # diffs (carried locally); see issues/pypto-incore-loop-cube-vector-race/.
+            return (snaps, decays, tot)
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_orch_stage1(
@@ -392,9 +563,15 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            Gsnap: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
-        ) -> pl.Tensor[[DK, DV], pl.FP32]:
-            return self.gla_stage1(A, Kmat, Vmat, tril, zero, Stot)
+        ) -> tuple[
+            pl.Tensor[[N * DK, DV], pl.FP32],
+            pl.Tensor[[N * DK, 1], pl.FP32],
+            pl.Tensor[[DK, DV], pl.FP32],
+        ]:
+            return self.gla_stage1(A, Kmat, Vmat, tril, zero, Ssnap, Gsnap, Stot)
 
         # ---- phase 3: chunk-recurrent GLA stage2 (output from boundary S_recv) ----
         # ``attrs={"slot_num": ...}`` rather than ``pl.func_attr``: the ring depth is derived
@@ -412,61 +589,69 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
+            Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
             zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            """O[n] = (Q_n*b_n)@S_run + ((Q_n*b_n)@(K_n/b_n)^T ⊙ tril)@V_n; carry S from Srecv.
+            """O[n] = (Q_n*b_n)@S_n + ((Q_n*b_n)@(K_n/b_n)^T (*) tril)@V_n, S_n REBUILT not carried.
 
-            The head dim is walked in ``NB`` blocks of ``BK`` and the running state lives in the
-            scratch tensor ``Sws`` rather than a carried tile -- see :func:`blocking_plans` for
-            why both are needed. Q, K and A need no slicing: a block of them is just a narrower
-            ``pl.load``; only the state does.
+            The chunk recurrence is linear in its starting state, so
+
+                S_n(boundary) = G_n * boundary + S_n(0)
+
+            with both right-hand terms already computed by stage1. Rebuilding beats carrying:
+            a carried state is live across the whole kernel at full ``[dk, dv]`` (three copies,
+            60% of the vector budget, untouched by any amount of head-dim blocking), whereas a
+            rebuilt one is read a block at a time at ``[BK, DV]`` and dies within the block.
+            That is the difference between a head dim that has to be made to fit and one that
+            is simply a parameter. It also makes the chunks mutually independent, which is what
+            pto-kernels' KDA chunk_o relies on ("each reads its own s_snapshots entry").
+
+            The head dim is walked in ``NB`` blocks of ``BK``. Q, K and A need no slicing: a
+            block of them is just a narrower ``pl.load``.
             """
             tril_t = pl.load(tril, [0, 0], [C, C])
-            s_init = pl.load(Srecv, [0, 0], [DK, DV])
             out = O
-            for n, (s_run,) in pl.range(0, N, init_values=(s_init,)):
+            # No init_values for the state anywhere below: there is no state carry left.
+            for n in pl.range(0, N):
                 off = n * C
-                # EXPERIMENT: V is a pure matmul operand -- stage it in L1 (512 KB,
-                # entirely unused today) instead of the 184 KB vector buffer.
+                soff = n * DK
+                # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
+                # rather than in the 184 KB vector buffer.
                 v = pl.load(Vmat, [off, 0], [C, DV], target_memory=pl.MemorySpace.Mat)
-                s_run_v = pl.mul(s_run, 1.0)  # detach carry for matmul/slice
                 # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0` comes
-                # from a [C, DV] zero rather than from V, because V is now staged in L1 and
+                # from a [C, DV] zero rather than from V, because V is staged in L1 and
                 # touching it with a vector op would drag a copy back into the vector buffer.
                 sc0 = pl.mul(tril_t, 0.0)
                 oi0 = pl.load(zc, [0, 0], [C, DV])
                 # A real nested pl.range, not a Python `for`: pypto parses this source, so a
                 # Python loop here is read as a device loop that reassigns names without
                 # pl.yield_ ("N iteration arguments but 0 return variables").
-                for j, (scores_acc, o_inter, s_acc) in pl.range(
-                    0, NB, init_values=(sc0, oi0, s_run_v)
-                ):
+                for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
                     dof = j * BK
                     q_b = pl.load(Q, [off, dof], [C, BK])
                     k_b = pl.load(Kmat, [off, dof], [C, BK])
                     a_b = pl.load(A, [off, dof], [C, BK])
                     la_b = pl.log(a_b)
                     b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
-                    gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
                     qt_b = pl.mul(q_b, b_b)
                     kb_b = pl.div(k_b, b_b)
                     kbt_b = pl.transpose(kb_b, 0, 1)
-                    # Read this block's rows out of the carried state; the blocks write
-                    # disjoint rows, so reading `s_run_v` while assembling into `s_acc` is safe.
-                    s_blk = pl.tile.slice(s_run_v, [BK, DV], [dof, 0])
+                    # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
+                    # [BK, DV] is ever live, and it dies at the end of the block.
+                    s_snap = pl.load(Ssnap, [soff + dof, 0], [BK, DV])
+                    g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
+                    b_blk = pl.load(Srecv, [dof, 0], [BK, DV])
+                    s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
                     # Both matmuls contract over the head dim, so their partials are summed
                     # here in the VECTOR unit -- fp32 cube accumulation is broken on a2a3.
                     sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
                     oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
-                    kv_b = pl.matmul(kbt_b, v, out_dtype=pl.FP32)
-                    s_blk_new = pl.tile.row_expand_mul(pl.add(s_blk, kv_b), gamma_b)
-                    s_acc_n = pl.tile.assemble(s_acc, s_blk_new, [dof, 0])
-                    scores_acc, o_inter, s_acc = pl.yield_(sc_n, oi_n, s_acc_n)
+                    scores_acc, o_inter = pl.yield_(sc_n, oi_n)
                 scores = pl.mul(scores_acc, tril_t)
                 o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
                 out = pl.store(o_n, [off, 0], out)
-                s_run = pl.yield_(s_acc)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -478,10 +663,12 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             A: pl.Tensor[[L, DK], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
+            Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
+            Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
             zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
-            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, zc, O)
+            return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)
 
         # ---- phase 2: AllScan ring (first/middle/last), emitting S_recv ----
         @pl.function(type=pl.FunctionType.InCore)
@@ -595,7 +782,9 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             S_local = pl.create_tensor([P, dk, dv], dtype=pl.FP32)     # stage1 local S_total (ring input)
             S_out_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)   # ring inclusive-scan out[r] (sent)
             S_recv_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)  # received boundary out[r-1] per rank
-            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)  # seeds the O accumulator
+            Ssnap_all = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)  # stage1 per-chunk S_n(0)
+            Gsnap_all = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)   # stage1 per-chunk decay
+            zc = pl.create_tensor([C, dv], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
 
             for r in pl.range(P):
                 # Slice this rank's inputs once, before the if/elif/else.
@@ -608,10 +797,18 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 S_local_r = S_local[r]
                 S_out_r = S_out_all[r]
                 S_recv_r = S_recv_all[r]
+                snap_r = Ssnap_all[r]
+                gsnap_r = Gsnap_all[r]
                 dst = pld.window(dst_buf, [dk, dv], dtype=pl.FP32)
                 signal = pld.window(signal_buf, [K, 1], dtype=pl.INT32)
 
-                sl_r = self.chip_orch_stage1(A_r, K_r, V_r, tril, zero, S_local_r, device=r)
+                # stage1 now has three results: the two per-chunk records stage2 rebuilds its
+                # state from, and the end-of-slice state that feeds the ring.
+                st1 = self.chip_orch_stage1(
+                    A_r, K_r, V_r, tril, zero, snap_r, gsnap_r, S_local_r, device=r)
+                snaps_r = st1[0]
+                decays_r = st1[1]
+                sl_r = st1[2]
 
                 # The ring picks this rank's boundary: rank 0 has none (S_recv = 0), the
                 # others take the received out[r-1]. stage2 then consumes the merged value
@@ -630,7 +827,8 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                     boundary = self.chip_orch_middle(
                         sl_r, gamma_r, S_recv_r, dst, signal, r + 1, device=r)
 
-                self.chip_orch_stage2(Q_r, K_r, V_r, A_r, tril, boundary, zc, O_r, device=r)
+                self.chip_orch_stage2(
+                    Q_r, K_r, V_r, A_r, tril, boundary, snaps_r, decays_r, zc, O_r, device=r)
             return O
 
     return FusedForwardProgram

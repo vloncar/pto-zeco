@@ -147,11 +147,12 @@ class PyPtoZeCo(ZeCoImpl):
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
         dist_cfg = DistributedConfig(device_ids=self.device_ids, num_sub_workers=0)
-        # The chunk kernels block the head dim and keep the running state in a scratch tensor;
-        # how many blocks, and how deep the cube<->vector ring may be, depends on the shape.
-        # `compile_fused_forward` tries the cheapest settings first and keeps the first that
-        # fits the vector buffer, so a shape that already worked keeps its old choice and a
-        # bigger head dim gets a finer one instead of failing outright.
+        # The chunk kernels block the head dim, and stage2 rebuilds each chunk's state from
+        # stage1's per-chunk snapshot rather than carrying it. How many blocks, and how deep
+        # the cube<->vector ring may be, depends on the shape. `compile_fused_forward` tries
+        # the cheapest settings first and keeps the first that fits the vector buffer, so a
+        # shape that already worked keeps its old choice and a bigger head dim gets a finer
+        # one instead of failing outright.
         self._compiled, self.blocking = compile_fused_forward(
             L, C, dk, dv, 1, P, platform=platform, distributed_config=dist_cfg)
         # The BACKWARD is compiled lazily, on first use (see _ensure_backward_compiled).

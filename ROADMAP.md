@@ -13,7 +13,7 @@ size, and in steady-state cost.
 
 | Piece | torch | torch-dist | simpler | pypto |
 |---|---|---|---|---|
-| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C ≤ 64`, head dim **128 on either side** |
+| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C ≤ 64`, head dims **128 × 128** |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
 | **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2/4** — `C ≤ 32`, `D ≤ 64` (no blocking yet — Task A6) |
 
@@ -156,8 +156,25 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   worked keep their old choice. `C=64 dk=128 dv=64` at 7.6e-05. **Staging `V` in L1**
   (`ce0c840`): the 512 KB `Mat` space was entirely unused while the 184 KB vector buffer
   overflowed — `C=64 dk=64 dv=128` at 5.7e-05. Dims need only be a multiple of **16**, not
-  powers of two: 48/80/96 all run, 24 and 40 are rejected by codegen. `dk=dv=128` and `C=128`
-  remain open — see Task A, whose stages are what the rest of this needs.
+  powers of two: 48/80/96 all run, 24 and 40 are rejected by codegen.
+- **F3.1b (part) — `dk = dv = 128`, by not carrying the state.** Head-dim blocking then hit a
+  wall it could not move: the `[dk,dv]` state was a *loop carry*, live across the whole kernel,
+  and three copies of it at 128×128 are 60% of the vector budget however finely everything else
+  is cut. The recurrence is linear in its starting state, so the carry is removable —
+  `S_n(boundary) = G_n · boundary + S_n(0)`. stage1 already walks from zero, so it now records
+  `S_n(0)` and `G_n` per chunk and stage2 rebuilds each chunk's state a `[BK,DV]` block at a
+  time. stage1's own blocks are independent for the *whole* slice (nothing in it contracts over
+  the head dim), so its block loop moved outside the chunk scan and its carry is `[BK,DV]` too.
+  `C=64 dk=dv=128` runs at **7.6e-05 (P=1)** and **9.2e-05 (P=2)** — a shape unreachable at any
+  blocking before. It also picks *cheaper* settings for shapes that already worked
+  (`dk=128 dv=64` went from 4 head blocks / ring depth 1 to 2 / depth 4). Costs `N·dk·dv` of
+  stores and makes stage1 live at P=1, where it used to be dead code — one extra dispatch.
+  Chunks are now mutually independent, which is a parallelism lever we did not have.
+  Found en route, and now the reason a ones vector is built on-device: **`pl.create_tensor(...,
+  init_value=<non-zero>)` silently delivers zeros when the tensor is created in a HOST
+  orchestrator** (honoured in a chip orchestrator; `init_value=0` honoured everywhere) — no
+  error, no warning. See `../allscan/issues/pypto-host-init-value-zeroed/`.
+  `C=128` remains open — see Task A.
 - **F3.1c — `dv < C` silently wrong.** Root-caused to pto-isa striding the consumer's local
   L1 FIFO ring by the popped tile's own size while the GM ring beside it uses a fixed
   `SLOT_SIZE`, so two differently-sized tiles held at once alias in L1. For `[M,K] @ [K,N]`
@@ -245,30 +262,18 @@ multi-head. `L` is already unbounded — it is the chunk-loop trip count and no 
 Design and measurements: `../allscan/issues/pypto-tile-blocking/ARBITRARY-SIZES.md`.
 Probes: `../devtools/t5_{math_check,block_probe,snapshot_math,nocarry_probe,verdict,split_check}.py`.
 
-**Sequencing.** Not a chain. A1→A2 is a real order (A2 is much easier once the state is
-already blocked), and A3 is **independent of both** — it addresses a different wall, the L0
-operand buffers, and could be done first or in parallel. A4 is *conditional*: only if A3 fails
-to deliver `C=128`. A5–A7 are follow-on and need A1–A3 done.
+**A1 is done** (2026-08-21) — snapshot state instead of a carry; see the F3.1b entries under
+Forward. The stage labels below keep their original numbers so earlier notes and commit
+messages still resolve.
 
-    A1 ──> A2 ──┐
-                ├──> A5, A6, A7
-    A3 ─────────┘
+**Sequencing.** Not a chain. A3 is **independent** of A2 — it addresses a different wall, the
+L0 operand buffers, and can be done in parallel. A4 is *conditional*: only if A3 fails to
+deliver `C=128`. A5–A7 are follow-on and need A2 and A3 done.
+
+    A2 ──┐
+         ├──> A5, A6, A7
+    A3 ──┘
      └──> A4  (only if A3 does not deliver C=128)
-
-A1 first because it is already proven on hardware and because it pays three ways: it unlocks
-`dk=dv=128`, it makes chunks independent, and it stops the state being a special case in every
-future sizing argument.
-
-### A1 — Snapshot state, no carry *(next; proven on HW in probe form)*
-stage1 stores its per-chunk snapshot `S_n(0)` `[N,dk,dv]` and running decay `G_n` `[N,dk,1]`;
-stage2 drops its carry and rebuilds `S_n = G_n * boundary + S_n(0)` per chunk. The state then
-blocks like every other operand — `[BK,DV]` live instead of 3 × `[dk,dv]`.
-
-Unlocks `dk=dv=128`. Two further consequences worth having in their own right: **chunks become
-independent**, which is a parallelism lever we do not have today, and the state stops being a
-special case in every future sizing argument. Costs `N·dk·dv` of stores (256 KB at N=4,
-dk=dv=128) and makes stage1 live at P=1, where it is currently dead-code-eliminated — one extra
-dispatch there.
 
 ### A2 — Value-dim blocking
 After A1 the only tiles that still scale with `dv` are the `[C,dv]` output accumulator and its

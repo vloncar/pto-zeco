@@ -96,6 +96,12 @@ SIZES = [
     # by blocking alone was impossible -- three copies of the [dk,dv] state are 60% of the
     # budget and no amount of head-dim blocking touches them.
     (256, 64, 64, 128),   # dv=128
+    # BOTH head dims at 128. Out of reach at any blocking while stage2 CARRIED its state:
+    # three [dk,dv] copies are 60% of the budget and blocking the head dim does not touch a
+    # loop carry. Reachable since stage2 rebuilds each chunk's state from stage1's snapshot
+    # (A1, 2026-08-21) and holds only [BK,DV] at a time. If the snapshot path regresses this
+    # goes red with "no blocking plan fits".
+    (256, 64, 128, 128),  # dk = dv = 128
     (192, 48, 48, 48),    # a multiple of 16 that is not a power of two
     # Both head dims below C. These were REFUSED by build() until 2026-08-13, because the
     # pto-isa FIFO local-slot aliasing (issue #521) made them silently corrupt: dv < C on
