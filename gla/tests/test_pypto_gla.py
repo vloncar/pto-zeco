@@ -92,6 +92,10 @@ SIZES = [
     # 1, which alone is 131072 B of the 188416 B budget. If either regresses this goes red
     # with "no blocking plan fits" rather than a wrong answer.
     (256, 64, 128, 64),   # dk=128
+    # dv=128 needed a second thing: V staged in L1 rather than the vector buffer. Reaching it
+    # by blocking alone was impossible -- three copies of the [dk,dv] state are 60% of the
+    # budget and no amount of head-dim blocking touches them.
+    (256, 64, 64, 128),   # dv=128
     (192, 48, 48, 48),    # a multiple of 16 that is not a power of two
     # Both head dims below C. These were REFUSED by build() until 2026-08-13, because the
     # pto-isa FIFO local-slot aliasing (issue #521) made them silently corrupt: dv < C on
