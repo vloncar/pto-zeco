@@ -169,6 +169,11 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   `allscan/issues/simpler-l3-callable-redispatch/`. Both directions now share one held-worker
   path; the only surviving constraint is that a device hosts one worker at a time, so the
   compute workers are dropped around the boundary AllScan (`_release_devices`).
+  The probe was turned into an upstream ST and filed as **simpler PR #1938** (2026-08-20) —
+  the existing `dynamic_register` cases build two callables that compute the *same* value, so
+  they pass whichever one runs. Review finding addressed 2026-08-21 (`47e60a86`): both cases
+  now open their `try` at `Worker(...)` rather than after `init()`, since a failed startup
+  otherwise skips `close()` and leaves the card held. 7/7 on `a2a3sim` and on `a2a3`.
 - **F5 — shared-box hardening.** Rendezvous auto-clean, `LD_PRELOAD` check, per-config
   device-health guard, failure isolation in `finally`.
 - **F6.1–F6.4 — the first honest forward numbers.** All 6 shared-config cases correct;
