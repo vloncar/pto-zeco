@@ -13,7 +13,7 @@ size, and in steady-state cost.
 
 | Piece | torch | torch-dist | simpler | pypto |
 |---|---|---|---|---|
-| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW `C ≤ 64`, head dims **to 1024** |
+| **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW **`C ≤ 128`**, head dims **to 1024** |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
 | **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2/4** — `C ≤ 32`, `D ≤ 64` (no blocking yet — Task A6) |
 
@@ -174,6 +174,18 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   init_value=<non-zero>)` silently delivers zeros when the tensor is created in a HOST
   orchestrator** (honoured in a chip orchestrator; `init_value=0` honoured everywhere) — no
   error, no warning. See `../allscan/issues/pypto-host-init-value-zeroed/`.
+- **F3.1b (done) — chunk 128, by blocking the key-row axis.** The last shape ceiling, and the
+  reason it survived so long is that it was misdiagnosed: `C=128` was recorded as failing on
+  operand width when it actually missed by **256 B of vector buffer**. A third of that buffer is
+  the cross-core ring reserve, sized by the widest tile *crossing* cube↔vector — at `C=128` the
+  `[C,C]` score matmul **result**, which is fp32 by construction and so cannot be narrowed.
+  Blocking the key-row (contraction) axis shrinks it exactly: `tril[:, r]` already carries the
+  causal zeros, so each block is an independent product needing no scan, and the MAC count is
+  unchanged. Both chunk kernels now walk it, and the mask reuses the same `[C, BC]` tile as the
+  decay operand. `C=128 dk=dv=128` runs at **1.411e-04** with the search choosing
+  head=4/value=2/key-row=2 on its own; forward sweep **30 passed / 1 skipped**. Latency measured
+  unchanged (two interleaved A/B passes, 30 iterations; the box is shared and the spread swamps
+  any effect). Evidence: `../allscan/issues/pypto-c128-wall/`.
 - **F3.1b (part) — value dim blocked, and the ring with it. Head dims reach 1024 on HW.**
   What still scaled with `dv` was the `[C,dv]` output accumulator and the `[C,dv]` right-hand
   operand of `scores @ V` — the latter a 64 KB L0 operand at `dv=256`, the whole buffer.
@@ -285,13 +297,11 @@ blocking and a searched ring split; see the F3.1b entries under Forward. Both he
 reach 1024 on hardware. The stage labels below keep their original numbers so earlier notes and
 commit messages still resolve.
 
-**Sequencing (revised 2026-08-24).** A3 was scheduled as the route to `C=128`; measurement
-says it cannot be — the tile that binds is a matmul *result*, and results are fp32 by
-construction. **A4 is the route**, and it is a far smaller change than this document used to
-claim. A3 demotes to an optional performance lever.
+**A4 is done** (2026-08-24) — `C=128` runs on hardware. See the F3.1b entry under Forward.
+A3 was investigated first and could not deliver it; it stays available as an optional, lossy
+performance lever and is not a size-unlocking stage.
 
-    A4 ──> A5, A6, A7          A4 delivers C=128 exactly
-    A3  (optional, lossy)      operand-buffer pressure + traffic only
+    A5, A6, A7 remain.   A3 optional (lossy; operand-buffer pressure + traffic only)
 
 ### A3 — Narrower matmul operands *(investigated 2026-08-24 — does NOT deliver `C=128`)*
 **The description this section used to carry was wrong, and the correction matters.** It said
@@ -318,7 +328,7 @@ matching the torch study).
 traffic, at a deliberate ~3e-04 relative cost. Not a size-unlocking stage. Do not schedule it
 as one.
 
-### A4 — Block the two `[C,C]` matmuls over their CONTRACTION axis *(the actual route to `C=128`)*
+### A4 — Block the two `[C,C]` matmuls over their CONTRACTION axis *(DONE 2026-08-24)*
 Both `[C,C]` matmuls split exactly over their contraction (key-row) axis — verified in fp64,
 residual 2.8e-14 at every block size:
 

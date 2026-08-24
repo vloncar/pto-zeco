@@ -106,6 +106,13 @@ SIZES = [
     # the [C,dv] right-hand operand of `scores @ V` is 65536 B, the entire L0 buffer. The
     # chosen plan here should be 2 value blocks; if value blocking regresses, this goes red.
     (256, 64, 64, 256),   # dv=256 — forces the value split
+    # Chunk 128. Out of reach since F3.1, and NOT for the reason the roadmap recorded: the
+    # binding constraint is the cross-core ring RESERVE in the vector buffer, sized by the
+    # widest tile crossing cube<->vector -- which at C=128 was the [C,C] score matmul result.
+    # A matmul result is fp32 by construction, so narrower operands could never shrink it;
+    # blocking the key-row (contraction) axis does, exactly. If key-row blocking regresses this
+    # goes red with "no blocking plan fits" rather than a wrong answer.
+    (256, 128, 128, 128),  # C=128
     (192, 48, 48, 48),    # a multiple of 16 that is not a power of two
     # Both head dims below C. These were REFUSED by build() until 2026-08-13, because the
     # pto-isa FIFO local-slot aliasing (issue #521) made them silently corrupt: dv < C on

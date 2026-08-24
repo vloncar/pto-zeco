@@ -120,11 +120,11 @@ def _splits(d: int) -> list[int]:
     return out
 
 
-def blocking_plans(dk: int, dv: int, distributed: bool = False) -> list[tuple[int, ...]]:
-    """Candidate ``(head_blocks, value_blocks, ring_depth, ring_blocks)`` settings, cheapest
-    first.
+def blocking_plans(C: int, dk: int, dv: int, distributed: bool = False) -> list[tuple[int, ...]]:
+    """Candidate ``(head_blocks, value_blocks, ring_depth, ring_blocks, key_row_blocks)``
+    settings, cheapest first.
 
-    Four independent levers decide whether a shape fits the 188416 B vector buffer:
+    Five independent levers decide whether a shape fits the 188416 B vector buffer:
 
     * **head_blocks** -- how many pieces the head dim ``dk`` is cut into. Only two matmuls
       contract over it (``qt @ S`` and ``qt @ kb^T``), so a block's partial products are
@@ -146,11 +146,21 @@ def blocking_plans(dk: int, dv: int, distributed: bool = False) -> list[tuple[in
       became the binding constraint at ``P > 1``, and it was pinned at one piece. It only
       exists for ``P > 1``, so ``distributed=False`` leaves it at 1 and does not search it.
 
-    ``(1, 1, 4, 1)`` reproduces the pre-blocking settings, so shapes that already worked keep
-    their old choice.
+    * **key_row_blocks** -- how many pieces the chunk's KEY-ROW axis is cut into. Both matmuls
+      that contract over it block exactly (`tril[:, r]` already carries the causal zeros, so
+      no scan is needed), and the MAC count is unchanged, so this lever is work-neutral. What
+      it buys is the size of the widest tile CROSSING the cube/vector boundary -- and that
+      tile sizes the ring reserve, which is 65536 B of the 188416 B budget at ``C=128``.
+      It is the only lever that touches the reserve: a matmul RESULT is fp32 by construction
+      (`the Cube accumulator fixes the result dtype`), so narrowing cannot shrink it.
+      See ``../../../allscan/issues/pypto-c128-wall/``.
+
+    ``(1, 1, 4, 1, 1)`` reproduces the pre-blocking settings, so shapes that already worked
+    keep their old choice.
     """
     ring = _splits(dk) if distributed else [1]
-    return [(nb, nv, slot, rb)
+    return [(nb, nv, slot, rb, nc)
+            for nc in _splits(C)
             for nv in _splits(dv)
             for rb in ring
             for nb in _splits(dk)
@@ -211,21 +221,21 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
     """
     from pypto import ir
 
-    plans = list(plans if plans is not None else blocking_plans(dk, dv, distributed=P > 1))
+    plans = list(plans if plans is not None else blocking_plans(C, dk, dv, distributed=P > 1))
     assert plans, (f"no legal blocking for dk={dk} dv={dv} "
                    f"(block widths must be a multiple of {TILE_UNIT})")
     tried = []
     seen = {}
 
-    def attempt(nb, nv, slot, rb):
+    def attempt(nb, nv, slot, rb, nc):
         """Compile one plan. Returns the compiled program, or None if it does not fit.
 
         Memoised: the group feasibility probe below deliberately compiles a plan the walk may
         reach again, and each attempt costs seconds.
         """
-        if (nb, nv, slot, rb) in seen:
-            return seen[(nb, nv, slot, rb)]
-        program = build_fused_forward_program(L, C, dk, dv, rb, P, nb, nv, slot)
+        if (nb, nv, slot, rb, nc) in seen:
+            return seen[(nb, nv, slot, rb, nc)]
+        program = build_fused_forward_program(L, C, dk, dv, rb, P, nb, nv, slot, nc)
         kwargs = {"platform": platform}
         if distributed_config is not None:
             kwargs["distributed_config"] = distributed_config
@@ -234,32 +244,20 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
         except Exception as exc:  # noqa: BLE001 -- narrowed on the message just below
             if "buffer usage" not in str(exc) or "exceeds platform limit" not in str(exc):
                 raise
-            # A LEFT-operand overflow is not something any plan here can fix. The widest left
-            # matmul operand is the [C, C] triangular matrix, so this says the chunk size does
-            # not fit the 64 KB L0 buffer -- and neither lever below touches C. Say so once
-            # instead of grinding through every remaining plan to reach the same conclusion.
-            if "Left buffer usage" in str(exc):
-                raise ValueError(
-                    f"C={C} does not fit the L0 left-operand buffer at any blocking on "
-                    f"{platform}: the widest left operand is the [{C}, {C}] fp32 triangular "
-                    "matrix, and neither head-dim nor value-dim blocking changes it. Narrower "
-                    "(fp16/bf16) operands or blocking the chunk rows would -- neither is "
-                    "implemented; see ROADMAP Task A3 / A4."
-                ) from exc
-            tried.append((nb, nv, slot, rb, str(exc).split("exceeds")[0].strip()))
+            tried.append((nb, nv, slot, rb, nc, str(exc).split("exceeds")[0].strip()))
             if log is not None:
                 log(f"blocking plan head_blocks={nb} value_blocks={nv} ring_depth={slot} "
-                    f"ring_blocks={rb} does not fit")
-            seen[(nb, nv, slot, rb)] = None
+                    f"ring_blocks={rb} key_row_blocks={nc} does not fit")
+            seen[(nb, nv, slot, rb, nc)] = None
             return None
-        seen[(nb, nv, slot, rb)] = compiled
+        seen[(nb, nv, slot, rb, nc)] = compiled
         return compiled
 
-    def take(nb, nv, slot, rb, compiled):
-        if log is not None and (nb, nv, slot, rb) != plans[0]:
+    def take(nb, nv, slot, rb, nc, compiled):
+        if log is not None and (nb, nv, slot, rb, nc) != plans[0]:
             log(f"blocking plan head_blocks={nb} value_blocks={nv} ring_depth={slot} "
-                f"ring_blocks={rb} fits (after {len(tried)} that did not)")
-        return compiled, (nb, nv, slot, rb)
+                f"ring_blocks={rb} key_row_blocks={nc} fits (after {len(tried)} that did not)")
+        return compiled, (nb, nv, slot, rb, nc)
 
     # Walk the plans one (value split, ring split) group at a time. The cheapest setting in a
     # group is tried first, as before; only if THAT fails is the group tested as a whole, so a
@@ -271,25 +269,27 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
     # reach. If that does not fit, nothing else in the group does, and the group is skipped for
     # one compile instead of up to eighteen. Each compile takes seconds and there are now four
     # levers, so at dk=dv=1024 this is the difference between hundreds of attempts and ~25.
-    for nv, rb in dict.fromkeys((p[1], p[3]) for p in plans):
-        group = [p for p in plans if p[1] == nv and p[3] == rb]
+    for nv, rb, nc in dict.fromkeys((p[1], p[3], p[4]) for p in plans):
+        group = [p for p in plans if p[1] == nv and p[3] == rb and p[4] == nc]
         head = group[0]
         compiled = attempt(*head)
         if compiled is not None:
             return take(*head, compiled)
-        floor = (max(nb for nb, _, _, _ in group), nv, min(s for _, _, s, _ in group), rb)
+        floor = (max(q[0] for q in group), nv, min(q[2] for q in group), rb, nc)
         if attempt(*floor) is None:
             if log is not None:
-                log(f"value_blocks={nv} ring_blocks={rb} cannot fit at any head blocking or "
-                    f"cross-core ring depth; skipping {len(group) - 2} further settings")
+                log(f"value_blocks={nv} ring_blocks={rb} key_row_blocks={nc} cannot fit at "
+                    f"any head blocking or cross-core ring depth; skipping "
+                    f"{len(group) - 2} further settings")
             continue
-        for nb, _nv, slot, _rb in group[1:]:
-            compiled = attempt(nb, nv, slot, rb)
+        for nb, _nv, slot, _rb, _nc in group[1:]:
+            compiled = attempt(nb, nv, slot, rb, nc)
             if compiled is not None:
-                return take(nb, nv, slot, rb, compiled)
+                return take(nb, nv, slot, rb, nc, compiled)
     detail = "\n  ".join(
-        f"head_blocks={nb} value_blocks={nv} ring_depth={slot} ring_blocks={rb}: {why}"
-        for nb, nv, slot, rb, why in tried)
+        f"head_blocks={nb} value_blocks={nv} ring_depth={slot} ring_blocks={rb} "
+        f"key_row_blocks={nc}: {why}"
+        for nb, nv, slot, rb, nc, why in tried)
     raise ValueError(
         f"no blocking plan fits C={C} dk={dk} dv={dv} on {platform}; tried:\n  {detail}\n"
         "The chunk dim C is not blocked yet, so a large C overflows whatever the head and "
@@ -298,7 +298,7 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
 
 
 def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
-                              nb: int = 1, nv: int = 1, slot: int = 4):
+                              nb: int = 1, nv: int = 1, slot: int = 4, nc: int = 1):
     """P == 1 native path: stage1 + stage2 from a zero boundary (no ring).
 
     stage1 used to be dead here -- its only consumer was the ring -- so P=1 was stage2 alone.
@@ -311,7 +311,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     N = L // C
     P, DK, DV = 1, dk, dv
-    NB, BK, NV, BV, SLOT = nb, dk // nb, nv, dv // nv, slot
+    NB, BK, NV, BV, NC, BC, SLOT = nb, dk // nb, nv, dv // nv, nc, C // nc, slot
 
     @pl.program
     class FusedForwardP1Program:
@@ -347,7 +347,6 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             re-reading ``V`` once per block; it is staged in L1, and it is what makes the head
             dim a free parameter rather than a fitted one.
             """
-            tril_t = pl.load(tril, [0, 0], [C, C])
             snaps = Ssnap
             decays = Gsnap
             tot = Stot
@@ -375,20 +374,36 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
                     for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
                         off = n * C
                         soff = n * DK
-                        # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise
-                        # unused) rather than in the 184 KB vector buffer.
-                        v = pl.load(Vmat, [off, vof], [C, BV],
-                                    target_memory=pl.MemorySpace.Mat)
                         # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
                         snaps = pl.store(s_run, [soff + dof, vof], snaps)
                         decays = pl.store(g_run, [soff + dof, 0], decays)
                         k_b = pl.load(Kmat, [off, dof], [C, BK])
                         a_b = pl.load(A, [off, dof], [C, BK])
                         la_b = pl.log(a_b)
-                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        # Decay, blocked over the KEY-ROW (contraction) axis. `tril[:, r]`
+                        # already carries the causal zeros, so each block is an independent
+                        # product and no scan is needed -- and the MAC count is unchanged.
+                        # This is what keeps the widest tile the cube sees at [C, BC].
+                        zb = pl.mul(la_b, 0.0)
+                        for r, (b_acc,) in pl.range(0, NC, init_values=(zb,)):
+                            rof = r * BC
+                            tril_r = pl.load(tril, [0, rof], [C, BC])
+                            la_r = pl.log(pl.load(A, [off + rof, dof], [BC, BK]))
+                            b_fin = pl.yield_(
+                                pl.add(b_acc, pl.matmul(tril_r, la_r, out_dtype=pl.FP32)))
+                        b_b = pl.exp(b_fin)
                         gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
-                        kb_b = pl.div(k_b, b_b)
-                        kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
+                        kbt_b = pl.transpose(pl.div(k_b, b_b), 0, 1)
+                        # (K/b)^T @ V contracts over the chunk rows too, so it blocks the
+                        # same way and for the same reason.
+                        zkv = pl.mul(s_run, 0.0)
+                        for r2, (kv_acc,) in pl.range(0, NC, init_values=(zkv,)):
+                            rof2 = r2 * BC
+                            v_r = pl.load(Vmat, [off + rof2, vof], [BC, BV],
+                                          target_memory=pl.MemorySpace.Mat)
+                            kbt_r = pl.tile.slice(kbt_b, [BK, BC], [0, rof2])
+                            kv_b = pl.yield_(
+                                pl.add(kv_acc, pl.matmul(kbt_r, v_r, out_dtype=pl.FP32)))
                         # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference
                         # factors it.
                         s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
@@ -460,7 +475,6 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             The head dim is walked in ``NB`` blocks of ``BK``. Q, K and A need no slicing: a
             block of them is just a narrower ``pl.load``.
             """
-            tril_t = pl.load(tril, [0, 0], [C, C])
             out = O
             # No init_values for the state anywhere below: there is no state carry left.
             for n in pl.range(0, N):
@@ -474,43 +488,60 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
                 # score matrix -- both of which depend only on `dk` -- once per value block.
                 for w in pl.range(0, NV):
                     vof = w * BV
-                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
-                    # rather than in the 184 KB vector buffer.
-                    v = pl.load(Vmat, [off, vof], [C, BV],
-                                target_memory=pl.MemorySpace.Mat)
-                    # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0`
-                    # comes from a [C, BV] zero rather than from V, because V is staged in L1
-                    # and touching it with a vector op would drag a copy back.
-                    sc0 = pl.mul(tril_t, 0.0)
+                    # `oi0` comes from a [C, BV] zero tensor rather than from V, because V is
+                    # staged in L1 and touching it with a vector op would drag a copy back.
                     oi0 = pl.load(zc, [0, 0], [C, BV])
-                    # A real nested pl.range, not a Python `for`: pypto parses this source, so
-                    # a Python loop here is read as a device loop that reassigns names without
-                    # pl.yield_ ("N iteration arguments but 0 return variables").
-                    for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
+                    # Head blocks OUTSIDE key-row blocks. That order matters: the within-chunk
+                    # decay is a cumulative sum over ALL key rows, so every query row needs it
+                    # in full -- computing it once per head block avoids recomputing it per
+                    # key-row block. A real nested pl.range, not a Python `for`: pypto parses
+                    # this source, so a Python loop here is read as a device loop that
+                    # reassigns names without pl.yield_ ("N iteration arguments but 0 return
+                    # variables").
+                    for j, (o_acc,) in pl.range(0, NB, init_values=(oi0,)):
                         dof = j * BK
                         q_b = pl.load(Q, [off, dof], [C, BK])
                         k_b = pl.load(Kmat, [off, dof], [C, BK])
-                        a_b = pl.load(A, [off, dof], [C, BK])
-                        la_b = pl.log(a_b)
-                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        # Decay, blocked over the KEY-ROW (contraction) axis -- see gla_stage1.
+                        zb = pl.mul(q_b, 0.0)
+                        for r, (b_acc,) in pl.range(0, NC, init_values=(zb,)):
+                            rof = r * BC
+                            tril_r = pl.load(tril, [0, rof], [C, BC])
+                            la_r = pl.log(pl.load(A, [off + rof, dof], [BC, BK]))
+                            b_fin = pl.yield_(
+                                pl.add(b_acc, pl.matmul(tril_r, la_r, out_dtype=pl.FP32)))
+                        b_b = pl.exp(b_fin)
                         qt_b = pl.mul(q_b, b_b)
-                        kb_b = pl.div(k_b, b_b)
-                        kbt_b = pl.transpose(kb_b, 0, 1)
-                        # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
-                        # [BK, BV] is ever live, and it dies at the end of the block.
+                        kbt_b = pl.transpose(pl.div(k_b, b_b), 0, 1)
+                        # State term: independent of the key rows, so it sits outside the
+                        # key-row loop and is counted once per head block. Rebuild THIS block
+                        # of the state -- only [BK, BV] is ever live. This matmul contracts
+                        # over the head dim, so its partials are summed in the VECTOR unit;
+                        # fp32 cube accumulation is broken on a2a3.
                         s_snap = pl.load(Ssnap, [soff + dof, vof], [BK, BV])
                         g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
                         b_blk = pl.load(Srecv, [dof, vof], [BK, BV])
                         s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
-                        # Both matmuls contract over the head dim, so their partials are
-                        # summed here in the VECTOR unit -- fp32 cube accumulation is broken
-                        # on a2a3.
-                        sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
-                        oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
-                        scores_acc, o_inter = pl.yield_(sc_n, oi_n)
-                    scores = pl.mul(scores_acc, tril_t)
-                    o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
-                    out = pl.store(o_n, [off, vof], out)
+                        o_st = pl.add(o_acc, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
+                        # Within-chunk term, accumulated STRAIGHT INTO THE OUTPUT. The causal
+                        # mask is elementwise, hence linear, so it distributes over the
+                        # head-block sum: (sum_j X_j) (*) tril @ V == sum_j (X_j (*) tril) @ V.
+                        # That is what removes the [C, C] score matrix entirely -- it is never
+                        # built, so it never crosses the cube/vector boundary and never sizes
+                        # the ring reserve. The widest tile here is [C, BC].
+                        for r2, (o_in,) in pl.range(0, NC, init_values=(o_st,)):
+                            rof2 = r2 * BC
+                            tril_2 = pl.load(tril, [0, rof2], [C, BC])
+                            # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise
+                            # unused) rather than in the 184 KB vector buffer.
+                            v_r = pl.load(Vmat, [off + rof2, vof], [BC, BV],
+                                          target_memory=pl.MemorySpace.Mat)
+                            kbt_r = pl.tile.slice(kbt_b, [BK, BC], [0, rof2])
+                            x = pl.mul(pl.matmul(qt_b, kbt_r, out_dtype=pl.FP32), tril_2)
+                            o_fin = pl.yield_(
+                                pl.add(o_in, pl.matmul(x, v_r, out_dtype=pl.FP32)))
+                        o_acc = pl.yield_(o_fin)
+                    out = pl.store(o_acc, [off, vof], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -567,7 +598,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
 
 
 def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int,
-                                nb: int = 1, nv: int = 1, slot: int = 4):
+                                nb: int = 1, nv: int = 1, slot: int = 4, nc: int = 1):
     """Build the fully-fused ``stage1 + ring + stage2`` distributed program.
 
     Args:
@@ -583,12 +614,12 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
     assert dk % K == 0, f"dk ({dk}) must be divisible by K ({K})"
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     if P == 1:
-        return _build_p1_forward_program(L, C, dk, dv, K, nb, nv, slot)
+        return _build_p1_forward_program(L, C, dk, dv, K, nb, nv, slot, nc)
 
     BLOCK = dk // K
     N = L // C
     DK, DV = dk, dv
-    NB, BK, NV, BV, SLOT = nb, dk // nb, nv, dv // nv, slot
+    NB, BK, NV, BV, NC, BC, SLOT = nb, dk // nb, nv, dv // nv, nc, C // nc, slot
 
     @pl.program
     class FusedForwardProgram:
@@ -624,7 +655,6 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             re-reading ``V`` once per block; it is staged in L1, and it is what makes the head
             dim a free parameter rather than a fitted one.
             """
-            tril_t = pl.load(tril, [0, 0], [C, C])
             snaps = Ssnap
             decays = Gsnap
             tot = Stot
@@ -652,20 +682,36 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                     for n, (s_run, g_run) in pl.range(0, N, init_values=(s0, g0)):
                         off = n * C
                         soff = n * DK
-                        # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise
-                        # unused) rather than in the 184 KB vector buffer.
-                        v = pl.load(Vmat, [off, vof], [C, BV],
-                                    target_memory=pl.MemorySpace.Mat)
                         # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
                         snaps = pl.store(s_run, [soff + dof, vof], snaps)
                         decays = pl.store(g_run, [soff + dof, 0], decays)
                         k_b = pl.load(Kmat, [off, dof], [C, BK])
                         a_b = pl.load(A, [off, dof], [C, BK])
                         la_b = pl.log(a_b)
-                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        # Decay, blocked over the KEY-ROW (contraction) axis. `tril[:, r]`
+                        # already carries the causal zeros, so each block is an independent
+                        # product and no scan is needed -- and the MAC count is unchanged.
+                        # This is what keeps the widest tile the cube sees at [C, BC].
+                        zb = pl.mul(la_b, 0.0)
+                        for r, (b_acc,) in pl.range(0, NC, init_values=(zb,)):
+                            rof = r * BC
+                            tril_r = pl.load(tril, [0, rof], [C, BC])
+                            la_r = pl.log(pl.load(A, [off + rof, dof], [BC, BK]))
+                            b_fin = pl.yield_(
+                                pl.add(b_acc, pl.matmul(tril_r, la_r, out_dtype=pl.FP32)))
+                        b_b = pl.exp(b_fin)
                         gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
-                        kb_b = pl.div(k_b, b_b)
-                        kv_b = pl.matmul(pl.transpose(kb_b, 0, 1), v, out_dtype=pl.FP32)
+                        kbt_b = pl.transpose(pl.div(k_b, b_b), 0, 1)
+                        # (K/b)^T @ V contracts over the chunk rows too, so it blocks the
+                        # same way and for the same reason.
+                        zkv = pl.mul(s_run, 0.0)
+                        for r2, (kv_acc,) in pl.range(0, NC, init_values=(zkv,)):
+                            rof2 = r2 * BC
+                            v_r = pl.load(Vmat, [off + rof2, vof], [BC, BV],
+                                          target_memory=pl.MemorySpace.Mat)
+                            kbt_r = pl.tile.slice(kbt_b, [BK, BC], [0, rof2])
+                            kv_b = pl.yield_(
+                                pl.add(kv_acc, pl.matmul(kbt_r, v_r, out_dtype=pl.FP32)))
                         # S = gamma * (S + (K/b)^T @ V), exactly as the torch reference
                         # factors it.
                         s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
@@ -737,7 +783,6 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             The head dim is walked in ``NB`` blocks of ``BK``. Q, K and A need no slicing: a
             block of them is just a narrower ``pl.load``.
             """
-            tril_t = pl.load(tril, [0, 0], [C, C])
             out = O
             # No init_values for the state anywhere below: there is no state carry left.
             for n in pl.range(0, N):
@@ -751,43 +796,60 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
                 # score matrix -- both of which depend only on `dk` -- once per value block.
                 for w in pl.range(0, NV):
                     vof = w * BV
-                    # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise unused)
-                    # rather than in the 184 KB vector buffer.
-                    v = pl.load(Vmat, [off, vof], [C, BV],
-                                target_memory=pl.MemorySpace.Mat)
-                    # Zero seeds. `sc0` comes from tril_t (already vector-resident); `oi0`
-                    # comes from a [C, BV] zero rather than from V, because V is staged in L1
-                    # and touching it with a vector op would drag a copy back.
-                    sc0 = pl.mul(tril_t, 0.0)
+                    # `oi0` comes from a [C, BV] zero tensor rather than from V, because V is
+                    # staged in L1 and touching it with a vector op would drag a copy back.
                     oi0 = pl.load(zc, [0, 0], [C, BV])
-                    # A real nested pl.range, not a Python `for`: pypto parses this source, so
-                    # a Python loop here is read as a device loop that reassigns names without
-                    # pl.yield_ ("N iteration arguments but 0 return variables").
-                    for j, (scores_acc, o_inter) in pl.range(0, NB, init_values=(sc0, oi0)):
+                    # Head blocks OUTSIDE key-row blocks. That order matters: the within-chunk
+                    # decay is a cumulative sum over ALL key rows, so every query row needs it
+                    # in full -- computing it once per head block avoids recomputing it per
+                    # key-row block. A real nested pl.range, not a Python `for`: pypto parses
+                    # this source, so a Python loop here is read as a device loop that
+                    # reassigns names without pl.yield_ ("N iteration arguments but 0 return
+                    # variables").
+                    for j, (o_acc,) in pl.range(0, NB, init_values=(oi0,)):
                         dof = j * BK
                         q_b = pl.load(Q, [off, dof], [C, BK])
                         k_b = pl.load(Kmat, [off, dof], [C, BK])
-                        a_b = pl.load(A, [off, dof], [C, BK])
-                        la_b = pl.log(a_b)
-                        b_b = pl.exp(pl.matmul(tril_t, la_b, out_dtype=pl.FP32))
+                        # Decay, blocked over the KEY-ROW (contraction) axis -- see gla_stage1.
+                        zb = pl.mul(q_b, 0.0)
+                        for r, (b_acc,) in pl.range(0, NC, init_values=(zb,)):
+                            rof = r * BC
+                            tril_r = pl.load(tril, [0, rof], [C, BC])
+                            la_r = pl.log(pl.load(A, [off + rof, dof], [BC, BK]))
+                            b_fin = pl.yield_(
+                                pl.add(b_acc, pl.matmul(tril_r, la_r, out_dtype=pl.FP32)))
+                        b_b = pl.exp(b_fin)
                         qt_b = pl.mul(q_b, b_b)
-                        kb_b = pl.div(k_b, b_b)
-                        kbt_b = pl.transpose(kb_b, 0, 1)
-                        # Rebuild THIS block of the state: G_n * boundary + snapshot. Only
-                        # [BK, BV] is ever live, and it dies at the end of the block.
+                        kbt_b = pl.transpose(pl.div(k_b, b_b), 0, 1)
+                        # State term: independent of the key rows, so it sits outside the
+                        # key-row loop and is counted once per head block. Rebuild THIS block
+                        # of the state -- only [BK, BV] is ever live. This matmul contracts
+                        # over the head dim, so its partials are summed in the VECTOR unit;
+                        # fp32 cube accumulation is broken on a2a3.
                         s_snap = pl.load(Ssnap, [soff + dof, vof], [BK, BV])
                         g_blk = pl.load(Gsnap, [soff + dof, 0], [BK, 1])
                         b_blk = pl.load(Srecv, [dof, vof], [BK, BV])
                         s_blk = pl.add(pl.tile.row_expand_mul(b_blk, g_blk), s_snap)
-                        # Both matmuls contract over the head dim, so their partials are
-                        # summed here in the VECTOR unit -- fp32 cube accumulation is broken
-                        # on a2a3.
-                        sc_n = pl.add(scores_acc, pl.matmul(qt_b, kbt_b, out_dtype=pl.FP32))
-                        oi_n = pl.add(o_inter, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
-                        scores_acc, o_inter = pl.yield_(sc_n, oi_n)
-                    scores = pl.mul(scores_acc, tril_t)
-                    o_n = pl.add(o_inter, pl.matmul(scores, v, out_dtype=pl.FP32))
-                    out = pl.store(o_n, [off, vof], out)
+                        o_st = pl.add(o_acc, pl.matmul(qt_b, s_blk, out_dtype=pl.FP32))
+                        # Within-chunk term, accumulated STRAIGHT INTO THE OUTPUT. The causal
+                        # mask is elementwise, hence linear, so it distributes over the
+                        # head-block sum: (sum_j X_j) (*) tril @ V == sum_j (X_j (*) tril) @ V.
+                        # That is what removes the [C, C] score matrix entirely -- it is never
+                        # built, so it never crosses the cube/vector boundary and never sizes
+                        # the ring reserve. The widest tile here is [C, BC].
+                        for r2, (o_in,) in pl.range(0, NC, init_values=(o_st,)):
+                            rof2 = r2 * BC
+                            tril_2 = pl.load(tril, [0, rof2], [C, BC])
+                            # V is a pure matmul operand -- stage it in L1 (512 KB, otherwise
+                            # unused) rather than in the 184 KB vector buffer.
+                            v_r = pl.load(Vmat, [off + rof2, vof], [BC, BV],
+                                          target_memory=pl.MemorySpace.Mat)
+                            kbt_r = pl.tile.slice(kbt_b, [BK, BC], [0, rof2])
+                            x = pl.mul(pl.matmul(qt_b, kbt_r, out_dtype=pl.FP32), tril_2)
+                            o_fin = pl.yield_(
+                                pl.add(o_in, pl.matmul(x, v_r, out_dtype=pl.FP32)))
+                        o_acc = pl.yield_(o_fin)
+                    out = pl.store(o_acc, [off, vof], out)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
