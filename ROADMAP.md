@@ -285,36 +285,60 @@ blocking and a searched ring split; see the F3.1b entries under Forward. Both he
 reach 1024 on hardware. The stage labels below keep their original numbers so earlier notes and
 commit messages still resolve.
 
-**Sequencing.** A3 is next and is the only thing between us and `C=128`. A4 is *conditional*:
-only if A3 fails to deliver it. A5–A7 are follow-on.
+**Sequencing (revised 2026-08-24).** A3 was scheduled as the route to `C=128`; measurement
+says it cannot be — the tile that binds is a matmul *result*, and results are fp32 by
+construction. **A4 is the route**, and it is a far smaller change than this document used to
+claim. A3 demotes to an optional performance lever.
 
-    A3 ──> A5, A6, A7
-     └──> A4  (only if A3 does not deliver C=128)
+    A4 ──> A5, A6, A7          A4 delivers C=128 exactly
+    A3  (optional, lossy)      operand-buffer pressure + traffic only
 
-### A3 — Narrower matmul operands
-The 64 KB `Left`/`Right` operand buffers are the wall for `C=128` and `dk=dv=512`: a `[128,128]`
-fp32 tile is exactly 65536 B, the whole buffer, so there is no room to double-buffer. This is
-**not** a working-set problem and no amount of tiling addresses it.
+### A3 — Narrower matmul operands *(investigated 2026-08-24 — does NOT deliver `C=128`)*
+**The description this section used to carry was wrong, and the correction matters.** It said
+`C=128` fails on operand width, that a `[128,128]` fp32 tile is the whole 64 KB buffer, and that
+"no amount of tiling addresses it". That came from the failure message at ONE blocking setting;
+the search only ever reports the first buffer to overflow. Walking the whole space says `C=128`
+misses on the **vector buffer by 256 B** (head=4, value=2), with the two operand buffers
+4096 B short. Full evidence: `../allscan/issues/pypto-c128-wall/`.
 
-fp16/bf16 operands halve it and restore double-buffering. pto-kernels' flash attention uses
-`half` L0 tiles; its KDA chunk_o casts fp16 inputs up so the cube sees fp32 sources. For GLA the
-gate terms and the state must stay fp32 — the decay is an exponential of a running sum, so its
-range is wide — but `q`, `k`, `v` and the score matrix are candidates, which is what the
-reference implementations do. Also a straight performance win: half the operand traffic.
+Narrowing cannot fix the binding constraint. 65536 B of the vector budget — a third — is
+reserved by the cross-core ring, sized by the largest tile *crossing* cube↔vector, and at
+`C=128` that is the `[C,C]` score matmul **result**. Results cannot be narrowed:
+`pl.matmul: out_dtype=fp16 is not supported ... the Cube accumulator fixes the result dtype`.
+Casting `tril` (lossless, it is only 0.0/1.0) does not help either — the score result is the
+same size and the reserve takes the max. Mixed precision is refused outright, so `tril` cannot
+go narrow while `la` stays fp32.
 
-### A4 — Chunk-row blocking *(CONDITIONAL — lowest priority of A1–A4; skip entirely if A3 delivers `C=128`)*
-Flash-attention-style row blocking. Two things make it more than mechanical: the within-chunk
-decay is a cumulative product down rows, so it becomes a sequential scan carrying a `[1,BK]`
-running total instead of one matmul; and query row blocks must revisit earlier key row blocks,
-whose decay depends on their own running total (walking them in order carries it forward, so
-recomputing is cheap).
+GLA also cannot narrow most operands at all: `k/b` reaches **8.8e+07** against fp16's 65504, so
+the score matmul and stage1 update go **NaN**. These are not flash-attention's operands.
+Measured cost where narrowing IS legal: fp16 3.0e-04 relative, bf16 2.4e-03 (device-measured,
+matching the torch study).
 
-**Lowest priority of the four size-unlocking stages, and deliberately capped.** It was the
-headline item in the earlier plan; the 2026-08-21 measurements demoted it, because `C=128`
-fails on operand WIDTH, not working-set size — so tiling rows does not address the thing that
-actually stops it. A3 might, on its own. Chunk size is also a tuning knob, not a model
-dimension: within-chunk work grows linearly with it while state work shrinks, so past ~128 it is
-strictly worse. The useful range is 64–256. Bound it with a clear error rather than chasing
+**What is left of A3:** an opt-in performance lever for `Left`/`Right` pressure and operand
+traffic, at a deliberate ~3e-04 relative cost. Not a size-unlocking stage. Do not schedule it
+as one.
+
+### A4 — Block the two `[C,C]` matmuls over their CONTRACTION axis *(the actual route to `C=128`)*
+Both `[C,C]` matmuls split exactly over their contraction (key-row) axis — verified in fp64,
+residual 2.8e-14 at every block size:
+
+    b       = tril @ la    =  sum over key-row blocks r of  tril[:, r] @ la[r, :]
+    o_intra = scores @ v   =  sum over key-row blocks r of  scores[:, r] @ v[r, :]
+
+The widest tile the cube ever sees becomes `[C, BC]`, so the ring reserve shrinks with it — and
+the reserve is what `C=128` is short of.
+
+**This is NOT the rewrite this section used to describe.** It was written as flash-attention row
+blocking, whose hard part was that "the within-chunk decay is a cumulative product down rows, so
+it becomes a sequential scan carrying a `[1,BK]` running total". That is true when blocking the
+output ROWS. Blocking the CONTRACTION needs no scan at all: `tril[:, r]` already carries the
+right zeros, and every block is an independent product summed afterwards. Mechanical, exact, and
+the same shape of change as A1/A2.
+
+Cost, as with the value split: the per-key-row-block quantities are recomputed once per block,
+so keep the search reaching for it last. Chunk size remains a tuning knob rather than a model
+dimension — within-chunk work grows linearly with it while state work shrinks, so past ~128 it
+is strictly worse. Useful range 64–256; bound it with a clear error rather than chasing
 arbitrary values.
 
 ### A5 — Block sizes from a cost model *(partly relieved)*
