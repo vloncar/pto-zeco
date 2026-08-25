@@ -256,6 +256,12 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   P=2 6.7e-7, P=2 `dk≠dv` 3.5e-7.
 - **B5.1–B5.3 — hardening.** 10-shape sweep 10/10; 16-dispatch back-to-back stress 16/16;
   steady-state latency measured and attributed (orchestration-setup-bound, not compute).
+- **B6 — pypto backward blocked (A6, 2026-08-25).** `C ≤ 32, D ≤ 64` → `C = 64, dk = dv = 128`
+  on hardware: 7.8e-07 at P=1, 5.6e-07 at P=2, and `C=32, dk=dv=64` — which previously did not
+  compile — at 4.3e-07. Forced-blocking check: a head or value split reproduces the unsplit
+  answer to the digit; the key-row split differs only in summation order (3.48e-07 vs
+  3.10e-07). Backward suite green, forward suite 31/31 unchanged by the shared plan search.
+  What still stops `C = 128` is a compiler placement bug, not the budget — see A6 and C4.
 
 ---
 
