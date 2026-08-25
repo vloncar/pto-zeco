@@ -15,7 +15,7 @@ size, and in steady-state cost.
 |---|---|---|---|---|
 | **Forward** (GLA compute + AllScan boundary) | ✅ | ✅ | ✅ HW P=1/2/4 | ✅ HW **`C ≤ 128`**, head dims **to 1024** |
 | **AllScan-collective backward** (building block) | ✅ | ✅ | ✅ HW | ✅ HW |
-| **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2/4** — `C ≤ 32`, `D ≤ 64` (no blocking yet — Task A6) |
+| **ZeCO/GLA operator backward** (dQ,dK,dV,dA) | ✅ | ✅ | ✅ HW P=1/2 | ✅ HW **P=1/2/4** — `C ≤ 64`, head dims **to 128** |
 
 **B4 is correct on HW at P=1, P=2 and P=4.** The pypto backward is one fully-fused
 distributed program, the same shape as the forward. The `P>1` hang that blocked it for weeks
@@ -52,9 +52,10 @@ Fix: give each comm domain a per-rank ordering token, threaded through every com
 (a worker runs one task at a time anyway) and is host-side only. Issue + reproducer + patch in
 `../allscan/issues/pypto-comm-dispatch-ordering/`. See task 4.
 
-It is also *narrower* than the forward in reachable shapes (`C ≤ 32` against the forward's
-`C ≤ 64`): its widest kernel holds about twice the working set. That is a measured ceiling,
-not an estimate, and task 5's job to lift.
+It used to be *narrower* than the forward in reachable shapes (`C ≤ 32`, `D ≤ 64`): its
+widest kernel holds about twice the working set. A6 blocked all three compute kernels and
+lifted it to `C = 64`, `D = 128` — measured on hardware, P=1 and P=2. What still stops
+`C = 128` is not the buffer: see A6 below.
 
 Both correctness gates that dominated this roadmap for months are **closed**: the cross-rank
 producer race and the `N = L//C > 2` loop-carry corruption. Neither was ever a bug in this
@@ -368,9 +369,35 @@ device kernels are built at `prepare()` — and that gap produced two wrong conc
 2026-08-21. `../devtools/t5_split_check.py` detects the known case statically;
 `../devtools/t5_verdict.py` reports bytes, wrong-core ops **and** a real build.
 
-### A6 — Same treatment for the backward
-The four backward kernels have a tighter ceiling than the forward (`grad_o` is the widest in
-either direction) and none of A1–A3 has been applied to them.
+### A6 — Same treatment for the backward *(DONE 2026-08-25)*
+All three compute kernels are blocked, and the ceiling went from `C ≤ 32, D ≤ 64` to
+**`C = 64`, `dk = dv = 128`** — passing on hardware at P=1 (7.8e-07 relative) and P=2
+(5.6e-07), with the whole suite green (16 passed, 1 skipped for the missing 4th card). The
+shape that motivated the task, `C = 32, dk = dv = 64`, did not previously **compile** at all.
+
+Everything A1–A4 did to the forward applies here, plus two things the forward never needed:
+
+* The backward's outputs reduce over DIFFERENT axes — `dV` over head blocks, `dQ`/`dK`/`dA`
+  over value blocks — and this kernel blocks both, so no single loop nest works: whichever
+  loop is outermost, the other output's partial sums would have to outlive it, and that is
+  the very tile being split. `grad_o` and `grad_h` therefore run three passes each, every one
+  ordered by its own reduction, and every write is a plain store.
+* The within-chunk decay `b` is **recorded** by `recompute` instead of being recomputed in
+  each kernel. It costs two matmuls per (chunk, head block) to build and all three kernels
+  need it; once it is a plain load, the adjoint kernels can order their loops by what their
+  reductions want rather than by what the decay costs. That is what makes the extra passes
+  cheap enough to be worth having.
+
+**What stops `C = 128` is a compiler bug, not the budget.** At `C = 128, dk = dv = 128`
+several blockings COMPILE — they fit the vector buffer — and are then rejected because the
+core splitter allocates one Vec tile (the zero seed of dQ's accumulator) inside the cube
+half, which has no vector unit. The device build dies on `set_vector_mask` /
+`copy_gm_to_ubuf_align_b32`, at `prepare()`, long after `ir.compile` returns success; a2a3sim
+does not catch it either. Four attempted workarounds all failed: seeding from a vector-pinned
+tile (`x * 0.0`) trades it for an internal MLIR error, moving the pass, splitting the mixed
+accumulator, and exact-sized zero tensors all leave it where it is. It is now **detected**
+rather than hit: `compile_blocked` inspects the generated cube half and rejects such a plan
+the way it rejects one that overflows the buffer, so the search routes around it. See C4.
 
 ### A7 — F6.5, the fair numbers at realistic sizes
 The point of the whole task. Needs A1–A3, and F6.6 below for a compute-vs-comm split to mean
@@ -423,6 +450,17 @@ but a declared `@pl.function(type=InCore)` has none and adding one fails. `Expan
 reads it off a **function attribute**. Worse, the non-deprecated `pl.func_attr` accepts only a
 **literal** — a shape-derived depth reaches the pass as an `ir::Expr` and is rejected — so the
 only route that takes a computed value is the deprecated `attrs={...}` decorator form.
+
+### C4 — The core splitter puts a vector tile on the cube core
+Found by A6, characterised, not yet written up. At some blockings the splitter allocates the
+zero seed of a matmul accumulator — a `TileType::Vec` tile — inside the `#if defined(__DAV_CUBE__)`
+half of a mixed kernel. The cube has no vector unit, so the DEVICE build fails
+(`set_vector_mask` / `copy_gm_to_ubuf_align_b32` "does not support the given target feature")
+at `prepare()`, long after `ir.compile` has returned success; a2a3sim passes too. It is
+plan-dependent: the same kernel at 1 or 2 head blocks is clean and at 2x2x2 is not. This is
+the same family as C1 and probably the same defect. Detector:
+`gla/implementations/pypto/fused_program.py::cube_side_vector_ops` and
+`../devtools/a6_split_check.py`; it is what keeps the backward at `C = 64`.
 
 ### C3 — Already filed, awaiting review
 pypto **#2398** (per-rank comm ordering token; 14 checks green) and simpler **#1938** (L3

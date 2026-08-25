@@ -6,6 +6,10 @@ kernels, no host round-trip (see :mod:`gla.implementations.pypto.fused_backward_
 ``P=1`` is the native single-rank path (no boundary, both rings gone); ``P>=2`` exercises
 the full SP path, including the reverse ring whose message *is* the neighbour's adjoint.
 
+Every kernel is blocked (A6), and which blocking a shape lands on is chosen by a search, so
+these cases also cover the blocked paths: a shape that needs no splitting runs the same code
+at one block, and the wider shapes exercise the head, value and key-row splits together.
+
 Checked against :func:`gla.common.expected_gla_backward`, the analytic golden that
 ``gla/tests/test_gla_backward.py`` independently cross-checks against ``torch.autograd``.
 
@@ -92,19 +96,23 @@ def test_pypto_zeco_backward(test_config, device_ids, P):
         f"on {nm}")
 
 
-# Shapes. The backward's `grad_o` is the widest kernel in either direction (three [C,C]
-# tiles plus ~12 [C,dk] and ~6 [dk,dv] tiles live at once), so it is expected to top out
-# BELOW the forward's C=D=64 — these bound what actually fits, and a shape that stops
-# compiling should be treated as the vector-buffer ceiling moving, not as a silent
-# regression. Head dims below C are included deliberately: they are the shapes the carried
-# pto-isa local-slot patch (MR !1457) protects, and the backward hits the `N < M` matmul
-# predicate in more places than the forward does.
+# Shapes. `grad_o` used to be the widest kernel in either direction, which capped the whole
+# backward at C=32 / D=64 — at C=32, dk=dv=64 it overflowed the vector buffer by about 1 KB
+# and would not compile at all. A6 blocks all three compute kernels, so the ceiling now moves
+# with the blocking the search picks rather than with the shape. A shape that stops compiling
+# should be treated as that ceiling moving, not as a silent regression.
+#
+# Head dims below C are included deliberately: they are the shapes the carried pto-isa
+# local-slot patch (MR !1457) protects, and the backward hits the `N < M` matmul predicate in
+# more places than the forward does.
 SIZES = [
     (128, 32, 32, 32),    # square, N=4 chunks
     (128, 32, 64, 32),    # dk != dv, both >= C
     (128, 32, 32, 64),    # the other rectangle
     (128, 16, 16, 16),    # small C, N=8 chunks — exercises the reverse walk
     (128, 32, 16, 32),    # dk < C — carried-patch regression guard
+    (128, 32, 64, 64),    # A6: the shape that would not compile before it
+    (256, 64, 128, 128),  # A6: chunk 64 with 128-wide head dims (head=4, value=2)
 ]
 
 

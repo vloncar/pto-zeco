@@ -93,6 +93,8 @@ fixed upstream).
 
 from __future__ import annotations
 
+import pathlib
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -201,9 +203,45 @@ def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
         f"got {type(compiled).__name__}.")
 
 
-def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
-                          plans=None, log=None):
-    """Compile the fused forward, picking the cheapest blocking that fits the vector buffer.
+# The vector unit's tiles live in UB, which the cube core cannot address. So the test for
+# "this kernel will not build" is the presence of a VEC-type tile inside the cube region --
+# not the op names. Op names mislead in both directions: a cube-side ``TSTORE`` is legitimate
+# (a matmul result going straight from the accumulator to GM), while a cube-side ``TLOAD`` is
+# legitimate too (a matmul operand staged into L1) unless its destination is a Vec tile.
+# Verified against six builds of the same kernel: the two that failed to build had exactly one
+# Vec tile on the cube side, the four that ran had none.
+_CUBE_VEC_TILE = "TileType::Vec"
+
+
+def cube_side_vector_ops(output_dir) -> list[str]:
+    """Vector tiles the code generator put on the cube core, which has no vector unit.
+
+    ``ir.compile`` does not catch this: the device kernels are built at ``prepare()``, and
+    only there does it fail ("'copy_gm_to_ubuf_align_b32' / 'set_vector_mask' ... does not
+    support the given target feature"). a2a3sim does not catch it either. But ``ir.compile``
+    WRITES the generated .cpp, so it is detectable statically.
+
+    Which loop nest lands on which core depends on the blocking -- an accumulator seeded by a
+    load has no cube work in it and can be assigned either way -- so this is a property of the
+    PLAN, not of the kernel. That is why the plan search consults it rather than the caller.
+    """
+    if output_dir is None:
+        return []
+    out = []
+    for cpp in sorted(pathlib.Path(output_dir).rglob("kernels/aic/*.cpp")):
+        src = cpp.read_text().splitlines()
+        try:
+            s = next(i for i, l in enumerate(src) if "__DAV_CUBE__" in l)
+            e = next(i for i, l in enumerate(src) if "#endif // __DAV_CUBE__" in l)
+        except StopIteration:
+            continue
+        out += [f"{cpp.name}:{src[i - 1].strip()[9:].strip() or 'vec tile'}"
+                for i in range(s, e) if _CUBE_VEC_TILE in src[i]]
+    return out
+
+
+def compile_blocked(build_one, C, dk, dv, *, distributed, plans=None, log=None, what="kernel"):
+    """Compile ``build_one(nb, nv, slot, rb, nc)``, keeping the cheapest blocking that fits.
 
     Whether a shape fits is not something to hardcode a table for: it depends on the chunk
     size, both head dims, the ring depth and the compiler's own packing, and it moves when any
@@ -215,17 +253,21 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
     error and is re-raised immediately -- a search that swallows everything would turn a
     genuine miscompile into a confusing "no plan fits".
 
-    Returns:
-        ``(compiled, (head_blocks, value_blocks, ring_depth, ring_blocks))`` -- the plan is
-        returned so callers can record which one was used rather than guess.
-    """
-    from pypto import ir
+    Shared by the forward and the backward: the levers are the same and so is the buffer they
+    compete for, and the backward is the direction where a bad search shows up as a shape that
+    simply cannot be run.
 
-    plans = list(plans if plans is not None else blocking_plans(C, dk, dv, distributed=P > 1))
+    Returns:
+        ``(compiled, (head_blocks, value_blocks, ring_depth, ring_blocks, key_row_blocks))``
+        -- the plan is returned so callers can record which one was used rather than guess.
+    """
+    plans = list(plans if plans is not None else blocking_plans(C, dk, dv,
+                                                                distributed=distributed))
     assert plans, (f"no legal blocking for dk={dk} dv={dv} "
                    f"(block widths must be a multiple of {TILE_UNIT})")
     tried = []
     seen = {}
+    why = {}
 
     def attempt(nb, nv, slot, rb, nc):
         """Compile one plan. Returns the compiled program, or None if it does not fit.
@@ -233,25 +275,32 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
         Memoised: the group feasibility probe below deliberately compiles a plan the walk may
         reach again, and each attempt costs seconds.
         """
-        if (nb, nv, slot, rb, nc) in seen:
-            return seen[(nb, nv, slot, rb, nc)]
-        program = build_fused_forward_program(L, C, dk, dv, rb, P, nb, nv, slot, nc)
-        kwargs = {"platform": platform}
-        if distributed_config is not None:
-            kwargs["distributed_config"] = distributed_config
+        key = (nb, nv, slot, rb, nc)
+        if key in seen:
+            return seen[key]
         try:
-            compiled = ir.compile(program, **kwargs)
+            compiled = build_one(nb, nv, slot, rb, nc)
         except Exception as exc:  # noqa: BLE001 -- narrowed on the message just below
             if "buffer usage" not in str(exc) or "exceeds platform limit" not in str(exc):
                 raise
-            tried.append((nb, nv, slot, rb, nc, str(exc).split("exceeds")[0].strip()))
-            if log is not None:
-                log(f"blocking plan head_blocks={nb} value_blocks={nv} ring_depth={slot} "
-                    f"ring_blocks={rb} key_row_blocks={nc} does not fit")
-            seen[(nb, nv, slot, rb, nc)] = None
-            return None
-        seen[(nb, nv, slot, rb, nc)] = compiled
+            return reject(key, "buffer", str(exc).split("exceeds")[0].strip())
+        # A plan can compile and still not BUILD. Catch that here rather than at prepare(),
+        # where it is a crash in the middle of a run instead of one more rejected plan.
+        bad = cube_side_vector_ops(getattr(compiled, "output_dir", None))
+        if bad:
+            return reject(key, "placement", f"vector work on the cube core ({bad[0]})")
+        seen[key] = compiled
         return compiled
+
+    def reject(key, kind, detail):
+        tried.append(key + (detail,))
+        why[key] = kind
+        if log is not None:
+            nb, nv, slot, rb, nc = key
+            log(f"blocking plan head_blocks={nb} value_blocks={nv} ring_depth={slot} "
+                f"ring_blocks={rb} key_row_blocks={nc} rejected: {detail}")
+        seen[key] = None
+        return None
 
     def take(nb, nv, slot, rb, nc, compiled):
         if log is not None and (nb, nv, slot, rb, nc) != plans[0]:
@@ -275,8 +324,11 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
         compiled = attempt(*head)
         if compiled is not None:
             return take(*head, compiled)
+        # Only a BUFFER overflow at the floor rules the group out: the footprint is monotone
+        # in the two inner levers, but which core a loop nest lands on is not, so a placement
+        # rejection says nothing about the rest of the group.
         floor = (max(q[0] for q in group), nv, min(q[2] for q in group), rb, nc)
-        if attempt(*floor) is None:
+        if attempt(*floor) is None and why.get(floor) == "buffer":
             if log is not None:
                 log(f"value_blocks={nv} ring_blocks={rb} key_row_blocks={nc} cannot fit at "
                     f"any head blocking or cross-core ring depth; skipping "
@@ -291,10 +343,23 @@ def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
         f"key_row_blocks={nc}: {why}"
         for nb, nv, slot, rb, nc, why in tried)
     raise ValueError(
-        f"no blocking plan fits C={C} dk={dk} dv={dv} on {platform}; tried:\n  {detail}\n"
-        "The chunk dim C is not blocked yet, so a large C overflows whatever the head and "
-        "value dims do."
-    )
+        f"no blocking plan fits the {what} at C={C} dk={dk} dv={dv}; tried:\n  {detail}")
+
+
+def compile_fused_forward(L, C, dk, dv, P, *, platform, distributed_config=None,
+                          plans=None, log=None):
+    """Compile the fused forward at the cheapest blocking that fits (see :func:`compile_blocked`)."""
+    from pypto import ir
+
+    def build_one(nb, nv, slot, rb, nc):
+        program = build_fused_forward_program(L, C, dk, dv, rb, P, nb, nv, slot, nc)
+        kwargs = {"platform": platform}
+        if distributed_config is not None:
+            kwargs["distributed_config"] = distributed_config
+        return ir.compile(program, **kwargs)
+
+    return compile_blocked(build_one, C, dk, dv, distributed=P > 1, plans=plans, log=log,
+                           what="fused forward")
 
 
 def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,

@@ -68,7 +68,7 @@ if _REPO_ROOT not in sys.path:
 
 from gla.common import ZeCoImpl  # noqa: E402
 from gla.implementations.pypto.fused_backward_program import (  # noqa: E402
-    build_fused_backward_program,
+    compile_fused_backward,
 )
 from gla.implementations.pypto.fused_program import (  # noqa: E402
     build_fused_forward_program,
@@ -143,7 +143,6 @@ class PyPtoZeCo(ZeCoImpl):
         self._zerov = torch.zeros(dk, 1, dtype=torch.float32).share_memory_()
         self._onev = torch.ones(dk, 1, dtype=torch.float32).share_memory_()
 
-        from pypto import ir
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
         dist_cfg = DistributedConfig(device_ids=self.device_ids, num_sub_workers=0)
@@ -165,6 +164,7 @@ class PyPtoZeCo(ZeCoImpl):
         # be benchmarked or run at all. Only the *buffers* below must be eager (they have to
         # exist before prepare() forks the chip children); compiling does not.
         self._bcompiled = None
+        self.bblocking = None
         self._bcompile_args = (L, C, dk, dv, P, platform, dist_cfg)
 
         # Prepare-once: for the distributed path, allocate the shared IO buffers BEFORE
@@ -235,10 +235,11 @@ class PyPtoZeCo(ZeCoImpl):
         """
         if self._bcompiled is not None:
             return
-        from pypto import ir
         L, C, dk, dv, P, platform, dist_cfg = self._bcompile_args
-        self._bcompiled = ir.compile(build_fused_backward_program(L, C, dk, dv, 1, P),
-                                     platform=platform, distributed_config=dist_cfg)
+        # Its own search, not the forward's plan: the two directions have different working
+        # sets, so the cheapest setting that fits one is not the cheapest that fits the other.
+        self._bcompiled, self.bblocking = compile_fused_backward(
+            L, C, dk, dv, P, platform=platform, distributed_config=dist_cfg)
 
     def _dispatch(self):
         """Run one fused-forward dispatch on the prepared worker (inputs already staged)."""

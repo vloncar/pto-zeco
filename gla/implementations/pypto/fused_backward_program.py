@@ -3,11 +3,12 @@
 The mirror of :mod:`.fused_program`. Per rank ``r`` (device ``r``) the single ``host_orch``
 runs, with no host round-trip between any of them:
 
-1. **recompute** (InCore) — re-runs the forward chunk scan, but *snapshotting* the per-chunk
-   pre-state ``S_prev[n]`` and cumulative decay ``c_prev[n]`` that the backward reads. Also
-   emits ``S_total``, the forward ring's input. (Activations are recomputed rather than
-   carried: :meth:`gla.common.ZeCoImpl.backward` is stateless by contract, and ``[N,dk,dv]``
-   of snapshots is cheaper to regenerate than to ship.)
+1. **recompute** (InCore) — re-runs the forward chunk scan, but *recording* what the two
+   adjoint kernels re-read: the per-chunk pre-state ``S_prev[n]``, the cumulative decay
+   ``c_prev[n]``, and the within-chunk decay ``b = exp(tril @ log A)``. Also emits
+   ``S_total``, the forward ring's input. (Activations are recomputed rather than carried:
+   :meth:`gla.common.ZeCoImpl.backward` is stateless by contract, and ``[N,dk,dv]`` of
+   snapshots is cheaper to regenerate than to ship.)
 2. **AllScan ring** (first/middle/last) — the same forward boundary scan as the forward
    program, giving each rank its ``S_recv``. Needed twice over: ``grad_o`` reconstructs
    ``H_n = S_prev[n] + c_prev[n]*S_recv``, and the reverse ring reduces ``dgamma`` against it.
@@ -17,9 +18,10 @@ runs, with no host round-trip between any of them:
    ``dS_recv`` that feeds the reverse ring.
 4. **reverse ring** (source/middle/terminal) — the adjoint of the boundary scan, flowing
    ``r -> r-1``, producing ``dS_total[r]`` and ``dgamma[r]``.
-5. **grad_h** (InCore) — the reverse chunk recurrence: carries the state adjoint ``dSloc``
-   and decay adjoint ``dcvec`` backwards over chunks, adds the state-path halves of
-   ``dK``/``dV``, and finishes the gate backward into ``dA``.
+5. **grad_h** (InCore) — the reverse chunk recurrence. It *records* the state adjoint
+   ``dSloc`` and decay adjoint ``dcvec`` per chunk rather than carrying them through the
+   work, then adds the state-path halves of ``dK``/``dV`` and finishes the gate backward
+   into ``dA`` from those records.
 
 ``P == 1`` is a native path (:func:`_build_p1_backward_program`): no boundary, so phases 2
 and 4 vanish and 1/3/5 run from a zero ``S_recv`` / ``dS_total`` / ``dgamma``.
@@ -70,13 +72,42 @@ whole-tile ``col_expand_add`` applied *after* the reverse cumulative sum: row ``
 ``>= t`` for every ``t``, so it contributes the same constant to every row. The reverse
 cumsum itself is a matmul by an upper-triangular ones matrix, not a scan.
 
-Vector-buffer budget
---------------------
-``grad_o`` is the widest kernel in either direction — three ``[C,C]`` tiles, ~12 ``[C,dk]``
-row tiles and ~6 ``[dk,dv]`` state tiles live at once, roughly double the forward's stage2,
-which itself sits at 96% of the 184 KB budget at ``C=D=64``. The backward therefore tops out
-below the forward; the reachable set is measured rather than assumed (see the B4 entry in
-ROADMAP.md). Blocking it further is task 5's job, and the same DK/DV design serves both.
+Vector-buffer budget (A6)
+-------------------------
+``grad_o`` used to be the widest kernel in either direction — three ``[C,C]`` tiles, ~12
+``[C,dk]`` row tiles and ~6 ``[dk,dv]`` state tiles live at once — which capped the whole
+backward at ``C<=32, D<=64`` while the forward reached ``C=128, D=1024``. All four of the
+forward's levers apply here too, plus two things the forward never needed:
+
+* **no carry.** ``recompute``'s state and ``grad_h``'s reverse walk are both diagonal in the
+  head and value dims, so each blocks to ``[BK, BV]`` once its block loops sit OUTSIDE the
+  chunk scan. ``grad_o``'s only carry was ``dS_recv = sum_n dH[n]*c_prev[n]``, a plain sum
+  over chunks: it moved to a small pass of its own, so the main pass carries nothing at all
+  and its chunks are mutually independent.
+* **head / value / key-row blocking** exactly as the forward: nothing contracts over the
+  value dim, both ``[C,C]`` products (the within-chunk decay and the score matrix) block over
+  their contraction axis with ``tril[:, r]`` carrying the causal zeros, and the reverse
+  cumulative sum blocks the same way with ``triu[:, r]``.
+* **more passes, each ordered by its own reduction.** The backward's outputs reduce over
+  DIFFERENT axes — ``dV`` sums over head blocks, ``dQ``/``dK``/``dA`` over value blocks — and
+  this kernel blocks both. One loop nest would have to hold one of those sums across its
+  outer loop, which is the very tile being split. So ``grad_o`` and ``grad_h`` each run three
+  passes over the chunks, and every write is a plain store: nothing accumulates through GM.
+* **the decay is recorded, not recomputed.** All three kernels need ``b``, it costs two
+  matmuls per (chunk, head block) to build, and once it is a plain load the adjoint kernels
+  can order their loops by what their reductions want instead of by what the decay costs.
+
+**One rule the DSL does not enforce**: seed every accumulator from a zero TENSOR, never from
+``x * 0.0``. A multiply is vector work, and when the accumulator it seeds is consumed by
+matmuls the core splitter may place that multiply on the CUBE half, which has no vector unit;
+the DEVICE build then fails on ``set_vector_mask`` long after ``ir.compile`` has returned
+success, and a2a3sim does not catch it either. The same hazard rules out GM->GM copy passes.
+It is not fully avoidable — at some blockings the splitter puts even a zero-tensor LOAD on the
+cube — so :func:`.fused_program.compile_blocked` inspects the generated cube half and rejects
+such a plan the way it rejects one that overflows the buffer.
+
+The reachable set is measured rather than assumed — see the B4 entry in ROADMAP.md and
+``devtools/a6_compile_probe.py``, which maps it with no NPU at all.
 
 Every distributed / HCCL run must set ``LD_PRELOAD=<cann>/lib64/libhccl.so``.
 """
@@ -86,8 +117,34 @@ from __future__ import annotations
 import pypto.language as pl
 import pypto.language.distributed as pld
 
+from gla.implementations.pypto.fused_program import compile_blocked
 
-def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
+
+def compile_fused_backward(L, C, dk, dv, P, *, platform, distributed_config=None,
+                           plans=None, log=None):
+    """Compile the fused backward at the cheapest blocking that fits the vector buffer.
+
+    Same five levers and the same search as the forward (:func:`.fused_program.compile_blocked`)
+    -- they compete for the same buffer, and the backward is where losing that search shows up
+    as a shape that cannot be run at all rather than merely one that runs slowly.
+
+    Returns ``(compiled, (head_blocks, value_blocks, ring_depth, ring_blocks, key_row_blocks))``.
+    """
+    from pypto import ir
+
+    def build_one(nb, nv, slot, rb, nc):
+        program = build_fused_backward_program(L, C, dk, dv, rb, P, nb, nv, slot, nc)
+        kwargs = {"platform": platform}
+        if distributed_config is not None:
+            kwargs["distributed_config"] = distributed_config
+        return ir.compile(program, **kwargs)
+
+    return compile_blocked(build_one, C, dk, dv, distributed=P > 1, plans=plans, log=log,
+                           what="fused backward")
+
+
+def _build_p1_backward_program(L: int, C: int, dk: int, dv: int,
+                               nb: int = 1, nv: int = 1, slot: int = 4, nc: int = 1):
     """P == 1 native path: recompute -> grad_o -> grad_h, all from a zero boundary.
 
     A single rank has no neighbour, so ``S_recv``, ``dS_total`` and ``dgamma`` are all zero
@@ -98,10 +155,14 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     N = L // C
     P, DK, DV = 1, dk, dv
+    NB, BK, NV, BV, NC, BC, SLOT = nb, dk // nb, nv, dv // nv, nc, C // nc, slot
+    # One zero tile source for every accumulator seed. The widest seed is [C, BK] or
+    # [C, BC], so it has to be at least as wide as both the head block and the chunk.
+    ZW = max(C, dk)
 
     @pl.program
     class FusedBackwardP1Program:
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_recompute(
             self,
             A: pl.Tensor[[L, DK], pl.FP32],
@@ -110,47 +171,95 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
             onev: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
             Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
             Cprev: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
+            Bs: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ):
-            """Forward chunk scan, snapshotting S_prev[n] / c_prev[n] before each update."""
-            tril_t = pl.load(tril, [0, 0], [C, C])
-            s_init = pl.load(zero, [0, 0], [DK, DV])
-            c_init = pl.load(onev, [0, 0], [DK, 1])
-            snap = Ssnap
-            cp = Cprev
-            for n, (s_run, c_run) in pl.range(0, N, init_values=(s_init, c_init)):
-                off = n * C
-                soff = n * DK
-                k = pl.load(Kmat, [off, 0], [C, DK])
-                v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                snap = pl.store(s_run, [soff, 0], snap)
-                cp = pl.store(c_run, [soff, 0], cp)
-                kb = pl.div(k, b)
-                kv = pl.matmul(pl.transpose(kb, 0, 1), v, out_dtype=pl.FP32)
-                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
-                c_new = pl.mul(c_run, gamma)
-                s_fin, c_fin = pl.yield_(s_new, c_new)
-            return snap, cp, pl.store(s_fin, [0, 0], Stot)
+            """Forward chunk scan, recording everything the two adjoint kernels re-read.
 
-        @pl.function(type=pl.FunctionType.InCore)
+            Four outputs: the per-chunk snapshot ``Ssnap[n] = S_n(0)``, the running decay
+            ``Cprev[n] = prod_{m<n} gamma_m``, the WITHIN-chunk decay ``Bs = exp(tril @ log A)``
+            and the end-of-slice state ``Stot`` that feeds the ring.
+
+            ``Bs`` is recorded rather than recomputed. All three kernels need it, it costs two
+            matmuls per (chunk, head block) to build, and once it is a plain load the adjoint
+            kernels can order their loops by what their REDUCTIONS want instead of by what the
+            decay costs -- which is what lets dV be stored rather than accumulated.
+
+            Head-dim block OUTSIDE the chunk scan, exactly as the forward's stage1: nothing
+            here contracts over the head dim (``kb^T @ v`` has it as the OUTPUT row dim), so
+            block j's state depends only on block j for the whole slice. That makes the live
+            carry [BK, BV] instead of [dk, dv] -- three copies of a [128, 128] carry are
+            196608 B of a 188416 B buffer, which no amount of inner blocking can move.
+            """
+            snaps = Ssnap
+            cp = Cprev
+            bs = Bs
+            tot = Stot
+            for j in pl.range(0, NB):
+                dof = j * BK
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    s0 = pl.load(zero, [dof, vof], [BK, BV])
+                    c0 = pl.load(onev, [dof, 0], [BK, 1])
+                    for n, (s_run, c_run) in pl.range(0, N, init_values=(s0, c0)):
+                        off = n * C
+                        soff = n * DK
+                        # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
+                        snaps = pl.store(s_run, [soff + dof, vof], snaps)
+                        cp = pl.store(c_run, [soff + dof, 0], cp)
+                        k_b = pl.load(Kmat, [off, dof], [C, BK])
+                        la_b = pl.log(pl.load(A, [off, dof], [C, BK]))
+                        # Decay, blocked over the KEY-ROW (contraction) axis: ``tril[:, r]``
+                        # already carries the causal zeros, so each block is an independent
+                        # product, no scan is needed, and the MAC count is unchanged.
+                        zb = pl.load(zc, [0, 0], [C, BK])
+                        for r, (b_acc,) in pl.range(0, NC, init_values=(zb,)):
+                            rof = r * BC
+                            tril_r = pl.load(tril, [0, rof], [C, BC])
+                            la_r = pl.log(pl.load(A, [off + rof, dof], [BC, BK]))
+                            b_fin = pl.yield_(
+                                pl.add(b_acc, pl.matmul(tril_r, la_r, out_dtype=pl.FP32)))
+                        b_b = pl.exp(b_fin)
+                        # Written once per value block with the same numbers, like Cprev: a
+                        # device conditional to write it only at w == 0 costs more than the
+                        # store does.
+                        bs = pl.store(b_b, [off, dof], bs)
+                        gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                        kbt_b = pl.transpose(pl.div(k_b, b_b), 0, 1)
+                        # (K/b)^T @ V contracts over the chunk rows too, so it blocks the same
+                        # way and for the same reason.
+                        zkv = pl.load(zero, [dof, vof], [BK, BV])
+                        for r2, (kv_acc,) in pl.range(0, NC, init_values=(zkv,)):
+                            rof2 = r2 * BC
+                            v_r = pl.load(Vmat, [off + rof2, vof], [BC, BV],
+                                          target_memory=pl.MemorySpace.Mat)
+                            kbt_r = pl.tile.slice(kbt_b, [BK, BC], [0, rof2])
+                            kv_b = pl.yield_(
+                                pl.add(kv_acc, pl.matmul(kbt_r, v_r, out_dtype=pl.FP32)))
+                        # S = gamma * (S + (K/b)^T @ V), exactly as the reference factors it.
+                        s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
+                        c_new = pl.mul(c_run, gamma_b)
+                        s_fin, c_fin = pl.yield_(s_new, c_new)
+                    tot = pl.store(s_fin, [dof, vof], tot)
+            return snaps, cp, bs, tot
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_grad_o(
             self,
             Q: pl.Tensor[[L, DK], pl.FP32],
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
-            A: pl.Tensor[[L, DK], pl.FP32],
             dOmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dQ: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dKo: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dVo: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
@@ -159,61 +268,144 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             dCp: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
             dSrecv: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ):
-            """Output-stage adjoints; chunks independent apart from the dS_recv sum."""
-            tril_t = pl.load(tril, [0, 0], [C, C])
-            srecv_t = pl.load(Srecv, [0, 0], [DK, DV])
-            acc0 = pl.load(zero, [0, 0], [DK, DV])
+            """Output-stage adjoints, in three passes over the chunks::
+
+                H_n     = S_prev[n] + c_prev[n]*S_recv     reconstruct's inter-chunk history
+                dQt     = dO @ H_n^T  +  dsc @ (k/b)
+                dH_n    = (q*b)^T @ dO                     -> the state stage's dS_prev[n]
+                dsc     = (dO @ v^T) * tril                intra-chunk masked attention
+                dV_o    = scores^T @ dO ,  dK_o = (dsc^T @ (q*b)) / b
+                dg_cs_o = dQ*q - dK_o*k                    log-domain gate grad
+
+            Three passes because the outputs reduce over DIFFERENT axes and this kernel blocks
+            both: dQ and dK sum over value blocks, dV sums over head blocks. One loop nest
+            would have to hold one of those sums across its outer loop -- which is the very
+            tile being split -- so each pass orders its loops for its own reduction, and every
+            write is a plain store.
+
+            The within-chunk decay is READ from ``Bs`` rather than recomputed; that is what
+            makes a second and third pass cheap enough to be worth having.
+            """
             oq = dQ
             ok = dKo
             ov = dVo
             og = dgcso
             oh = dH
             oc = dCp
-            for n, (acc,) in pl.range(0, N, init_values=(acc0,)):
+            # ---- pass 1: dQ, dK_o, dg_cs, dH, dc_prev. Head blocks outside, so the value
+            # sums that dQ and dK need land in tiles.
+            for n in pl.range(0, N):
                 off = n * C
                 soff = n * DK
-                q = pl.load(Q, [off, 0], [C, DK])
-                k = pl.load(Kmat, [off, 0], [C, DK])
-                v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                do = pl.load(dOmat, [off, 0], [C, DV])
-                la = pl.log(a)
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                qt = pl.mul(q, b)
-                kb = pl.div(k, b)
-                scores = pl.mul(pl.matmul(qt, pl.transpose(kb, 0, 1), out_dtype=pl.FP32), tril_t)
-                sprev = pl.load(Ssnap, [soff, 0], [DK, DV])
-                cprev = pl.load(Cprev, [soff, 0], [DK, 1])
-                hmat = pl.add(sprev, pl.tile.row_expand_mul(srecv_t, cprev))
-                dqt = pl.matmul(do, pl.transpose(hmat, 0, 1), out_dtype=pl.FP32)
-                dh_n = pl.matmul(pl.transpose(qt, 0, 1), do, out_dtype=pl.FP32)
-                oh = pl.store(dh_n, [soff, 0], oh)
-                tmp = pl.tile.create([DK, DV], pl.FP32)
-                oc = pl.store(pl.row_sum(pl.mul(dh_n, srecv_t), tmp), [soff, 0], oc)
-                acc_n = pl.add(acc, pl.tile.row_expand_mul(dh_n, cprev))
-                dsc = pl.mul(pl.matmul(do, pl.transpose(v, 0, 1), out_dtype=pl.FP32), tril_t)
-                ov = pl.store(
-                    pl.matmul(pl.transpose(scores, 0, 1), do, out_dtype=pl.FP32), [off, 0], ov)
-                dqt2 = pl.add(dqt, pl.matmul(dsc, kb, out_dtype=pl.FP32))
-                dkin = pl.matmul(pl.transpose(dsc, 0, 1), qt, out_dtype=pl.FP32)
-                dq_n = pl.mul(dqt2, b)
-                dko_n = pl.div(dkin, b)
-                oq = pl.store(dq_n, [off, 0], oq)
-                ok = pl.store(dko_n, [off, 0], ok)
-                og = pl.store(pl.sub(pl.mul(dq_n, q), pl.mul(dko_n, k)), [off, 0], og)
-                acc_fin = pl.yield_(acc_n)
-            return oq, ok, ov, og, oh, oc, pl.store(acc_fin, [0, 0], dSrecv)
-
-        @pl.function(type=pl.FunctionType.InCore)
+                for j in pl.range(0, NB):
+                    dof = j * BK
+                    q_b = pl.load(Q, [off, dof], [C, BK])
+                    k_b = pl.load(Kmat, [off, dof], [C, BK])
+                    b_b = pl.load(Bs, [off, dof], [C, BK])
+                    qt_b = pl.mul(q_b, b_b)
+                    kb_b = pl.div(k_b, b_b)
+                    cprev = pl.load(Cprev, [soff + dof, 0], [BK, 1])
+                    # Accumulators are seeded from a zero TENSOR, never from ``x * 0.0``: a
+                    # multiply is vector work, and when the accumulator it seeds is consumed
+                    # by matmuls the splitter may put that multiply on the CUBE half, which
+                    # has no vector unit. Loading zeros is what the forward does.
+                    dq0 = pl.load(zc, [0, 0], [C, BK])
+                    dc0 = pl.load(zerov, [0, 0], [BK, 1])
+                    # ---- inter-chunk half: dQ's state term, dH_n and dc_prev[n]. Nothing
+                    # here touches the key rows, so it is a plain sum over value blocks.
+                    for w, (dq_a, dc_a) in pl.range(0, NV, init_values=(dq0, dc0)):
+                        vof = w * BV
+                        do_w = pl.load(dOmat, [off, vof], [C, BV])
+                        srecv = pl.load(Srecv, [dof, vof], [BK, BV])
+                        hmat = pl.add(pl.load(Ssnap, [soff + dof, vof], [BK, BV]),
+                                      pl.tile.row_expand_mul(srecv, cprev))
+                        dq_n = pl.add(dq_a, pl.matmul(do_w, pl.transpose(hmat, 0, 1),
+                                                      out_dtype=pl.FP32))
+                        dh_n = pl.matmul(pl.transpose(qt_b, 0, 1), do_w, out_dtype=pl.FP32)
+                        oh = pl.store(dh_n, [soff + dof, vof], oh)
+                        tmp = pl.tile.create([BK, BV], pl.FP32)
+                        dc_n = pl.add(dc_a, pl.row_sum(pl.mul(dh_n, srecv), tmp))
+                        dq_s, dc_s = pl.yield_(dq_n, dc_n)
+                    oc = pl.store(dc_s, [soff + dof, 0], oc)
+                    # ---- within-chunk half. Key-row blocks OUTSIDE value blocks: a key
+                    # block's dK is finished once its value sum finishes, so it is stored
+                    # straight out and never needs a [C, dk] accumulator.
+                    for r2, (dq_b,) in pl.range(0, NC, init_values=(dq_s,)):
+                        rof2 = r2 * BC
+                        tril_2 = pl.load(tril, [0, rof2], [C, BC])
+                        kb_r = pl.tile.slice(kb_b, [BC, BK], [rof2, 0])
+                        b_r = pl.tile.slice(b_b, [BC, BK], [rof2, 0])
+                        dk0 = pl.load(zc, [0, 0], [BC, BK])
+                        for w2, (dq_c, dk_c) in pl.range(0, NV, init_values=(dq_b, dk0)):
+                            vof2 = w2 * BV
+                            do_w2 = pl.load(dOmat, [off, vof2], [C, BV])
+                            v_r = pl.load(Vmat, [off + rof2, vof2], [BC, BV])
+                            dsc = pl.mul(pl.matmul(do_w2, pl.transpose(v_r, 0, 1),
+                                                   out_dtype=pl.FP32), tril_2)
+                            dq_d = pl.add(dq_c, pl.matmul(dsc, kb_r, out_dtype=pl.FP32))
+                            dk_d = pl.add(dk_c, pl.matmul(pl.transpose(dsc, 0, 1), qt_b,
+                                                          out_dtype=pl.FP32))
+                            dq_e, dk_e = pl.yield_(dq_d, dk_d)
+                        ok = pl.store(pl.div(dk_e, b_r), [off + rof2, dof], ok)
+                        dq_f = pl.yield_(dq_e)
+                    dq_out = pl.mul(dq_f, b_b)
+                    oq = pl.store(dq_out, [off, dof], oq)
+                    # dg_cs = dQ*q - dK_o*k needs this head block's dK whole, and the key-row
+                    # loop wrote it out in pieces; read it back rather than keeping a [C, BK]
+                    # accumulator alive across that loop.
+                    dko_b = pl.load(ok, [off, dof], [C, BK])
+                    og = pl.store(pl.sub(pl.mul(dq_out, q_b), pl.mul(dko_b, k_b)),
+                                  [off, dof], og)
+            # ---- pass 2: dV_o. HEAD blocks innermost, so the score block's head-block sum is
+            # a tile accumulation and each key-row block's dV is complete when it is stored.
+            # The mask is applied once, to the finished sum -- masking is elementwise, hence
+            # linear, so no [C, C] score matrix is ever built.
+            for n2 in pl.range(0, N):
+                of2 = n2 * C
+                for r3 in pl.range(0, NC):
+                    rf3 = r3 * BC
+                    sc0 = pl.load(zc, [0, 0], [C, BC])
+                    for j3, (sc_a,) in pl.range(0, NB, init_values=(sc0,)):
+                        df3 = j3 * BK
+                        b_3 = pl.load(Bs, [of2, df3], [C, BK])
+                        qt_3 = pl.mul(pl.load(Q, [of2, df3], [C, BK]), b_3)
+                        kb_3 = pl.div(pl.load(Kmat, [of2, df3], [C, BK]), b_3)
+                        kbt_3 = pl.tile.slice(pl.transpose(kb_3, 0, 1), [BK, BC], [0, rf3])
+                        sc_f = pl.yield_(
+                            pl.add(sc_a, pl.matmul(qt_3, kbt_3, out_dtype=pl.FP32)))
+                    sc_m = pl.mul(sc_f, pl.load(tril, [0, rf3], [C, BC]))
+                    sct = pl.transpose(sc_m, 0, 1)
+                    for w3 in pl.range(0, NV):
+                        vf3 = w3 * BV
+                        do_3 = pl.load(dOmat, [of2, vf3], [C, BV])
+                        ov = pl.store(pl.matmul(sct, do_3, out_dtype=pl.FP32),
+                                      [of2 + rf3, vf3], ov)
+            # ---- pass 3: dS_recv = sum_n dH[n] * c_prev[n]. Kept out of pass 1 so that pass
+            # carries no state at all: as a loop carry this is a full [dk, dv] tile live
+            # across the whole kernel, which is exactly what A1 removed from the forward.
+            osr = dSrecv
+            for j2 in pl.range(0, NB):
+                df2 = j2 * BK
+                for w4 in pl.range(0, NV):
+                    vf4 = w4 * BV
+                    a0 = pl.load(zero, [df2, vf4], [BK, BV])
+                    for n3, (a_acc,) in pl.range(0, N, init_values=(a0,)):
+                        sf2 = n3 * DK
+                        dh_r = pl.load(oh, [sf2 + df2, vf4], [BK, BV])
+                        cp_r = pl.load(Cprev, [sf2 + df2, 0], [BK, 1])
+                        a_fin = pl.yield_(pl.add(a_acc, pl.tile.row_expand_mul(dh_r, cp_r)))
+                    osr = pl.store(a_fin, [df2, vf4], osr)
+            return oq, ok, ov, og, oh, oc, osr
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_grad_h(
             self,
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
-            tril: pl.Tensor[[C, C], pl.FP32],
             triu: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             dH: pl.Tensor[[N * DK, DV], pl.FP32],
             dCp: pl.Tensor[[N * DK, 1], pl.FP32],
             dKo: pl.Tensor[[L, DK], pl.FP32],
@@ -221,53 +413,113 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             dgcso: pl.Tensor[[L, DK], pl.FP32],
             dStot: pl.Tensor[[DK, DV], pl.FP32],
             dgam: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dK: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dV: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
             dA: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
+            dSl: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            dCv: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
         ):
-            """Reverse chunk recurrence + gate backward. pl.range only counts up, so the
-            reverse walk is n = N-1-m; the n>0 guard on the carry update is dropped because
-            at n==0 the new carry is dead and an InCore branch costs more than one add."""
-            tril_t = pl.load(tril, [0, 0], [C, C])
-            triu_t = pl.load(triu, [0, 0], [C, C])
-            ds_init = pl.load(dStot, [0, 0], [DK, DV])
-            dc_init = pl.load(dgam, [0, 0], [DK, 1])
+            """State-stage adjoints and the gate backward, in three passes.
+
+            Pass 1 RECORDS the reverse recurrence instead of carrying it through the work:
+            ``dsloc_n = gamma_n*dsloc_{n+1} + dH_n`` is diagonal in both dims, so the walk
+            itself blocks to [BK, BV], and writing each step out frees passes 2 and 3 to order
+            their loops by their own reductions -- which a live carry would forbid. Same trick
+            as A1 in the forward, run backwards.
+
+            Pass 2 takes dK and dA (value sums, so value blocks are innermost); pass 3 takes
+            dV (a head sum, so head blocks are innermost). Both end in a plain store.
+            """
+            osl = dSl
+            ocv = dCv
             okk = dK
             ovv = dV
             oaa = dA
-            for m, (dsloc, dcvec) in pl.range(0, N, init_values=(ds_init, dc_init)):
-                off = (N - 1 - m) * C
-                soff = (N - 1 - m) * DK
-                k = pl.load(Kmat, [off, 0], [C, DK])
-                v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                sprev = pl.load(Ssnap, [soff, 0], [DK, DV])
-                cprev = pl.load(Cprev, [soff, 0], [DK, 1])
-                # Push gamma onto the state ONCE; everything downstream is broadcast-free.
-                # This also detaches the raw iter_arg, which cannot feed a matmul directly.
-                dsl_p = pl.tile.row_expand_mul(dsloc, gamma)
-                dcv_p = pl.mul(dcvec, gamma)
-                kb = pl.div(k, b)
-                dv_h = pl.matmul(kb, dsl_p, out_dtype=pl.FP32)
-                dk_h = pl.div(pl.matmul(v, pl.transpose(dsl_p, 0, 1), out_dtype=pl.FP32), b)
-                dkk = pl.mul(dk_h, k)
-                tmp = pl.tile.create([DK, DV], pl.FP32)
-                c1 = pl.tile.reshape(pl.row_sum(pl.mul(dsl_p, sprev), tmp), [1, DK])
-                c2 = pl.tile.reshape(pl.mul(dcv_p, cprev), [1, DK])
-                corr = pl.add(pl.add(c1, c2), pl.tile.col_sum(dkk))
-                dgcs = pl.sub(pl.load(dgcso, [off, 0], [C, DK]), dkk)
-                rcs = pl.matmul(triu_t, dgcs, out_dtype=pl.FP32)
-                oaa = pl.store(pl.div(pl.tile.col_expand_add(rcs, corr), a), [off, 0], oaa)
-                okk = pl.store(pl.add(pl.load(dKo, [off, 0], [C, DK]), dk_h), [off, 0], okk)
-                ovv = pl.store(pl.add(pl.load(dVo, [off, 0], [C, DV]), dv_h), [off, 0], ovv)
-                dsloc_n = pl.add(dsl_p, pl.load(dH, [soff, 0], [DK, DV]))
-                dcvec_n = pl.add(dcv_p, pl.load(dCp, [soff, 0], [DK, 1]))
-                dsl_f, dcv_f = pl.yield_(dsloc_n, dcvec_n)
-            return okk, ovv, oaa
-
+            for j in pl.range(0, NB):
+                dof = j * BK
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    ds0 = pl.load(dStot, [dof, vof], [BK, BV])
+                    dc0 = pl.load(dgam, [dof, 0], [BK, 1])
+                    for m, (dsloc, dcvec) in pl.range(0, N, init_values=(ds0, dc0)):
+                        off = (N - 1 - m) * C
+                        soff = (N - 1 - m) * DK
+                        la = pl.log(pl.load(A, [off, dof], [C, BK]))
+                        gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [BK, 1]))
+                        # Push gamma onto the state ONCE; everything downstream is
+                        # broadcast-free. This also detaches the raw iter_arg, which cannot
+                        # feed a matmul directly.
+                        dsl_p = pl.tile.row_expand_mul(dsloc, gamma)
+                        dcv_p = pl.mul(dcvec, gamma)
+                        osl = pl.store(dsl_p, [soff + dof, vof], osl)
+                        ocv = pl.store(dcv_p, [soff + dof, 0], ocv)
+                        dsloc_n = pl.add(dsl_p, pl.load(dH, [soff + dof, vof], [BK, BV]))
+                        dcvec_n = pl.add(dcv_p, pl.load(dCp, [soff + dof, 0], [BK, 1]))
+                        dsl_f, dcv_f = pl.yield_(dsloc_n, dcvec_n)
+            # ---- pass 2: dK's state half and the gate gradient.
+            #     dK_h = (v @ (gamma*dS)^T) / b, with the 1/b applied after the value sum.
+            for n in pl.range(0, N):
+                off = n * C
+                soff = n * DK
+                for j2 in pl.range(0, NB):
+                    dof2 = j2 * BK
+                    k_b = pl.load(Kmat, [off, dof2], [C, BK])
+                    a_b = pl.load(A, [off, dof2], [C, BK])
+                    b_b = pl.load(Bs, [off, dof2], [C, BK])
+                    cprev = pl.load(Cprev, [soff + dof2, 0], [BK, 1])
+                    dk0 = pl.load(zc, [0, 0], [C, BK])
+                    c10 = pl.load(zerov, [0, 0], [BK, 1])
+                    for w2, (dk_a, c1_a) in pl.range(0, NV, init_values=(dk0, c10)):
+                        vf2 = w2 * BV
+                        dsl_p = pl.load(osl, [soff + dof2, vf2], [BK, BV])
+                        v_w = pl.load(Vmat, [off, vf2], [C, BV])
+                        sprev = pl.load(Ssnap, [soff + dof2, vf2], [BK, BV])
+                        dk_n = pl.add(dk_a, pl.matmul(v_w, pl.transpose(dsl_p, 0, 1),
+                                                      out_dtype=pl.FP32))
+                        tmp = pl.tile.create([BK, BV], pl.FP32)
+                        c1_n = pl.add(c1_a, pl.row_sum(pl.mul(dsl_p, sprev), tmp))
+                        dk_s, c1_s = pl.yield_(dk_n, c1_n)
+                    dk_h = pl.div(dk_s, b_b)
+                    dkk = pl.mul(dk_h, k_b)
+                    c2 = pl.mul(pl.load(ocv, [soff + dof2, 0], [BK, 1]), cprev)
+                    corr = pl.add(pl.add(pl.tile.reshape(c1_s, [1, BK]),
+                                         pl.tile.reshape(c2, [1, BK])),
+                                  pl.tile.col_sum(dkk))
+                    dgcs = pl.sub(pl.load(dgcso, [off, dof2], [C, BK]), dkk)
+                    # The per-chunk REVERSE cumulative sum is a matmul by an upper-triangular
+                    # ones matrix, not a scan -- and it blocks over its contraction axis for
+                    # the same reason tril does: ``triu[:, r]`` carries the zeros.
+                    zr = pl.load(zc, [0, 0], [C, BK])
+                    for r2, (rc_acc,) in pl.range(0, NC, init_values=(zr,)):
+                        rf2 = r2 * BC
+                        triu_r = pl.load(triu, [0, rf2], [C, BC])
+                        dg_r = pl.tile.slice(dgcs, [BC, BK], [rf2, 0])
+                        rc_fin = pl.yield_(
+                            pl.add(rc_acc, pl.matmul(triu_r, dg_r, out_dtype=pl.FP32)))
+                    oaa = pl.store(pl.div(pl.tile.col_expand_add(rc_fin, corr), a_b),
+                                   [off, dof2], oaa)
+                    okk = pl.store(pl.add(pl.load(dKo, [off, dof2], [C, BK]), dk_h),
+                                   [off, dof2], okk)
+            # ---- pass 3: dV = dV_o + sum over HEAD blocks of (k/b) @ (gamma*dS). Head blocks
+            # innermost, so the sum is a tile and the write is a store: dV_o seeds it, and
+            # nothing accumulates through GM.
+            for n2 in pl.range(0, N):
+                of2 = n2 * C
+                sf2 = n2 * DK
+                for w3 in pl.range(0, NV):
+                    vf3 = w3 * BV
+                    dv0 = pl.load(dVo, [of2, vf3], [C, BV])
+                    for j3, (dv_a,) in pl.range(0, NB, init_values=(dv0,)):
+                        df3 = j3 * BK
+                        kb_3 = pl.div(pl.load(Kmat, [of2, df3], [C, BK]),
+                                      pl.load(Bs, [of2, df3], [C, BK]))
+                        dsl_3 = pl.load(osl, [sf2 + df3, vf3], [BK, BV])
+                        dv_f = pl.yield_(
+                            pl.add(dv_a, pl.matmul(kb_3, dsl_3, out_dtype=pl.FP32)))
+                    ovv = pl.store(dv_f, [of2, vf3], ovv)
+            return okk, ovv, oaa, osl, ocv
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_recompute(
             self,
@@ -277,29 +529,34 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
             onev: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
             Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
             Cprev: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
+            Bs: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ) -> pl.Tuple[
             pl.Tensor[[N * DK, DV], pl.FP32],
             pl.Tensor[[N * DK, 1], pl.FP32],
+            pl.Tensor[[L, DK], pl.FP32],
             pl.Tensor[[DK, DV], pl.FP32],
         ]:
-            return self.gla_recompute(A, Kmat, Vmat, tril, zero, onev, Ssnap, Cprev, Stot)
-
+            return self.gla_recompute(A, Kmat, Vmat, tril, zero, onev, zc, Ssnap, Cprev, Bs,
+                                      Stot)
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_grad_o(
             self,
             Q: pl.Tensor[[L, DK], pl.FP32],
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
-            A: pl.Tensor[[L, DK], pl.FP32],
             dOmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dQ: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dKo: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dVo: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
@@ -316,19 +573,18 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             pl.Tensor[[N * DK, 1], pl.FP32],
             pl.Tensor[[DK, DV], pl.FP32],
         ]:
-            return self.gla_grad_o(Q, Kmat, Vmat, A, dOmat, tril, Ssnap, Cprev, Srecv, zero,
-                                   dQ, dKo, dVo, dgcso, dH, dCp, dSrecv)
-
+            return self.gla_grad_o(Q, Kmat, Vmat, dOmat, tril, Ssnap, Cprev, Bs, Srecv, zero,
+                                   zc, zerov, dQ, dKo, dVo, dgcso, dH, dCp, dSrecv)
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_grad_h(
             self,
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
-            tril: pl.Tensor[[C, C], pl.FP32],
             triu: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             dH: pl.Tensor[[N * DK, DV], pl.FP32],
             dCp: pl.Tensor[[N * DK, 1], pl.FP32],
             dKo: pl.Tensor[[L, DK], pl.FP32],
@@ -336,17 +592,22 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             dgcso: pl.Tensor[[L, DK], pl.FP32],
             dStot: pl.Tensor[[DK, DV], pl.FP32],
             dgam: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dK: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dV: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
             dA: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
+            dSl: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            dCv: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
         ) -> pl.Tuple[
             pl.Tensor[[L, DK], pl.FP32],
             pl.Tensor[[L, DV], pl.FP32],
             pl.Tensor[[L, DK], pl.FP32],
+            pl.Tensor[[N * DK, DV], pl.FP32],
+            pl.Tensor[[N * DK, 1], pl.FP32],
         ]:
-            return self.gla_grad_h(Kmat, Vmat, A, tril, triu, Ssnap, Cprev, dH, dCp,
-                                   dKo, dVo, dgcso, dStot, dgam, dK, dV, dA)
-
+            return self.gla_grad_h(Kmat, Vmat, A, triu, Ssnap, Cprev, Bs, dH, dCp, dKo, dVo,
+                                   dgcso, dStot, dgam, zc, zerov, dK, dV, dA, dSl, dCv)
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
             self,
@@ -375,8 +636,16 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             dCp = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)
             dSrecv = pl.create_tensor([P, dk, dv], dtype=pl.FP32)
             dKo = pl.create_tensor([P, L, dk], dtype=pl.FP32)
-            dVo = pl.create_tensor([P, L, dv], dtype=pl.FP32)
             dgcso = pl.create_tensor([P, L, dk], dtype=pl.FP32)
+            # The state-adjoint walk, recorded per chunk instead of carried (see gla_grad_h).
+            dSl = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)
+            dCv = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)
+            dVo = pl.create_tensor([P, L, dv], dtype=pl.FP32)
+            Bs = pl.create_tensor([P, L, dk], dtype=pl.FP32)
+            # One zero tile source for every accumulator seed in the three kernels (see
+            # gla_grad_o); `zerov` covers the [dk, 1] seeds, which cannot be sliced out of a
+            # wider tensor -- a one-column load is a layout change and is refused.
+            zc = pl.create_tensor([C, ZW], dtype=pl.FP32, init_value=0)
 
             # `sl_r` (S_total) and `dsr` (dS_recv) are unpacked but unused, and pypto's
             # UnusedVariableCheck says so: both exist only to feed the rings, which P=1 does
@@ -384,27 +653,33 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int):
             # callee's Out params, so an element cannot be dropped from the middle, and
             # keeping the kernels identical to the P>1 pair is worth three warnings.
             for r in pl.range(P):
-                snap, cp, sl_r = self.chip_recompute(
-                    A[r], Kmat[r], Vmat[r], tril, zero, onev,
-                    Ssnap[r], Cprev[r], Stot[r], device=r)
+                snap, cp, bs, sl_r = self.chip_recompute(
+                    A[r], Kmat[r], Vmat[r], tril, zero, onev, zc,
+                    Ssnap[r], Cprev[r], Bs[r], Stot[r], device=r)
                 dq_r, dko, dvo, dgo, dh, dcp, dsr = self.chip_grad_o(
-                    Qmat[r], Kmat[r], Vmat[r], A[r], dOmat[r], tril, snap, cp, zero, zero,
-                    dQ[r], dKo[r], dVo[r], dgcso[r], dH[r], dCp[r], dSrecv[r], device=r)
+                    Qmat[r], Kmat[r], Vmat[r], dOmat[r], tril, snap, cp, bs, zero, zero,
+                    zc, zerov, dQ[r], dKo[r], dVo[r], dgcso[r], dH[r], dCp[r], dSrecv[r],
+                    device=r)
                 self.chip_grad_h(
-                    Kmat[r], Vmat[r], A[r], tril, triu, snap, cp, dh, dcp, dko, dvo, dgo,
-                    zero, zerov, dK[r], dV[r], dA[r], device=r)
+                    Kmat[r], Vmat[r], A[r], triu, snap, cp, bs, dh, dcp, dko, dvo, dgo,
+                    zero, zerov, zc, zerov, dK[r], dV[r], dA[r], dSl[r], dCv[r], device=r)
             return dQ, dK, dV, dA
 
     return FusedBackwardP1Program
 
 
-def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: int):
+def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: int,
+                                 nb: int = 1, nv: int = 1, slot: int = 4, nc: int = 1):
     """Build the fully-fused ``recompute + ring + grad_o + reverse-ring + grad_h`` program.
 
     Args:
         L: Tokens per device. C: chunk size (``L % C == 0``, ``N = L // C``).
-        dk, dv: key/query and value dims. K: ring pipeline depth (``dk % K == 0``).
+        dk, dv: key/query and value dims. K: how many pieces the boundary exchange is cut
+            into (``dk % K == 0``).
         P: ranks / devices. ``P == 1`` builds the native single-rank program (no rings).
+        nb, nv, nc: how many pieces the head dim, the value dim and the chunk's key-row axis
+            are cut into. slot: the cube<->vector pipe ring depth. Chosen by
+            :func:`compile_fused_backward`, which keeps the cheapest setting that fits.
 
     Returns:
         A ``@pl.program`` whose ``host_orch`` takes ``(Qmat, Kmat, Vmat, A, dOmat, gammas,
@@ -413,16 +688,20 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
     assert dk % K == 0, f"dk ({dk}) must be divisible by K ({K})"
     assert L % C == 0, f"L ({L}) must be divisible by C ({C})"
     if P == 1:
-        return _build_p1_backward_program(L, C, dk, dv)
+        return _build_p1_backward_program(L, C, dk, dv, nb, nv, slot, nc)
 
     BLOCK = dk // K
     N = L // C
     DK, DV = dk, dv
+    NB, BK, NV, BV, NC, BC, SLOT = nb, dk // nb, nv, dv // nv, nc, C // nc, slot
+    # One zero tile source for every accumulator seed. The widest seed is [C, BK] or
+    # [C, BC], so it has to be at least as wide as both the head block and the chunk.
+    ZW = max(C, dk)
 
     @pl.program
     class FusedBackwardProgram:
         # ---- phase 1: forward recompute with per-chunk snapshots ----
-        @pl.function(type=pl.FunctionType.InCore)
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_recompute(
             self,
             A: pl.Tensor[[L, DK], pl.FP32],
@@ -431,39 +710,80 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
             onev: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
             Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
             Cprev: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
+            Bs: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ):
-            """Forward chunk scan, snapshotting S_prev[n] / c_prev[n] before each update.
+            """Forward chunk scan, recording everything the two adjoint kernels re-read.
 
-            Identical arithmetic to the forward's ``gla_stage1`` (same gamma-factored state
-            update); the only additions are the two snapshot stores and the ``c_prev``
-            carry. Snapshots live at row offset ``n*DK`` because a tile is physically 2D.
+            Four outputs: the per-chunk snapshot ``Ssnap[n] = S_n(0)``, the running decay
+            ``Cprev[n] = prod_{m<n} gamma_m``, the WITHIN-chunk decay ``Bs = exp(tril @ log A)``
+            and the end-of-slice state ``Stot`` that feeds the ring.
+
+            ``Bs`` is recorded rather than recomputed. All three kernels need it, it costs two
+            matmuls per (chunk, head block) to build, and once it is a plain load the adjoint
+            kernels can order their loops by what their REDUCTIONS want instead of by what the
+            decay costs -- which is what lets dV be stored rather than accumulated.
+
+            Head-dim block OUTSIDE the chunk scan, exactly as the forward's stage1: nothing
+            here contracts over the head dim (``kb^T @ v`` has it as the OUTPUT row dim), so
+            block j's state depends only on block j for the whole slice. That makes the live
+            carry [BK, BV] instead of [dk, dv] -- three copies of a [128, 128] carry are
+            196608 B of a 188416 B buffer, which no amount of inner blocking can move.
             """
-            tril_t = pl.load(tril, [0, 0], [C, C])
-            s_init = pl.load(zero, [0, 0], [DK, DV])
-            c_init = pl.load(onev, [0, 0], [DK, 1])
-            snap = Ssnap
+            snaps = Ssnap
             cp = Cprev
-            for n, (s_run, c_run) in pl.range(0, N, init_values=(s_init, c_init)):
-                off = n * C
-                soff = n * DK
-                k = pl.load(Kmat, [off, 0], [C, DK])
-                v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                snap = pl.store(s_run, [soff, 0], snap)
-                cp = pl.store(c_run, [soff, 0], cp)
-                kb = pl.div(k, b)
-                kv = pl.matmul(pl.transpose(kb, 0, 1), v, out_dtype=pl.FP32)
-                s_new = pl.tile.row_expand_mul(pl.add(s_run, kv), gamma)
-                c_new = pl.mul(c_run, gamma)
-                s_fin, c_fin = pl.yield_(s_new, c_new)
-            return snap, cp, pl.store(s_fin, [0, 0], Stot)
-
+            bs = Bs
+            tot = Stot
+            for j in pl.range(0, NB):
+                dof = j * BK
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    s0 = pl.load(zero, [dof, vof], [BK, BV])
+                    c0 = pl.load(onev, [dof, 0], [BK, 1])
+                    for n, (s_run, c_run) in pl.range(0, N, init_values=(s0, c0)):
+                        off = n * C
+                        soff = n * DK
+                        # Snapshot BEFORE this chunk's update: that is exactly S_n(0).
+                        snaps = pl.store(s_run, [soff + dof, vof], snaps)
+                        cp = pl.store(c_run, [soff + dof, 0], cp)
+                        k_b = pl.load(Kmat, [off, dof], [C, BK])
+                        la_b = pl.log(pl.load(A, [off, dof], [C, BK]))
+                        # Decay, blocked over the KEY-ROW (contraction) axis: ``tril[:, r]``
+                        # already carries the causal zeros, so each block is an independent
+                        # product, no scan is needed, and the MAC count is unchanged.
+                        zb = pl.load(zc, [0, 0], [C, BK])
+                        for r, (b_acc,) in pl.range(0, NC, init_values=(zb,)):
+                            rof = r * BC
+                            tril_r = pl.load(tril, [0, rof], [C, BC])
+                            la_r = pl.log(pl.load(A, [off + rof, dof], [BC, BK]))
+                            b_fin = pl.yield_(
+                                pl.add(b_acc, pl.matmul(tril_r, la_r, out_dtype=pl.FP32)))
+                        b_b = pl.exp(b_fin)
+                        # Written once per value block with the same numbers, like Cprev: a
+                        # device conditional to write it only at w == 0 costs more than the
+                        # store does.
+                        bs = pl.store(b_b, [off, dof], bs)
+                        gamma_b = pl.exp(pl.tile.reshape(pl.tile.col_sum(la_b), [BK, 1]))
+                        kbt_b = pl.transpose(pl.div(k_b, b_b), 0, 1)
+                        # (K/b)^T @ V contracts over the chunk rows too, so it blocks the same
+                        # way and for the same reason.
+                        zkv = pl.load(zero, [dof, vof], [BK, BV])
+                        for r2, (kv_acc,) in pl.range(0, NC, init_values=(zkv,)):
+                            rof2 = r2 * BC
+                            v_r = pl.load(Vmat, [off + rof2, vof], [BC, BV],
+                                          target_memory=pl.MemorySpace.Mat)
+                            kbt_r = pl.tile.slice(kbt_b, [BK, BC], [0, rof2])
+                            kv_b = pl.yield_(
+                                pl.add(kv_acc, pl.matmul(kbt_r, v_r, out_dtype=pl.FP32)))
+                        # S = gamma * (S + (K/b)^T @ V), exactly as the reference factors it.
+                        s_new = pl.tile.row_expand_mul(pl.add(s_run, kv_b), gamma_b)
+                        c_new = pl.mul(c_run, gamma_b)
+                        s_fin, c_fin = pl.yield_(s_new, c_new)
+                    tot = pl.store(s_fin, [dof, vof], tot)
+            return snaps, cp, bs, tot
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_recompute(
             self,
@@ -473,30 +793,34 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
             onev: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
             Ssnap: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
             Cprev: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
+            Bs: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             Stot: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ) -> pl.Tuple[
             pl.Tensor[[N * DK, DV], pl.FP32],
             pl.Tensor[[N * DK, 1], pl.FP32],
+            pl.Tensor[[L, DK], pl.FP32],
             pl.Tensor[[DK, DV], pl.FP32],
         ]:
-            return self.gla_recompute(A, Kmat, Vmat, tril, zero, onev, Ssnap, Cprev, Stot)
-
-        # ---- phase 3: output-stage adjoints ----
-        @pl.function(type=pl.FunctionType.InCore)
+            return self.gla_recompute(A, Kmat, Vmat, tril, zero, onev, zc, Ssnap, Cprev, Bs,
+                                      Stot)
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_grad_o(
             self,
             Q: pl.Tensor[[L, DK], pl.FP32],
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
-            A: pl.Tensor[[L, DK], pl.FP32],
             dOmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dQ: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dKo: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dVo: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
@@ -505,7 +829,7 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             dCp: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
             dSrecv: pl.Out[pl.Tensor[[DK, DV], pl.FP32]],
         ):
-            """Output-stage adjoints. Chunks are independent apart from the dS_recv sum::
+            """Output-stage adjoints, in three passes over the chunks::
 
                 H_n     = S_prev[n] + c_prev[n]*S_recv     reconstruct's inter-chunk history
                 dQt     = dO @ H_n^T  +  dsc @ (k/b)
@@ -513,64 +837,141 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
                 dsc     = (dO @ v^T) * tril                intra-chunk masked attention
                 dV_o    = scores^T @ dO ,  dK_o = (dsc^T @ (q*b)) / b
                 dg_cs_o = dQ*q - dK_o*k                    log-domain gate grad
+
+            Three passes because the outputs reduce over DIFFERENT axes and this kernel blocks
+            both: dQ and dK sum over value blocks, dV sums over head blocks. One loop nest
+            would have to hold one of those sums across its outer loop -- which is the very
+            tile being split -- so each pass orders its loops for its own reduction, and every
+            write is a plain store.
+
+            The within-chunk decay is READ from ``Bs`` rather than recomputed; that is what
+            makes a second and third pass cheap enough to be worth having.
             """
-            tril_t = pl.load(tril, [0, 0], [C, C])
-            srecv_t = pl.load(Srecv, [0, 0], [DK, DV])
-            acc0 = pl.load(zero, [0, 0], [DK, DV])
             oq = dQ
             ok = dKo
             ov = dVo
             og = dgcso
             oh = dH
             oc = dCp
-            for n, (acc,) in pl.range(0, N, init_values=(acc0,)):
+            # ---- pass 1: dQ, dK_o, dg_cs, dH, dc_prev. Head blocks outside, so the value
+            # sums that dQ and dK need land in tiles.
+            for n in pl.range(0, N):
                 off = n * C
                 soff = n * DK
-                q = pl.load(Q, [off, 0], [C, DK])
-                k = pl.load(Kmat, [off, 0], [C, DK])
-                v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                do = pl.load(dOmat, [off, 0], [C, DV])
-                la = pl.log(a)
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                qt = pl.mul(q, b)
-                kb = pl.div(k, b)
-                scores = pl.mul(pl.matmul(qt, pl.transpose(kb, 0, 1), out_dtype=pl.FP32), tril_t)
-                sprev = pl.load(Ssnap, [soff, 0], [DK, DV])
-                cprev = pl.load(Cprev, [soff, 0], [DK, 1])
-                hmat = pl.add(sprev, pl.tile.row_expand_mul(srecv_t, cprev))
-                dqt = pl.matmul(do, pl.transpose(hmat, 0, 1), out_dtype=pl.FP32)
-                dh_n = pl.matmul(pl.transpose(qt, 0, 1), do, out_dtype=pl.FP32)
-                oh = pl.store(dh_n, [soff, 0], oh)
-                tmp = pl.tile.create([DK, DV], pl.FP32)
-                oc = pl.store(pl.row_sum(pl.mul(dh_n, srecv_t), tmp), [soff, 0], oc)
-                acc_n = pl.add(acc, pl.tile.row_expand_mul(dh_n, cprev))
-                dsc = pl.mul(pl.matmul(do, pl.transpose(v, 0, 1), out_dtype=pl.FP32), tril_t)
-                ov = pl.store(
-                    pl.matmul(pl.transpose(scores, 0, 1), do, out_dtype=pl.FP32), [off, 0], ov)
-                dqt2 = pl.add(dqt, pl.matmul(dsc, kb, out_dtype=pl.FP32))
-                dkin = pl.matmul(pl.transpose(dsc, 0, 1), qt, out_dtype=pl.FP32)
-                dq_n = pl.mul(dqt2, b)
-                dko_n = pl.div(dkin, b)
-                oq = pl.store(dq_n, [off, 0], oq)
-                ok = pl.store(dko_n, [off, 0], ok)
-                og = pl.store(pl.sub(pl.mul(dq_n, q), pl.mul(dko_n, k)), [off, 0], og)
-                acc_fin = pl.yield_(acc_n)
-            return oq, ok, ov, og, oh, oc, pl.store(acc_fin, [0, 0], dSrecv)
-
+                for j in pl.range(0, NB):
+                    dof = j * BK
+                    q_b = pl.load(Q, [off, dof], [C, BK])
+                    k_b = pl.load(Kmat, [off, dof], [C, BK])
+                    b_b = pl.load(Bs, [off, dof], [C, BK])
+                    qt_b = pl.mul(q_b, b_b)
+                    kb_b = pl.div(k_b, b_b)
+                    cprev = pl.load(Cprev, [soff + dof, 0], [BK, 1])
+                    # Accumulators are seeded from a zero TENSOR, never from ``x * 0.0``: a
+                    # multiply is vector work, and when the accumulator it seeds is consumed
+                    # by matmuls the splitter may put that multiply on the CUBE half, which
+                    # has no vector unit. Loading zeros is what the forward does.
+                    dq0 = pl.load(zc, [0, 0], [C, BK])
+                    dc0 = pl.load(zerov, [0, 0], [BK, 1])
+                    # ---- inter-chunk half: dQ's state term, dH_n and dc_prev[n]. Nothing
+                    # here touches the key rows, so it is a plain sum over value blocks.
+                    for w, (dq_a, dc_a) in pl.range(0, NV, init_values=(dq0, dc0)):
+                        vof = w * BV
+                        do_w = pl.load(dOmat, [off, vof], [C, BV])
+                        srecv = pl.load(Srecv, [dof, vof], [BK, BV])
+                        hmat = pl.add(pl.load(Ssnap, [soff + dof, vof], [BK, BV]),
+                                      pl.tile.row_expand_mul(srecv, cprev))
+                        dq_n = pl.add(dq_a, pl.matmul(do_w, pl.transpose(hmat, 0, 1),
+                                                      out_dtype=pl.FP32))
+                        dh_n = pl.matmul(pl.transpose(qt_b, 0, 1), do_w, out_dtype=pl.FP32)
+                        oh = pl.store(dh_n, [soff + dof, vof], oh)
+                        tmp = pl.tile.create([BK, BV], pl.FP32)
+                        dc_n = pl.add(dc_a, pl.row_sum(pl.mul(dh_n, srecv), tmp))
+                        dq_s, dc_s = pl.yield_(dq_n, dc_n)
+                    oc = pl.store(dc_s, [soff + dof, 0], oc)
+                    # ---- within-chunk half. Key-row blocks OUTSIDE value blocks: a key
+                    # block's dK is finished once its value sum finishes, so it is stored
+                    # straight out and never needs a [C, dk] accumulator.
+                    for r2, (dq_b,) in pl.range(0, NC, init_values=(dq_s,)):
+                        rof2 = r2 * BC
+                        tril_2 = pl.load(tril, [0, rof2], [C, BC])
+                        kb_r = pl.tile.slice(kb_b, [BC, BK], [rof2, 0])
+                        b_r = pl.tile.slice(b_b, [BC, BK], [rof2, 0])
+                        dk0 = pl.load(zc, [0, 0], [BC, BK])
+                        for w2, (dq_c, dk_c) in pl.range(0, NV, init_values=(dq_b, dk0)):
+                            vof2 = w2 * BV
+                            do_w2 = pl.load(dOmat, [off, vof2], [C, BV])
+                            v_r = pl.load(Vmat, [off + rof2, vof2], [BC, BV])
+                            dsc = pl.mul(pl.matmul(do_w2, pl.transpose(v_r, 0, 1),
+                                                   out_dtype=pl.FP32), tril_2)
+                            dq_d = pl.add(dq_c, pl.matmul(dsc, kb_r, out_dtype=pl.FP32))
+                            dk_d = pl.add(dk_c, pl.matmul(pl.transpose(dsc, 0, 1), qt_b,
+                                                          out_dtype=pl.FP32))
+                            dq_e, dk_e = pl.yield_(dq_d, dk_d)
+                        ok = pl.store(pl.div(dk_e, b_r), [off + rof2, dof], ok)
+                        dq_f = pl.yield_(dq_e)
+                    dq_out = pl.mul(dq_f, b_b)
+                    oq = pl.store(dq_out, [off, dof], oq)
+                    # dg_cs = dQ*q - dK_o*k needs this head block's dK whole, and the key-row
+                    # loop wrote it out in pieces; read it back rather than keeping a [C, BK]
+                    # accumulator alive across that loop.
+                    dko_b = pl.load(ok, [off, dof], [C, BK])
+                    og = pl.store(pl.sub(pl.mul(dq_out, q_b), pl.mul(dko_b, k_b)),
+                                  [off, dof], og)
+            # ---- pass 2: dV_o. HEAD blocks innermost, so the score block's head-block sum is
+            # a tile accumulation and each key-row block's dV is complete when it is stored.
+            # The mask is applied once, to the finished sum -- masking is elementwise, hence
+            # linear, so no [C, C] score matrix is ever built.
+            for n2 in pl.range(0, N):
+                of2 = n2 * C
+                for r3 in pl.range(0, NC):
+                    rf3 = r3 * BC
+                    sc0 = pl.load(zc, [0, 0], [C, BC])
+                    for j3, (sc_a,) in pl.range(0, NB, init_values=(sc0,)):
+                        df3 = j3 * BK
+                        b_3 = pl.load(Bs, [of2, df3], [C, BK])
+                        qt_3 = pl.mul(pl.load(Q, [of2, df3], [C, BK]), b_3)
+                        kb_3 = pl.div(pl.load(Kmat, [of2, df3], [C, BK]), b_3)
+                        kbt_3 = pl.tile.slice(pl.transpose(kb_3, 0, 1), [BK, BC], [0, rf3])
+                        sc_f = pl.yield_(
+                            pl.add(sc_a, pl.matmul(qt_3, kbt_3, out_dtype=pl.FP32)))
+                    sc_m = pl.mul(sc_f, pl.load(tril, [0, rf3], [C, BC]))
+                    sct = pl.transpose(sc_m, 0, 1)
+                    for w3 in pl.range(0, NV):
+                        vf3 = w3 * BV
+                        do_3 = pl.load(dOmat, [of2, vf3], [C, BV])
+                        ov = pl.store(pl.matmul(sct, do_3, out_dtype=pl.FP32),
+                                      [of2 + rf3, vf3], ov)
+            # ---- pass 3: dS_recv = sum_n dH[n] * c_prev[n]. Kept out of pass 1 so that pass
+            # carries no state at all: as a loop carry this is a full [dk, dv] tile live
+            # across the whole kernel, which is exactly what A1 removed from the forward.
+            osr = dSrecv
+            for j2 in pl.range(0, NB):
+                df2 = j2 * BK
+                for w4 in pl.range(0, NV):
+                    vf4 = w4 * BV
+                    a0 = pl.load(zero, [df2, vf4], [BK, BV])
+                    for n3, (a_acc,) in pl.range(0, N, init_values=(a0,)):
+                        sf2 = n3 * DK
+                        dh_r = pl.load(oh, [sf2 + df2, vf4], [BK, BV])
+                        cp_r = pl.load(Cprev, [sf2 + df2, 0], [BK, 1])
+                        a_fin = pl.yield_(pl.add(a_acc, pl.tile.row_expand_mul(dh_r, cp_r)))
+                    osr = pl.store(a_fin, [df2, vf4], osr)
+            return oq, ok, ov, og, oh, oc, osr
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_grad_o(
             self,
             Q: pl.Tensor[[L, DK], pl.FP32],
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
-            A: pl.Tensor[[L, DK], pl.FP32],
             dOmat: pl.Tensor[[L, DV], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             zero: pl.Tensor[[DK, DV], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dQ: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dKo: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dVo: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
@@ -587,20 +988,18 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             pl.Tensor[[N * DK, 1], pl.FP32],
             pl.Tensor[[DK, DV], pl.FP32],
         ]:
-            return self.gla_grad_o(Q, Kmat, Vmat, A, dOmat, tril, Ssnap, Cprev, Srecv, zero,
-                                   dQ, dKo, dVo, dgcso, dH, dCp, dSrecv)
-
-        # ---- phase 5: state-stage adjoints + gate backward ----
-        @pl.function(type=pl.FunctionType.InCore)
+            return self.gla_grad_o(Q, Kmat, Vmat, dOmat, tril, Ssnap, Cprev, Bs, Srecv, zero,
+                                   zc, zerov, dQ, dKo, dVo, dgcso, dH, dCp, dSrecv)
+        @pl.function(type=pl.FunctionType.InCore, attrs={"slot_num": SLOT})
         def gla_grad_h(
             self,
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
-            tril: pl.Tensor[[C, C], pl.FP32],
             triu: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             dH: pl.Tensor[[N * DK, DV], pl.FP32],
             dCp: pl.Tensor[[N * DK, 1], pl.FP32],
             dKo: pl.Tensor[[L, DK], pl.FP32],
@@ -608,63 +1007,123 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             dgcso: pl.Tensor[[L, DK], pl.FP32],
             dStot: pl.Tensor[[DK, DV], pl.FP32],
             dgam: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dK: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dV: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
             dA: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
+            dSl: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            dCv: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
         ):
-            """Reverse chunk recurrence + gate backward. pl.range only counts up, so the
-            reverse walk is n = N-1-m; the n>0 guard on the carry update is dropped because
-            at n==0 the new carry is dead and an InCore branch costs more than one add."""
-            tril_t = pl.load(tril, [0, 0], [C, C])
-            triu_t = pl.load(triu, [0, 0], [C, C])
-            ds_init = pl.load(dStot, [0, 0], [DK, DV])
-            dc_init = pl.load(dgam, [0, 0], [DK, 1])
+            """State-stage adjoints and the gate backward, in three passes.
+
+            Pass 1 RECORDS the reverse recurrence instead of carrying it through the work:
+            ``dsloc_n = gamma_n*dsloc_{n+1} + dH_n`` is diagonal in both dims, so the walk
+            itself blocks to [BK, BV], and writing each step out frees passes 2 and 3 to order
+            their loops by their own reductions -- which a live carry would forbid. Same trick
+            as A1 in the forward, run backwards.
+
+            Pass 2 takes dK and dA (value sums, so value blocks are innermost); pass 3 takes
+            dV (a head sum, so head blocks are innermost). Both end in a plain store.
+            """
+            osl = dSl
+            ocv = dCv
             okk = dK
             ovv = dV
             oaa = dA
-            for m, (dsloc, dcvec) in pl.range(0, N, init_values=(ds_init, dc_init)):
-                off = (N - 1 - m) * C
-                soff = (N - 1 - m) * DK
-                k = pl.load(Kmat, [off, 0], [C, DK])
-                v = pl.load(Vmat, [off, 0], [C, DV])
-                a = pl.load(A, [off, 0], [C, DK])
-                la = pl.log(a)
-                gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [DK, 1]))
-                b = pl.exp(pl.matmul(tril_t, la, out_dtype=pl.FP32))
-                sprev = pl.load(Ssnap, [soff, 0], [DK, DV])
-                cprev = pl.load(Cprev, [soff, 0], [DK, 1])
-                # Push gamma onto the state ONCE; everything downstream is broadcast-free.
-                # This also detaches the raw iter_arg, which cannot feed a matmul directly.
-                dsl_p = pl.tile.row_expand_mul(dsloc, gamma)
-                dcv_p = pl.mul(dcvec, gamma)
-                kb = pl.div(k, b)
-                dv_h = pl.matmul(kb, dsl_p, out_dtype=pl.FP32)
-                dk_h = pl.div(pl.matmul(v, pl.transpose(dsl_p, 0, 1), out_dtype=pl.FP32), b)
-                dkk = pl.mul(dk_h, k)
-                tmp = pl.tile.create([DK, DV], pl.FP32)
-                c1 = pl.tile.reshape(pl.row_sum(pl.mul(dsl_p, sprev), tmp), [1, DK])
-                c2 = pl.tile.reshape(pl.mul(dcv_p, cprev), [1, DK])
-                corr = pl.add(pl.add(c1, c2), pl.tile.col_sum(dkk))
-                dgcs = pl.sub(pl.load(dgcso, [off, 0], [C, DK]), dkk)
-                rcs = pl.matmul(triu_t, dgcs, out_dtype=pl.FP32)
-                oaa = pl.store(pl.div(pl.tile.col_expand_add(rcs, corr), a), [off, 0], oaa)
-                okk = pl.store(pl.add(pl.load(dKo, [off, 0], [C, DK]), dk_h), [off, 0], okk)
-                ovv = pl.store(pl.add(pl.load(dVo, [off, 0], [C, DV]), dv_h), [off, 0], ovv)
-                dsloc_n = pl.add(dsl_p, pl.load(dH, [soff, 0], [DK, DV]))
-                dcvec_n = pl.add(dcv_p, pl.load(dCp, [soff, 0], [DK, 1]))
-                dsl_f, dcv_f = pl.yield_(dsloc_n, dcvec_n)
-            return okk, ovv, oaa
-
+            for j in pl.range(0, NB):
+                dof = j * BK
+                for w in pl.range(0, NV):
+                    vof = w * BV
+                    ds0 = pl.load(dStot, [dof, vof], [BK, BV])
+                    dc0 = pl.load(dgam, [dof, 0], [BK, 1])
+                    for m, (dsloc, dcvec) in pl.range(0, N, init_values=(ds0, dc0)):
+                        off = (N - 1 - m) * C
+                        soff = (N - 1 - m) * DK
+                        la = pl.log(pl.load(A, [off, dof], [C, BK]))
+                        gamma = pl.exp(pl.tile.reshape(pl.tile.col_sum(la), [BK, 1]))
+                        # Push gamma onto the state ONCE; everything downstream is
+                        # broadcast-free. This also detaches the raw iter_arg, which cannot
+                        # feed a matmul directly.
+                        dsl_p = pl.tile.row_expand_mul(dsloc, gamma)
+                        dcv_p = pl.mul(dcvec, gamma)
+                        osl = pl.store(dsl_p, [soff + dof, vof], osl)
+                        ocv = pl.store(dcv_p, [soff + dof, 0], ocv)
+                        dsloc_n = pl.add(dsl_p, pl.load(dH, [soff + dof, vof], [BK, BV]))
+                        dcvec_n = pl.add(dcv_p, pl.load(dCp, [soff + dof, 0], [BK, 1]))
+                        dsl_f, dcv_f = pl.yield_(dsloc_n, dcvec_n)
+            # ---- pass 2: dK's state half and the gate gradient.
+            #     dK_h = (v @ (gamma*dS)^T) / b, with the 1/b applied after the value sum.
+            for n in pl.range(0, N):
+                off = n * C
+                soff = n * DK
+                for j2 in pl.range(0, NB):
+                    dof2 = j2 * BK
+                    k_b = pl.load(Kmat, [off, dof2], [C, BK])
+                    a_b = pl.load(A, [off, dof2], [C, BK])
+                    b_b = pl.load(Bs, [off, dof2], [C, BK])
+                    cprev = pl.load(Cprev, [soff + dof2, 0], [BK, 1])
+                    dk0 = pl.load(zc, [0, 0], [C, BK])
+                    c10 = pl.load(zerov, [0, 0], [BK, 1])
+                    for w2, (dk_a, c1_a) in pl.range(0, NV, init_values=(dk0, c10)):
+                        vf2 = w2 * BV
+                        dsl_p = pl.load(osl, [soff + dof2, vf2], [BK, BV])
+                        v_w = pl.load(Vmat, [off, vf2], [C, BV])
+                        sprev = pl.load(Ssnap, [soff + dof2, vf2], [BK, BV])
+                        dk_n = pl.add(dk_a, pl.matmul(v_w, pl.transpose(dsl_p, 0, 1),
+                                                      out_dtype=pl.FP32))
+                        tmp = pl.tile.create([BK, BV], pl.FP32)
+                        c1_n = pl.add(c1_a, pl.row_sum(pl.mul(dsl_p, sprev), tmp))
+                        dk_s, c1_s = pl.yield_(dk_n, c1_n)
+                    dk_h = pl.div(dk_s, b_b)
+                    dkk = pl.mul(dk_h, k_b)
+                    c2 = pl.mul(pl.load(ocv, [soff + dof2, 0], [BK, 1]), cprev)
+                    corr = pl.add(pl.add(pl.tile.reshape(c1_s, [1, BK]),
+                                         pl.tile.reshape(c2, [1, BK])),
+                                  pl.tile.col_sum(dkk))
+                    dgcs = pl.sub(pl.load(dgcso, [off, dof2], [C, BK]), dkk)
+                    # The per-chunk REVERSE cumulative sum is a matmul by an upper-triangular
+                    # ones matrix, not a scan -- and it blocks over its contraction axis for
+                    # the same reason tril does: ``triu[:, r]`` carries the zeros.
+                    zr = pl.load(zc, [0, 0], [C, BK])
+                    for r2, (rc_acc,) in pl.range(0, NC, init_values=(zr,)):
+                        rf2 = r2 * BC
+                        triu_r = pl.load(triu, [0, rf2], [C, BC])
+                        dg_r = pl.tile.slice(dgcs, [BC, BK], [rf2, 0])
+                        rc_fin = pl.yield_(
+                            pl.add(rc_acc, pl.matmul(triu_r, dg_r, out_dtype=pl.FP32)))
+                    oaa = pl.store(pl.div(pl.tile.col_expand_add(rc_fin, corr), a_b),
+                                   [off, dof2], oaa)
+                    okk = pl.store(pl.add(pl.load(dKo, [off, dof2], [C, BK]), dk_h),
+                                   [off, dof2], okk)
+            # ---- pass 3: dV = dV_o + sum over HEAD blocks of (k/b) @ (gamma*dS). Head blocks
+            # innermost, so the sum is a tile and the write is a store: dV_o seeds it, and
+            # nothing accumulates through GM.
+            for n2 in pl.range(0, N):
+                of2 = n2 * C
+                sf2 = n2 * DK
+                for w3 in pl.range(0, NV):
+                    vf3 = w3 * BV
+                    dv0 = pl.load(dVo, [of2, vf3], [C, BV])
+                    for j3, (dv_a,) in pl.range(0, NB, init_values=(dv0,)):
+                        df3 = j3 * BK
+                        kb_3 = pl.div(pl.load(Kmat, [of2, df3], [C, BK]),
+                                      pl.load(Bs, [of2, df3], [C, BK]))
+                        dsl_3 = pl.load(osl, [sf2 + df3, vf3], [BK, BV])
+                        dv_f = pl.yield_(
+                            pl.add(dv_a, pl.matmul(kb_3, dsl_3, out_dtype=pl.FP32)))
+                    ovv = pl.store(dv_f, [of2, vf3], ovv)
+            return okk, ovv, oaa, osl, ocv
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_grad_h(
             self,
             Kmat: pl.Tensor[[L, DK], pl.FP32],
             Vmat: pl.Tensor[[L, DV], pl.FP32],
             A: pl.Tensor[[L, DK], pl.FP32],
-            tril: pl.Tensor[[C, C], pl.FP32],
             triu: pl.Tensor[[C, C], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Cprev: pl.Tensor[[N * DK, 1], pl.FP32],
+            Bs: pl.Tensor[[L, DK], pl.FP32],
             dH: pl.Tensor[[N * DK, DV], pl.FP32],
             dCp: pl.Tensor[[N * DK, 1], pl.FP32],
             dKo: pl.Tensor[[L, DK], pl.FP32],
@@ -672,18 +1131,22 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             dgcso: pl.Tensor[[L, DK], pl.FP32],
             dStot: pl.Tensor[[DK, DV], pl.FP32],
             dgam: pl.Tensor[[DK, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
+            zerov: pl.Tensor[[DK, 1], pl.FP32],
             dK: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
             dV: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
             dA: pl.Out[pl.Tensor[[L, DK], pl.FP32]],
+            dSl: pl.Out[pl.Tensor[[N * DK, DV], pl.FP32]],
+            dCv: pl.Out[pl.Tensor[[N * DK, 1], pl.FP32]],
         ) -> pl.Tuple[
             pl.Tensor[[L, DK], pl.FP32],
             pl.Tensor[[L, DV], pl.FP32],
             pl.Tensor[[L, DK], pl.FP32],
+            pl.Tensor[[N * DK, DV], pl.FP32],
+            pl.Tensor[[N * DK, 1], pl.FP32],
         ]:
-            return self.gla_grad_h(Kmat, Vmat, A, tril, triu, Ssnap, Cprev, dH, dCp,
-                                   dKo, dVo, dgcso, dStot, dgam, dK, dV, dA)
-
-        # ---- phase 2: forward AllScan ring (identical to the forward program's) ----
+            return self.gla_grad_h(Kmat, Vmat, A, triu, Ssnap, Cprev, Bs, dH, dCp, dKo, dVo,
+                                   dgcso, dStot, dgam, zc, zerov, dK, dV, dA, dSl, dCv)
         @pl.function(type=pl.FunctionType.InCore)
         def allscan_first_step(
             self,
@@ -956,10 +1419,18 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             dCp = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)
             dSrecv = pl.create_tensor([P, dk, dv], dtype=pl.FP32)
             dKo = pl.create_tensor([P, L, dk], dtype=pl.FP32)
-            dVo = pl.create_tensor([P, L, dv], dtype=pl.FP32)
             dgcso = pl.create_tensor([P, L, dk], dtype=pl.FP32)
             dStot = pl.create_tensor([P, dk, dv], dtype=pl.FP32)
             dgam = pl.create_tensor([P, dk, 1], dtype=pl.FP32)
+            # The state-adjoint walk, recorded per chunk instead of carried (see gla_grad_h).
+            dSl = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)
+            dCv = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)
+            dVo = pl.create_tensor([P, L, dv], dtype=pl.FP32)
+            Bs = pl.create_tensor([P, L, dk], dtype=pl.FP32)
+            # One zero tile source for every accumulator seed in the three kernels (see
+            # gla_grad_o); `zerov` covers the [dk, 1] seeds, which cannot be sliced out of a
+            # wider tensor -- a one-column load is a layout change and is refused.
+            zc = pl.create_tensor([C, ZW], dtype=pl.FP32, init_value=0)
 
             for r in pl.range(P):
                 fdst = pld.window(fdst_buf, [dk, dv], dtype=pl.FP32)
@@ -967,9 +1438,9 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
                 bdst = pld.window(bdst_buf, [dk, dv], dtype=pl.FP32)
                 bsig = pld.window(bsig_buf, [K, 1], dtype=pl.INT32)
 
-                snap, cp, sl_r = self.chip_recompute(
-                    A[r], Kmat[r], Vmat[r], tril, zero, onev,
-                    Ssnap[r], Cprev[r], Stot[r], device=r)
+                snap, cp, bs, sl_r = self.chip_recompute(
+                    A[r], Kmat[r], Vmat[r], tril, zero, onev, zc,
+                    Ssnap[r], Cprev[r], Bs[r], Stot[r], device=r)
 
                 # Same boundary phi as the forward: rank 0 has none (S_recv = 0).
                 if r == 0:
@@ -983,8 +1454,9 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
                         sl_r, gammas[r], S_recv_all[r], fdst, fsig, r + 1, device=r)
 
                 dq_r, dko, dvo, dgo, dh, dcp, dsr = self.chip_grad_o(
-                    Qmat[r], Kmat[r], Vmat[r], A[r], dOmat[r], tril, snap, cp, boundary, zero,
-                    dQ[r], dKo[r], dVo[r], dgcso[r], dH[r], dCp[r], dSrecv[r], device=r)
+                    Qmat[r], Kmat[r], Vmat[r], dOmat[r], tril, snap, cp, bs, boundary, zero,
+                    zc, zerov, dQ[r], dKo[r], dVo[r], dgcso[r], dH[r], dCp[r], dSrecv[r],
+                    device=r)
 
                 # Reverse ring. Rank P-1 sources it with d = 0; rank 0 terminates it.
                 if r == P - 1:
@@ -999,8 +1471,8 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
                         device=r)
 
                 self.chip_grad_h(
-                    Kmat[r], Vmat[r], A[r], tril, triu, snap, cp, dh, dcp, dko, dvo, dgo,
-                    dst_r, dgam_r, dK[r], dV[r], dA[r], device=r)
+                    Kmat[r], Vmat[r], A[r], triu, snap, cp, bs, dh, dcp, dko, dvo, dgo,
+                    dst_r, dgam_r, zc, zerov, dK[r], dV[r], dA[r], dSl[r], dCv[r], device=r)
             return dQ, dK, dV, dA
 
     return FusedBackwardProgram
