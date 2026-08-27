@@ -52,7 +52,15 @@ class PyPtoAllscan(AllscanImpl):
     name = "pypto"
 
     #: Number of AllScans dispatched per batched timing sample (and per dispatch).
-    _MEASURE_BATCH = 16
+    #: ``ZECO_BENCH_BATCH=1`` turns batching OFF, giving a true per-call sample
+    #: (one AllScan per dispatch, full comm-domain cost included).
+    _MEASURE_BATCH = int(os.environ.get("ZECO_BENCH_BATCH", "16"))
+
+    #: Retain the CommDomain across dispatches instead of allocating and freeing
+    #: it per call (``DistributedCompiledProgram.prepare(persistent=...)``, pypto
+    #: #2095). Postdates the 2026-07 numbers, so it defaults off to keep the old
+    #: measurement reproducible; ``ZECO_BENCH_PERSISTENT=1`` enables it.
+    _PERSISTENT = os.environ.get("ZECO_BENCH_PERSISTENT", "0") == "1"
 
     def __init__(self) -> None:
         self._rt = None
@@ -87,7 +95,7 @@ class PyPtoAllscan(AllscanImpl):
         self._host_s = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
         self._host_g = torch.zeros((P, dk, 1), dtype=torch.float32).share_memory_()
         self._host_out_b = torch.zeros((self._B, P, dk, dv), dtype=torch.float32).share_memory_()
-        self._rt = compiled_b.prepare()
+        self._rt = compiled_b.prepare(persistent=self._PERSISTENT)
 
     def _dispatch(self):
         """Copy inputs in and run one batched dispatch (`_B` rings)."""
@@ -131,7 +139,7 @@ class PyPtoAllscan(AllscanImpl):
 
     #: pypto amortizes the per-call comm-domain + drain overhead in measure(),
     #: matching the simpler backend so the two are directly comparable.
-    amortized_timing = True
+    amortized_timing = _MEASURE_BATCH > 1
 
     def measure(self, S_locals, gammas, outputs, n_iters):
         """Per-iteration samples with per-dispatch orchestration overhead amortized.
@@ -167,6 +175,9 @@ class PyPtoAllscanBackward(AllscanImpl):
 
     #: Number of backward passes dispatched per batched timing sample.
     _MEASURE_BATCH = 16
+
+    #: As :attr:`PyPtoAllscan._PERSISTENT`; this class does not inherit from it.
+    _PERSISTENT = os.environ.get("ZECO_BENCH_PERSISTENT", "0") == "1"
 
     def __init__(self) -> None:
         self._rt = None
@@ -204,7 +215,7 @@ class PyPtoAllscanBackward(AllscanImpl):
         self._host_outprev = torch.zeros((P, dk, dv), dtype=torch.float32).share_memory_()
         self._host_dS_b = torch.zeros((self._B, P, dk, dv), dtype=torch.float32).share_memory_()
         self._host_dgamma_b = torch.zeros((self._B, P, dk, 1), dtype=torch.float32).share_memory_()
-        self._rt = compiled_b.prepare()
+        self._rt = compiled_b.prepare(persistent=self._PERSISTENT)
 
     def run(self, S_locals, gammas, outputs):
         """Not implemented — this class is backward-only (use :class:`PyPtoAllscan`
@@ -265,7 +276,7 @@ class PyPtoAllscanBackward(AllscanImpl):
         return time.perf_counter() - t0
 
     #: pypto amortizes the per-dispatch comm-domain overhead in measure_backward.
-    amortized_timing = True
+    amortized_timing = _MEASURE_BATCH > 1
 
     def measure_backward(self, g_out, gammas, outs, dS, dgamma, n_iters):
         """Amortized backward samples: one batched dispatch of `_B` passes / `_B`."""

@@ -174,7 +174,11 @@ with restore instructions: `/root/env-backup-2026-08-12/RESTORE.md`.
   Found en route, and now the reason a ones vector is built on-device: **`pl.create_tensor(...,
   init_value=<non-zero>)` silently delivers zeros when the tensor is created in a HOST
   orchestrator** (honoured in a chip orchestrator; `init_value=0` honoured everywhere) — no
-  error, no warning. See `../allscan/issues/pypto-host-init-value-zeroed/`.
+  error, no warning. Filed as pypto **#2505**; **closed 2026-08-27 by a different solution**
+  (#2530) — `init_value` is *removed*, and passing anything but `None` now raises. Our fix
+  (#2506) is superseded. Nothing here breaks today, but the next pin bump turns our four
+  `init_value=0` calls into a `ValueError`; see `../allscan/issues/pypto-host-init-value-zeroed/`
+  for what to replace them with.
 - **F3.1b (done) — chunk 128, by blocking the key-row axis.** The last shape ceiling, and the
   reason it survived so long is that it was misdiagnosed: `C=128` was recorded as failing on
   operand width when it actually missed by **256 B of vector buffer**. A third of that buffer is
