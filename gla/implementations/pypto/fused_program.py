@@ -169,20 +169,23 @@ def blocking_plans(C: int, dk: int, dv: int, distributed: bool = False) -> list[
             for slot in (4, 2, 1)]
 
 
-def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, O,
+def run_fused_forward(compiled, Q, K, V, A, gammas, tril, zero, zc, O,
                       *, platform, device_ids):
     """Run a compiled fused-forward program, hiding the P==1 vs P>1 run-API split.
 
     P>1 compiles to a distributed program (``prepare``/``rt``/``close``, share-memory
     tensors). P==1 has no communication, so pypto compiles it to a plain single-device
     ``CompiledProgram`` whose entry is stage2's own signature
-    ``(Q, Kmat, Vmat, A, tril, Srecv, O)`` — run directly with the rank-0 slices and
-    ``zero`` as ``Srecv``. Writes results in place into ``O`` (``[P, L, dv]``).
+    ``(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)`` — run directly with the rank-0
+    slices and ``zero`` as ``Srecv``. Writes results in place into ``O`` (``[P, L, dv]``).
+    ``zc`` is a ``[C, dv]`` tensor of zeros: it seeds stage2's output accumulator, and it comes
+    from the caller because ``pl.create_tensor(..., init_value=0)`` is refused by pypto from
+    #2530 on -- `init_value` was removed rather than fixed.
     """
     if hasattr(compiled, "prepare"):
         def sm(t):
             return t if t.is_shared() else t.clone().share_memory_()
-        h = [sm(t) for t in (Q, K, V, A, gammas, tril, zero)]
+        h = [sm(t) for t in (Q, K, V, A, gammas, tril, zero, zc)]
         h_O = sm(O)
         rt = compiled.prepare()
         try:
@@ -520,7 +523,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, BV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             """O[n] = (Q_n*b_n)@S_n + ((Q_n*b_n)@(K_n/b_n)^T (*) tril)@V_n, S_n REBUILT not carried.
@@ -620,7 +623,7 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, BV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)
@@ -635,13 +638,13 @@ def _build_p1_forward_program(L: int, C: int, dk: int, dv: int, K: int,
             gammas: pl.Tensor[[P, dk, 1], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[dk, dv], pl.FP32],
+            zc: pl.Tensor[[C, dv], pl.FP32],
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
             """P == 1: single rank, boundary = 0. ``gammas`` is unused (no ring)."""
             S_local = pl.create_tensor([P, dk, dv], dtype=pl.FP32)       # end-of-slice state
             Ssnap_all = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)  # per-chunk S_n(0)
             Gsnap_all = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)   # per-chunk decay
-            zc = pl.create_tensor([C, BV], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
             for r in pl.range(P):
                 Q_r = Qmat[r]
                 K_r = Kmat[r]
@@ -828,7 +831,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, BV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             """O[n] = (Q_n*b_n)@S_n + ((Q_n*b_n)@(K_n/b_n)^T (*) tril)@V_n, S_n REBUILT not carried.
@@ -928,7 +931,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             Srecv: pl.Tensor[[DK, DV], pl.FP32],
             Ssnap: pl.Tensor[[N * DK, DV], pl.FP32],
             Gsnap: pl.Tensor[[N * DK, 1], pl.FP32],
-            zc: pl.Tensor[[C, BV], pl.FP32],
+            zc: pl.Tensor[[C, DV], pl.FP32],
             O: pl.Out[pl.Tensor[[L, DV], pl.FP32]],
         ) -> pl.Tensor[[L, DV], pl.FP32]:
             return self.gla_stage2(Q, Kmat, Vmat, A, tril, Srecv, Ssnap, Gsnap, zc, O)
@@ -1036,6 +1039,7 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             gammas: pl.Tensor[[P, dk, 1], pl.FP32],
             tril: pl.Tensor[[C, C], pl.FP32],
             zero: pl.Tensor[[dk, dv], pl.FP32],
+            zc: pl.Tensor[[C, dv], pl.FP32],
             O: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
         ) -> pl.Tensor[[P, L, dv], pl.FP32]:
             """Per rank r on device r: stage1 -> ring (first/middle/last, emitting S_recv)
@@ -1047,7 +1051,6 @@ def build_fused_forward_program(L: int, C: int, dk: int, dv: int, K: int, P: int
             S_recv_all = pl.create_tensor([P, dk, dv], dtype=pl.FP32)  # received boundary out[r-1] per rank
             Ssnap_all = pl.create_tensor([P, N * dk, dv], dtype=pl.FP32)  # stage1 per-chunk S_n(0)
             Gsnap_all = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)   # stage1 per-chunk decay
-            zc = pl.create_tensor([C, BV], dtype=pl.FP32, init_value=0)   # seeds the O accumulator
 
             for r in pl.range(P):
                 # Slice this rank's inputs once, before the if/elif/else.

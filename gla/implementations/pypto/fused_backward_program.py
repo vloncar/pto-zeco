@@ -622,6 +622,7 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int,
             zero: pl.Tensor[[dk, dv], pl.FP32],
             zerov: pl.Tensor[[dk, 1], pl.FP32],
             onev: pl.Tensor[[dk, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
             dQ: pl.Out[pl.Tensor[[P, L, dk], pl.FP32]],
             dK: pl.Out[pl.Tensor[[P, L, dk], pl.FP32]],
             dV: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
@@ -642,10 +643,6 @@ def _build_p1_backward_program(L: int, C: int, dk: int, dv: int,
             dCv = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)
             dVo = pl.create_tensor([P, L, dv], dtype=pl.FP32)
             Bs = pl.create_tensor([P, L, dk], dtype=pl.FP32)
-            # One zero tile source for every accumulator seed in the three kernels (see
-            # gla_grad_o); `zerov` covers the [dk, 1] seeds, which cannot be sliced out of a
-            # wider tensor -- a one-column load is a layout change and is refused.
-            zc = pl.create_tensor([C, ZW], dtype=pl.FP32, init_value=0)
 
             # `sl_r` (S_total) and `dsr` (dS_recv) are unpacked but unused, and pypto's
             # UnusedVariableCheck says so: both exist only to feed the rings, which P=1 does
@@ -1381,6 +1378,7 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             zero: pl.Tensor[[dk, dv], pl.FP32],
             zerov: pl.Tensor[[dk, 1], pl.FP32],
             onev: pl.Tensor[[dk, 1], pl.FP32],
+            zc: pl.Tensor[[C, ZW], pl.FP32],
             dQ: pl.Out[pl.Tensor[[P, L, dk], pl.FP32]],
             dK: pl.Out[pl.Tensor[[P, L, dk], pl.FP32]],
             dV: pl.Out[pl.Tensor[[P, L, dv], pl.FP32]],
@@ -1427,10 +1425,6 @@ def build_fused_backward_program(L: int, C: int, dk: int, dv: int, K: int, P: in
             dCv = pl.create_tensor([P, N * dk, 1], dtype=pl.FP32)
             dVo = pl.create_tensor([P, L, dv], dtype=pl.FP32)
             Bs = pl.create_tensor([P, L, dk], dtype=pl.FP32)
-            # One zero tile source for every accumulator seed in the three kernels (see
-            # gla_grad_o); `zerov` covers the [dk, 1] seeds, which cannot be sliced out of a
-            # wider tensor -- a one-column load is a layout change and is refused.
-            zc = pl.create_tensor([C, ZW], dtype=pl.FP32, init_value=0)
 
             for r in pl.range(P):
                 fdst = pld.window(fdst_buf, [dk, dv], dtype=pl.FP32)

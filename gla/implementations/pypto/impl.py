@@ -142,6 +142,14 @@ class PyPtoZeCo(ZeCoImpl):
         self._triu = torch.triu(torch.ones(C, C, dtype=torch.float32)).share_memory_()
         self._zerov = torch.zeros(dk, 1, dtype=torch.float32).share_memory_()
         self._onev = torch.ones(dk, 1, dtype=torch.float32).share_memory_()
+        # The zero tile every accumulator seed is loaded from. It comes from here rather than
+        # from `pl.create_tensor(..., init_value=0)` because pypto REMOVED `init_value`
+        # (#2530) instead of fixing the host path that ignored it: a caller-supplied tensor is
+        # the one form no version can take away. Both shapes are deliberately independent of
+        # the blocking, which is not known until the plan search has run — the kernels load
+        # the corner they need.
+        self._zc = torch.zeros(C, dv, dtype=torch.float32).share_memory_()
+        self._zcb = torch.zeros(C, max(C, dk), dtype=torch.float32).share_memory_()
 
         from pypto.ir.distributed_compiled_program import DistributedConfig
 
@@ -246,7 +254,7 @@ class PyPtoZeCo(ZeCoImpl):
         self._select(backward=False)
         self._h_O.zero_()
         self._rt(self._h_Q, self._h_K, self._h_V, self._h_A, self._h_g,
-                 self._tril, self._zero, self._h_O)
+                 self._tril, self._zero, self._zc, self._h_O)
 
     def forward(self, Q, K, V, A):
         """ZeCO forward; args/return as in :meth:`gla.common.ZeCoImpl.forward`."""
@@ -259,7 +267,7 @@ class PyPtoZeCo(ZeCoImpl):
         gammas = A.prod(dim=1).reshape(self.P, self.dk, 1)
         O = torch.zeros((self.P, self.L, self.dv), dtype=torch.float32)
         run_fused_forward(
-            self._compiled, Q, K, V, A, gammas, self._tril, self._zero, O,
+            self._compiled, Q, K, V, A, gammas, self._tril, self._zero, self._zc, O,
             platform=self.platform, device_ids=self.device_ids,
         )
         return O
@@ -292,7 +300,7 @@ class PyPtoZeCo(ZeCoImpl):
             t.zero_()
         self._select(backward=True)
         self._rt(self._h_Q, self._h_K, self._h_V, self._h_A, self._b_dO, self._h_g,
-                 self._tril, self._triu, self._zero, self._zerov, self._onev,
+                 self._tril, self._triu, self._zero, self._zerov, self._onev, self._zcb,
                  self._b_dQ, self._b_dK, self._b_dV, self._b_dA)
         return (self._b_dQ.clone(), self._b_dK.clone(),
                 self._b_dV.clone(), self._b_dA.clone())

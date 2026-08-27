@@ -444,9 +444,17 @@ copy (`gla/implementations/pypto/impl.py:848-928`) first.
 
 ## Task C — Upstream
 
-Two findings from task A, both written up, **neither filed**. Re-test each against pypto
+Findings from tasks A and A6, written up, **none filed yet**. Re-test each against pypto
 `origin/main` before filing — the last two dependency bugs written up here were already fixed
-upstream. Isolated env: `../devtools/pypto_main_env.sh`.
+upstream. Isolated env: `../devtools/tq_env_main.sh` (pypto main + simpler `799640e6` +
+pto-isa `cd4a3d3f`, nothing under `/opt` modified; `pypto_main_env.sh` is its older sibling).
+
+**Pin status (2026-08-27).** The move to pypto `main` is *staged and blocked*: the tree is
+built, the runtime and pto-isa are at the pins main declares, and both patches we used to
+carry are now upstream — our comm-ordering fix landed as `e2d0f78a` (#2398), and pto-isa
+`cd4a3d3f` has both the DIR_BOTH entry offset and the local-slot stride. What stops it is C5
+below. Our own code is already ready for the move: `create_tensor(init_value=...)` was removed
+upstream (#2530) and every accumulator seed now comes from a caller-supplied zero tile.
 
 ### C1 — A pre-loop GM→GM copy lands on the cube core
 `../allscan/issues/pypto-cube-side-gm-copy/`. Triggered by a tensor-to-tensor copy before a
@@ -460,6 +468,16 @@ but a declared `@pl.function(type=InCore)` has none and adding one fails. `Expan
 reads it off a **function attribute**. Worse, the non-deprecated `pl.func_attr` accepts only a
 **literal** — a shape-derived depth reaches the pass as an `ir::Expr` and is rejected — so the
 only route that takes a computed value is the deprecated `attrs={...}` decorator form.
+
+### C5 — `pl.transpose` into a matmul emits MLIR ptoas cannot parse *(pypto main)*
+Found 2026-08-27 moving the pin, **and it blocks that move**. The `ttrans` scratch tile is
+allocated in the vector space and used in the matrix space, so ptoas refuses to parse the
+generated `.pto`. Root cause is one line in `flatten_tile_nd_to_2d/rewrite.cpp`, which picks
+the scratch's space at flatten time and defaults an unset space to `Vec` — and #2475 changed
+"unset" to mean "the compiler places it later", so the scratch keeps `Vec` while the transpose
+operands are placed in `Mat`. Not a toolchain mismatch: pypto's own `toolchain/versions.env`
+pins `PTOAS_VERSION=v0.57`, which is what we run. Reproducer, evidence and the reason we are
+not shipping the one-line workaround: `../allscan/issues/pypto-transpose-scratch-space/`.
 
 ### C4 — The core splitter puts a vector tile on the cube core
 Found by A6, characterised, not yet written up. At some blockings the splitter allocates the
