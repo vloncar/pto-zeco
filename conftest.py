@@ -26,6 +26,12 @@ from pathlib import Path
 
 import pytest
 
+# ``notes/`` is a snapshot of the working area (see notes/README.md), and some of the probes
+# in it are named ``test_*`` because they were written to be run with pytest by hand, against
+# hardware. Collecting them from a bare ``pytest`` run fails at import and stops the real
+# suites from running, so keep the whole tree out of collection.
+collect_ignore = ["notes"]
+
 # ---------------------------------------------------------------------------
 # sys.path bootstrap — make ``allscan`` importable when pytest is invoked from
 # the workspace root rather than from inside pto-allscan/.
