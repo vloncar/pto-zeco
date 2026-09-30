@@ -1,0 +1,5 @@
+python examples/distributed/04_barrier.py -p a2a3sim -d 0,1 --use-builtin
+python examples/distributed/05_remote_load_store.py -p a2a3sim -d 0,1 --mode store
+python examples/distributed/06_put_get.py -p a2a3sim -d 0,1 --mode get
+python examples/distributed/07_dynamic_rank_count.py -p a2a3sim -d 0,1,2
+python examples/distributed/07_dynamic_rank_count.py -p a2a3sim -d 0,1,2,3

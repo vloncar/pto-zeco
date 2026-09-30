@@ -1,0 +1,58 @@
+diff --git a/include/pto/npu/a2a3/TPush.hpp b/include/pto/npu/a2a3/TPush.hpp
+index 4d2176e5..184130fa 100644
+--- a/include/pto/npu/a2a3/TPush.hpp
++++ b/include/pto/npu/a2a3/TPush.hpp
+@@ -445,7 +445,7 @@ struct TPipe {
+             // local vector tile
+             uint64_t localTileBase =
+                 fifo.C2V_CONSUMER_BUF +
+-                (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * ConsM * ConsN * sizeof(T);
++                (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * RingFiFo::SLOT_SIZE;
+             TASSIGN_IMPL(tile, localTileBase);
+             TLOAD_IMPL(tile, globalTensor);
+         }
+@@ -463,7 +463,7 @@ struct TPipe {
+ 
+             uint64_t localTileBase =
+                 fifo.V2C_CONSUMER_BUF +
+-                (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * ConsM * ConsN * sizeof(T);
++                (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * RingFiFo::SLOT_SIZE;
+             TASSIGN_IMPL(tile, localTileBase);
+             TLOAD_IMPL(tile, globalTensor);
+         }
+@@ -498,7 +498,22 @@ struct TPipe {
+ 
+     PTO_INTERNAL explicit TPipe(__gm__ void *GM_SLOT_BUFFER, uint32_t C2V_CONSUMER_BUF, uint32_t V2C_CONSUMER_BUF)
+         : fifo(GM_SLOT_BUFFER, C2V_CONSUMER_BUF, V2C_CONSUMER_BUF), prod(), cons()
+-    {}
++    {
++        // Bidirectional: the two rings must NOT overlap. Both directions index the shared GM
++        // buffer as (tileIndex % SlotNum) * SlotSize, so without a per-direction base the C2V
++        // and V2C rings alias the same slots and silently corrupt each other's tiles. Place
++        // V2C after C2V, exactly as the ISA reference specifies
++        // (`v2c_ring_buf = GM_SLOT_BUFFER + SLOT_NUM * SLOT_SIZE`).
++        if constexpr (is_both) {
++            constexpr int V2C_ENTRY_OFFSET = static_cast<int>(SlotNum) * static_cast<int>(SlotSize);
++#ifdef __DAV_CUBE__
++            cons.setEntryOffset(V2C_ENTRY_OFFSET);   // Cube consumes V2C
++#endif
++#ifdef __DAV_VEC__
++            prod.setEntryOffset(V2C_ENTRY_OFFSET);   // Vector produces V2C
++#endif
++        }
++    }
+ 
+     // Destructor for TPipe: drain leftover free credits on FlagID+1.
+     // Initial TPUSH calls skip allocate() via shouldWaitFree (tileIndex < SlotNum, or 0 for depth 1).
+
+# ---------------------------------------------------------------------------
+# Carried against pto-isa pin 83d01313 (set by runtime/pto_isa.pin in the
+# simpler submodule, which enforces HEAD == pin).
+#
+# Contains TWO upstream-merged fixes that the pin predates:
+#   * the DIR_BOTH V2C ring offset  -> merged as 69a81f3b (MR !1438, issue #516)
+#   * the consumer local-slot stride -> merged as MR !1457 (issue #521)
+#
+# Both can be dropped the moment the runtime bumps pto_isa.pin past them.
+# Re-apply with:  git -C /opt/pto-isa apply <this file>
+# ---------------------------------------------------------------------------

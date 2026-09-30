@@ -1,0 +1,69 @@
+ZECO / ALLSCAN — bottom half.  Target 2:00, hard floor 1:30.
+
+[0:00 · 20s] THE PROBLEM
+One attention layer, over a sequence too long to fit on a single chip. Split it
+across four. The catch is that each chip's piece depends on a running total from
+every chip before it — so the obvious implementation makes them queue up and wait.
+We pass that total around a ring, so every chip keeps computing while the hand-off
+is still in flight.
+
+[0:20 · 20s] WHY FOUR VERSIONS
+We built the same thing four ways: a plain reference, a standard multi-chip
+version, hand-written chip code, and compiler-generated chip code. Same maths four
+times — so when they disagree it is a bug, not a matter of opinion.
+
+[0:40 · 30s] WHERE IT STANDS  ← the milestone
+It is correct. Both directions needed for training run on real hardware, on one,
+two and four chips, and all four versions agree. That is the result for this half.
+
+[1:10 · 35s] SPEED — say this carefully
+On a single chip the generated code is about three times quicker, end to end.
+The reason matters: it does the whole job in ONE visit to the chip, where the
+hand-written version makes three — and at these sizes a visit costs more than the
+maths does. That is a genuine advantage of the compiler: you get that structure
+for free, where a person would have to restructure the code by hand to match it.
+It is NOT a claim that the generated arithmetic is faster — we have not measured
+that yet. And the multi-chip comparison is held up by a fault on our hand-written
+side, so I am not quoting a number I cannot stand behind.
+
+[1:45 · 10s] CONTRIBUTION BACK
+On the way, this work turned up several genuine defects in the shared compiler and
+chip libraries. Those are fixed and back with the teams that own them.
+
+[1:55 · 5s] NEXT
+Clear the fault, get the multi-chip number, take it to realistic problem sizes.
+
+------------------------------------------------------------------------------
+IF YOU ARE RUNNING LATE — 30 seconds, say only this:
+"One attention layer spread across four chips, with the hand-off overlapped so
+nobody waits. Built four ways to check against each other; all four now agree on
+real hardware, both training directions, up to four chips. On a single chip the
+generated version is about three times quicker because it makes one trip to the
+chip instead of three. The multi-chip speed number is still blocked by a fault on
+our side — that is next."
+
+------------------------------------------------------------------------------
+LIKELY QUESTIONS
+
+"So is generated code faster than hand-written?"
+  On one chip, end to end, yes — about three times. But that is structure, not
+  arithmetic: one trip to the chip instead of three. At a problem size big enough
+  that the chips are genuinely busy, the gap should shrink. We have not measured
+  that point yet.
+
+"Why is the multi-chip number missing?"
+  The hand-written version currently fails to start on the multi-chip path. It is
+  a fault in our own code, not the hardware and not the compiler. It is next.
+
+"Is any of this in a product?"
+  Not yet. It is the first real distributed operator built this way, and it is
+  what tells us whether the automatic path is good enough to depend on.
+
+"What did the time actually go into?"
+  Mostly proving the failures were not ours — around ten defects in the layers
+  underneath, each needing a small reproducible example before the owning team
+  could act.
+
+"Could the hand-written version be fixed to match?"
+  Yes, and we know how — it would have to be restructured into a single fused
+  program. That is exactly the work the compiler does for you.

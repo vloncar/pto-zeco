@@ -1,0 +1,45 @@
+diff --git a/include/pto/npu/a2a3/TPush.hpp b/include/pto/npu/a2a3/TPush.hpp
+index 98055bf9..e512e537 100644
+--- a/include/pto/npu/a2a3/TPush.hpp
++++ b/include/pto/npu/a2a3/TPush.hpp
+@@ -410,10 +410,11 @@ struct TPipe {
+             using GlobalData = GlobalTensor<T, GlobalShape, GlobalStride>;
+             GlobalData globalData(addr, GlobalShape(tile.GetValidRow(), tile.GetValidCol()), GlobalStride(gmStrideR));
+ 
+-            // local vector tile
+-            uint64_t localTileBase =
+-                fifo.C2V_CONSUMER_BUF + (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * TileCons::Rows *
+-                                            TileCons::Cols * sizeof(T);
++            // local vector tile. Strided by SLOT_SIZE, like the GM ring above: striding by
++            // the popped tile's own Rows*Cols makes slot i+1 of a smaller tile land inside
++            // slot i of a larger one, so consecutive tiles of different sizes alias.
++            uint64_t localTileBase = fifo.C2V_CONSUMER_BUF +
++                                     (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * RingFiFo::SLOT_SIZE;
+             TASSIGN_IMPL(tile, localTileBase);
+             TLOAD_IMPL(tile, globalData);
+         }
+@@ -422,8 +423,6 @@ struct TPipe {
+         PTO_INTERNAL void popMatTileFromGMFiFo(RingFiFo& fifo, TileCons& tile)
+         {
+             using T = typename TileCons::DType;
+-            constexpr int ConsM = TileCons::Rows;
+-            constexpr int ConsN = TileCons::Cols;
+             size_t entryBase = (static_cast<size_t>(tileIndex) % RingFiFo::SLOT_NUM) * RingFiFo::SLOT_SIZE;
+             __gm__ T* addr = (__gm__ T*)((uint64_t)fifo.GM_SLOT_BUFFER + entryBase + entryOffset);
+             using GlobalShape = pto::Shape<1, 1, 1, -1, -1>;
+@@ -432,9 +431,12 @@ struct TPipe {
+             GlobalData globalTensor(
+                 addr, GlobalShape(tile.GetValidRow(), tile.GetValidCol()), GlobalStride(tile.GetValidCol()));
+ 
+-            uint64_t localTileBase =
+-                fifo.V2C_CONSUMER_BUF + (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * TileCons::Rows *
+-                                            TileCons::Cols * sizeof(T);
++            // Local slots must be strided by SLOT_SIZE, exactly like the GM ring above.
++            // Striding by the popped tile's own Rows*Cols makes slot i+1 of a smaller tile
++            // land INSIDE slot i of a larger one, so consecutive tiles of different sizes
++            // alias in L1 and silently corrupt each other.
++            uint64_t localTileBase = fifo.V2C_CONSUMER_BUF +
++                                     (static_cast<size_t>(tileIndex) % RingFiFo::LOCAL_SLOT_NUM) * RingFiFo::SLOT_SIZE;
+             TASSIGN_IMPL(tile, localTileBase);
+             TLOAD_IMPL(tile, globalTensor);
+         }

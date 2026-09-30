@@ -1,0 +1,37 @@
+GATED DELTANET — bottom half.  Target 1:30, hard floor 1:00.
+
+[0:00 · 15s] WHAT IT IS
+Gated DeltaNet is the attention layer inside Qwen3.5 and 3.6 — it stands in for
+most of the ordinary attention in those models, so how fast it runs is how fast
+they run. There is already a hand-tuned version of it in production, written
+directly against the chip.
+
+[0:15 · 20s] WHAT WE DID
+We rebuilt those six kernels in the compiler's own language. Not a new algorithm
+— deliberately the same one, the same six stages, the same accuracy target. That
+is what makes the comparison mean something: a difference is the compiler, not a
+different idea.
+
+[0:35 · 25s] THE RESULT  ← the milestone
+Every stage agrees with the reference to the precision the hardware allows, and
+end to end the generated code is slightly ahead — 1,463 microseconds against
+1,572 for the hand-written original. The chart is their own benchmark, run
+unchanged. Two stages are clearly ahead, two are level, two are a little behind.
+
+[1:00 · 20s] THE PART WORTH REPEATING
+Rewriting the triangular solve made us re-derive what it was doing, and that
+turned up two shortcuts the original author had not taken. Both are improvements
+to THEIR code, not ours, and they are going back to that team. That is the
+argument for working at this level: it makes the algorithm visible again.
+
+[1:20 · 10s] NEXT
+Fuse the six stages into one kernel, then variable-length batches.
+
+------------------------------------------------------------------------------
+IF ASKED "is it production ready?": not yet — one sequence at a time, fixed head
+count. The next two pieces of work are exactly the features that close that gap.
+
+IF ASKED "why is the last stage behind?": it makes more trips between the matrix
+unit and the vector unit than the hand-written version, which routes those
+through a different memory. That is a known request into the compiler, not a
+fault in the kernel.
