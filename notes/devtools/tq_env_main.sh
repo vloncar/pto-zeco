@@ -4,6 +4,18 @@
 # Same contract as tq_env.sh (run it under a task-submit grant; the granted cards arrive as
 # $TASK_DEVICE) but pointed at the newer toolchain instead of /opt/pypto. Nothing under /opt
 # is modified, so rolling back is a matter of using tq_env.sh again.
+# NOTE (2026-09-30): the tree this points at was DELETED before the machine was rebuilt --
+# 2.7 GB of scratch that /tmp would have dropped anyway. Rebuild it before using this shim:
+#
+#   git clone https://github.com/hw-native-sys/pypto.git /tmp/pypto-pr && cd /tmp/pypto-pr
+#   git submodule update --init runtime
+#   ( cd runtime && python3 -m venv .venv && . .venv/bin/activate && pip install -e . )
+#   cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build build --parallel
+#   git clone <pto-isa> /tmp/pto-isa-new && git -C /tmp/pto-isa-new checkout $(cat runtime/pto_isa.pin)
+#
+# Check `toolchain/versions.env` for the assembler version main expects before trusting a
+# result: ours is 0.57, and a mismatch there reads as a code failure.
+
 set +e
 
 source /usr/local/Ascend/cann-9.0.0/set_env.sh >/dev/null 2>&1
